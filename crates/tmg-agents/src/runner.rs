@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tmg_llm::{LlmClient, StreamEvent, ToolCall, ToolDefinition};
 use tmg_tools::ToolRegistry;
 
-use crate::config::AgentType;
+use crate::config::AgentKind;
 use crate::error::AgentError;
 
 /// Maximum number of consecutive tool-call rounds for a subagent.
@@ -115,17 +115,17 @@ impl SubagentRunner {
     /// Create a new subagent runner.
     ///
     /// The runner initializes with a system prompt appropriate for
-    /// the agent type and a filtered tool registry.
+    /// the agent kind (built-in or custom) and a filtered tool registry.
     pub fn new(
         client: LlmClient,
         registry: ToolRegistry,
-        agent_type: AgentType,
+        agent_kind: &AgentKind,
         cancel: CancellationToken,
     ) -> Self {
         let tool_defs = registry.tool_definitions();
         let registry = Arc::new(registry);
 
-        let history = vec![SubagentMessage::system(agent_type.system_prompt())];
+        let history = vec![SubagentMessage::system(agent_kind.system_prompt())];
 
         Self {
             client,

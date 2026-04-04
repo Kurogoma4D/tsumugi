@@ -89,7 +89,7 @@ fn run_prompt(endpoint: &str, model: &str, prompt: &str) -> anyhow::Result<()> {
 /// Launches a ratatui terminal interface with a chat pane, header,
 /// and input area. The TUI handles multi-turn conversations with
 /// streaming LLM responses. Includes subagent support via
-/// `spawn_agent` tool.
+/// `spawn_agent` tool, with custom agent definitions from TOML.
 fn run_tui(endpoint: &str, model: &str) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -110,17 +110,27 @@ fn run_tui(endpoint: &str, model: &str) -> anyhow::Result<()> {
         // Use cwd as project root for now (could be improved with git root detection).
         let project_root = cwd.clone();
 
+        // Discover custom agent definitions.
+        let custom_agent_metas = tmg_agents::discover_custom_agents(&project_root)
+            .await
+            .unwrap_or_default();
+        let custom_agent_defs: Vec<tmg_agents::CustomAgentDef> =
+            custom_agent_metas.iter().map(|m| m.def.clone()).collect();
+
         // Create the subagent manager.
         let subagent_manager = Arc::new(Mutex::new(tmg_agents::SubagentManager::new(
             client.clone(),
             cancel.clone(),
+            endpoint,
+            model,
         )));
 
-        // Create the tool registry with spawn_agent tool.
+        // Create the tool registry with spawn_agent tool (including custom agents).
         let mut registry = tmg_tools::default_registry();
-        registry.register(tmg_agents::SpawnAgentTool::new(Arc::clone(
-            &subagent_manager,
-        )));
+        registry.register(tmg_agents::SpawnAgentTool::with_custom_agents(
+            Arc::clone(&subagent_manager),
+            custom_agent_defs.clone(),
+        ));
 
         let agent =
             tmg_core::AgentLoop::new(client, registry, cancel.clone(), &project_root, &cwd)?;
@@ -132,6 +142,7 @@ fn run_tui(endpoint: &str, model: &str) -> anyhow::Result<()> {
             project_root,
             cwd,
             Some(subagent_manager),
+            custom_agent_defs,
         )
         .await?;
 

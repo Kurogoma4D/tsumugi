@@ -1,9 +1,12 @@
 //! Subagent configuration types.
 //!
-//! Defines [`AgentType`] (the built-in subagent kinds) and
+//! Defines [`AgentType`] (the built-in subagent kinds),
+//! [`AgentKind`] (built-in or custom), and
 //! [`SubagentConfig`] (the parameters for spawning a subagent).
 
 use serde::{Deserialize, Serialize};
+
+use crate::custom::CustomAgentDef;
 
 /// The built-in subagent types.
 ///
@@ -106,11 +109,62 @@ impl std::fmt::Display for AgentType {
     }
 }
 
+/// Distinguishes between a built-in agent type and a custom (TOML-defined)
+/// agent.
+#[derive(Debug, Clone)]
+pub enum AgentKind {
+    /// A built-in agent type (explore, worker, plan).
+    Builtin(AgentType),
+
+    /// A custom agent loaded from a TOML definition file.
+    Custom(CustomAgentDef),
+}
+
+impl AgentKind {
+    /// Return the display name of this agent kind.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Builtin(t) => t.name(),
+            Self::Custom(def) => &def.name,
+        }
+    }
+
+    /// Return a human-readable description.
+    pub fn description(&self) -> &str {
+        match self {
+            Self::Builtin(t) => t.description(),
+            Self::Custom(def) => &def.description,
+        }
+    }
+
+    /// Return the system prompt / instructions for this agent.
+    pub fn system_prompt(&self) -> &str {
+        match self {
+            Self::Builtin(t) => t.system_prompt(),
+            Self::Custom(def) => &def.instructions,
+        }
+    }
+
+    /// Return the allowed tool names for this agent.
+    pub fn allowed_tool_names(&self) -> Vec<&str> {
+        match self {
+            Self::Builtin(t) => t.allowed_tools().to_vec(),
+            Self::Custom(def) => def.allowed_tools.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
+impl std::fmt::Display for AgentKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// Configuration for spawning a subagent.
 #[derive(Debug, Clone)]
 pub struct SubagentConfig {
-    /// The type of subagent to spawn.
-    pub agent_type: AgentType,
+    /// The kind of subagent to spawn (built-in or custom).
+    pub agent_kind: AgentKind,
 
     /// The task description for the subagent.
     pub task: String,
