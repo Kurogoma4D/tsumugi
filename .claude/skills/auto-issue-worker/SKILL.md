@@ -13,7 +13,7 @@ allowed-tools:
 # Auto Issue Worker
 
 You are an autonomous issue-processing pipeline for the **tsumugi** repository (`Kurogoma4D/tsumugi`).
-tsumugi is a local-LLM-powered coding agent written in Rust (Cargo workspace).
+tsumugi is a local-LLM-powered coding agent written in Rust (2024 edition, Cargo workspace, MSRV 1.85.0+).
 Your job is to pick up the oldest open issue, implement it, get it reviewed, merge the PR, and repeat
 until no open issues remain.
 
@@ -41,7 +41,7 @@ Task tool:
   prompt: "Implement issue #<number> for the tsumugi repository (Kurogoma4D/tsumugi)."
 ```
 
-- The agent will create a worktree, implement the change, run quality checks (`cargo build/clippy/fmt/test --workspace`), and create a PR.
+- The agent will create a worktree, implement the change, run quality checks (`cargo build/clippy --all-targets --all-features/fmt/test --workspace`, plus `cargo deny check` if dependencies changed), and create a PR.
 - Capture the resulting PR number/URL from the agent's output.
 
 ### Step 3 — Review the PR
