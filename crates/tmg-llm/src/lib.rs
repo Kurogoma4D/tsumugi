@@ -12,5 +12,5 @@ pub use pool::{EndpointHealth, LlmPool};
 pub use pool_config::{LoadBalanceStrategy, PoolConfig, PoolConfigError};
 pub use types::{
     ChatMessage, ChatRequest, ChatResponse, FunctionCall, FunctionDefinition, Role, StreamEvent,
-    ToolCall, ToolCallAccumulator, ToolCallIndexError, ToolDefinition, ToolKind,
+    TokenizeResponse, ToolCall, ToolCallAccumulator, ToolCallIndexError, ToolDefinition, ToolKind,
 };

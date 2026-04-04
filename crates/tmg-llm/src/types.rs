@@ -241,6 +241,17 @@ pub enum StreamEvent {
 }
 
 // ---------------------------------------------------------------------------
+// Tokenize response
+// ---------------------------------------------------------------------------
+
+/// Response from the llama-server `POST /tokenize` endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TokenizeResponse {
+    /// The token ids produced by the tokenizer.
+    pub tokens: Vec<i64>,
+}
+
+// ---------------------------------------------------------------------------
 // Tool call accumulator
 // ---------------------------------------------------------------------------
 

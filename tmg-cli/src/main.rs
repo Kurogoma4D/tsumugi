@@ -19,15 +19,34 @@ struct Cli {
     /// Model name to use.
     #[arg(long, default_value = "default")]
     model: String,
+
+    /// Maximum context window tokens.
+    #[arg(long, default_value = "8192")]
+    max_context_tokens: usize,
+
+    /// Context compression threshold (0.0-1.0). Compression auto-triggers
+    /// when context usage exceeds this fraction of `max_context_tokens`.
+    #[arg(long, default_value = "0.8")]
+    context_compression_threshold: f64,
+
+    /// Maximum tokens for a single tool result before truncation.
+    #[arg(long, default_value = "4096")]
+    max_tool_result_tokens: usize,
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    let context_config = tmg_core::ContextConfig {
+        max_context_tokens: cli.max_context_tokens,
+        compression_threshold: cli.context_compression_threshold,
+        max_tool_result_tokens: cli.max_tool_result_tokens,
+    };
+
     if let Some(prompt) = cli.prompt {
         run_prompt(&cli.endpoint, &cli.model, &prompt)?;
     } else {
-        run_tui(&cli.endpoint, &cli.model)?;
+        run_tui(&cli.endpoint, &cli.model, context_config)?;
     }
 
     Ok(())
@@ -91,7 +110,11 @@ fn run_prompt(endpoint: &str, model: &str, prompt: &str) -> anyhow::Result<()> {
 /// and input area. The TUI handles multi-turn conversations with
 /// streaming LLM responses. Includes subagent support via
 /// `spawn_agent` tool, with custom agent definitions from TOML.
-fn run_tui(endpoint: &str, model: &str) -> anyhow::Result<()> {
+fn run_tui(
+    endpoint: &str,
+    model: &str,
+    context_config: tmg_core::ContextConfig,
+) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let config = tmg_llm::LlmClientConfig::new(endpoint, model);
@@ -133,8 +156,14 @@ fn run_tui(endpoint: &str, model: &str) -> anyhow::Result<()> {
             custom_agent_defs.clone(),
         ));
 
-        let agent =
-            tmg_core::AgentLoop::new(client, registry, cancel.clone(), &project_root, &cwd)?;
+        let agent = tmg_core::AgentLoop::with_context_config(
+            client,
+            registry,
+            cancel.clone(),
+            &project_root,
+            &cwd,
+            context_config,
+        )?;
 
         tmg_tui::run(
             agent,

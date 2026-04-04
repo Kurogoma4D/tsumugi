@@ -53,6 +53,12 @@ pub async fn run_event_loop(
         // Drain any pending turn messages before drawing.
         app.drain_turn_messages();
 
+        // Handle pending /compact command as a background task.
+        if app.needs_compact() && !app.is_streaming() {
+            app.clear_pending_compact();
+            app.start_compact(&cancel);
+        }
+
         // Refresh subagent summaries at a throttled rate (once per second)
         // to avoid excessive lock contention with the manager mutex.
         if last_subagent_refresh.elapsed() >= SUBAGENT_REFRESH_INTERVAL {
