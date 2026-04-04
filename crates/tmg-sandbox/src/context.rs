@@ -65,17 +65,33 @@ impl SandboxContext {
     ///
     /// On Linux, this:
     /// 1. Applies Landlock filesystem rules
-    /// 2. Creates a network namespace (if `allowed_domains` is configured)
-    /// 3. Applies iptables rules for the domain allowlist
+    /// 2. Creates an isolated network namespace that blocks all external
+    ///    network access
     ///
     /// On non-Linux platforms, this emits warnings and returns `Ok(())`.
     ///
     /// This method is idempotent: calling it multiple times has no
     /// additional effect after the first successful activation.
     ///
+    /// # Network isolation
+    ///
+    /// Network restriction is achieved by placing the process into a new,
+    /// empty network namespace via `unshare(CLONE_NEWNET)`. The new namespace
+    /// contains only a loopback interface with no external connectivity.
+    ///
+    /// The `allowed_domains` configuration field is accepted but **not yet
+    /// enforced** -- selective domain allowlisting requires veth pair setup
+    /// or Landlock v4+ network access rules, which are planned for future
+    /// work. Currently, when any network restriction is active, **all**
+    /// external network access is blocked.
+    ///
     /// # Errors
     ///
     /// Returns [`SandboxError`] if any OS-level restriction fails to apply.
+    #[expect(
+        clippy::unused_async,
+        reason = "kept async for API stability; future network allowlist implementation will require async"
+    )]
     pub async fn activate(&mut self) -> Result<(), SandboxError> {
         if self.activated {
             return Ok(());
@@ -89,11 +105,9 @@ impl SandboxContext {
         // Apply filesystem restrictions.
         platform::apply_landlock(&self.config)?;
 
-        // Apply network restrictions if domains are configured.
-        if !self.config.allowed_domains.is_empty() {
-            platform::create_network_namespace()?;
-            platform::apply_network_allowlist(&self.config.allowed_domains).await?;
-        }
+        // Apply network restrictions: create an empty network namespace
+        // that blocks all external connectivity.
+        platform::create_network_namespace()?;
 
         self.activated = true;
         Ok(())
@@ -114,15 +128,15 @@ impl SandboxContext {
         }
 
         let path = path.as_ref();
-        let canonical = normalize_path(path);
+        let canonical = normalize_path(path, &self.config.workspace);
 
         // Allow access to workspace directory.
         if canonical.starts_with(&self.config.workspace) {
             return Ok(());
         }
 
-        // Allow access to system paths.
-        for system_path in &["/usr", "/bin", "/lib", "/lib64"] {
+        // Allow access to system paths (platform-specific).
+        for system_path in system_read_paths() {
             if canonical.starts_with(system_path) {
                 return Ok(());
             }
@@ -159,7 +173,7 @@ impl SandboxContext {
         }
 
         // WorkspaceWrite mode: only allow writes within the workspace.
-        let canonical = normalize_path(path);
+        let canonical = normalize_path(path, &self.config.workspace);
         if canonical.starts_with(&self.config.workspace) {
             return Ok(());
         }
@@ -206,11 +220,41 @@ impl SandboxContext {
     }
 }
 
-/// Normalize a path by resolving `.` and `..` components without
-/// touching the filesystem (no symlink resolution).
+/// Normalize a path for sandbox access checks.
 ///
-/// This is a best-effort normalization for sandbox path checks.
-fn normalize_path(path: &Path) -> PathBuf {
+/// If `path` is relative, it is first joined with the given `base` directory
+/// (typically the workspace or current working directory) so that the resulting
+/// path is absolute and can be compared against the allowlist.
+///
+/// When the path exists on disk, [`std::fs::canonicalize`] is used so that
+/// symlinks are fully resolved. This prevents a symlink inside the workspace
+/// from pointing outside the sandbox boundary.
+///
+/// # Limitation
+///
+/// For paths that **do not yet exist** (e.g., a file about to be created),
+/// `canonicalize` cannot be used and we fall back to purely lexical
+/// normalization (resolving `.` and `..` components without filesystem
+/// access). A symlink in a *parent* directory of the not-yet-existing path
+/// will **not** be detected in this case, so the check is best-effort.
+fn normalize_path(path: &Path, base: &Path) -> PathBuf {
+    let absolute = if path.is_relative() {
+        base.join(path)
+    } else {
+        path.to_path_buf()
+    };
+
+    // Prefer canonicalize when the path exists -- it resolves symlinks.
+    if let Ok(canonical) = std::fs::canonicalize(&absolute) {
+        return canonical;
+    }
+
+    // Fallback: lexical normalization for paths that don't exist yet.
+    lexical_normalize(&absolute)
+}
+
+/// Resolve `.` and `..` components without touching the filesystem.
+fn lexical_normalize(path: &Path) -> PathBuf {
     use std::path::Component;
 
     let mut normalized = PathBuf::new();
@@ -224,6 +268,38 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+/// System paths that are granted read-only access in software path checks.
+///
+/// On Linux, these correspond to the standard FHS directories containing
+/// system binaries and shared libraries. On macOS, Homebrew and system
+/// framework paths are included instead.
+#[cfg(target_os = "linux")]
+fn system_read_paths() -> &'static [&'static str] {
+    &["/usr", "/bin", "/lib", "/lib64"]
+}
+
+/// System paths that are granted read-only access in software path checks.
+///
+/// On macOS, these include Homebrew, system frameworks, and standard
+/// Unix directories.
+#[cfg(target_os = "macos")]
+fn system_read_paths() -> &'static [&'static str] {
+    &[
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/opt/homebrew",
+        "/System",
+        "/Library",
+    ]
+}
+
+/// Fallback system path allowlist for other platforms.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn system_read_paths() -> &'static [&'static str] {
+    &["/usr", "/bin"]
 }
 
 /// Get the tsumugi configuration directory path (`~/.config/tsumugi/`).
@@ -285,11 +361,21 @@ mod tests {
         let ctx = SandboxContext::new(config);
 
         assert!(ctx.check_path_access("/usr/bin/ls").is_ok());
-        assert!(ctx.check_path_access("/bin/sh").is_ok());
-        assert!(
-            ctx.check_path_access("/lib/x86_64-linux-gnu/libc.so")
-                .is_ok()
-        );
+        #[cfg(target_os = "linux")]
+        {
+            assert!(ctx.check_path_access("/bin/sh").is_ok());
+            assert!(
+                ctx.check_path_access("/lib/x86_64-linux-gnu/libc.so")
+                    .is_ok()
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(ctx.check_path_access("/bin/sh").is_ok());
+            assert!(ctx.check_path_access("/opt/homebrew/bin/cargo").is_ok());
+            assert!(ctx.check_path_access("/System/Library/Frameworks").is_ok());
+            assert!(ctx.check_path_access("/Library/Developer").is_ok());
+        }
     }
 
     #[test]
@@ -350,14 +436,43 @@ mod tests {
 
     #[test]
     fn normalize_path_handles_parent_dir() {
-        let result = normalize_path(Path::new("/tmp/workspace/../secret"));
+        let base = Path::new("/tmp/workspace");
+        // Absolute path with `..` -- base is unused.
+        let result = normalize_path(Path::new("/tmp/workspace/../secret"), base);
         assert_eq!(result, PathBuf::from("/tmp/secret"));
     }
 
     #[test]
     fn normalize_path_handles_current_dir() {
-        let result = normalize_path(Path::new("/tmp/./workspace/./file"));
+        let base = Path::new("/tmp/workspace");
+        let result = normalize_path(Path::new("/tmp/./workspace/./file"), base);
         assert_eq!(result, PathBuf::from("/tmp/workspace/file"));
+    }
+
+    #[test]
+    fn normalize_path_resolves_relative_path() {
+        let base = Path::new("/tmp/workspace");
+        let result = normalize_path(Path::new("src/main.rs"), base);
+        assert_eq!(result, PathBuf::from("/tmp/workspace/src/main.rs"));
+    }
+
+    #[test]
+    fn relative_path_access_within_workspace() {
+        let config = test_config().with_mode(SandboxMode::WorkspaceWrite);
+        let ctx = SandboxContext::new(config);
+
+        // Relative paths should be resolved against the workspace.
+        assert!(ctx.check_path_access("src/main.rs").is_ok());
+        assert!(ctx.check_write_access("output.txt").is_ok());
+    }
+
+    #[test]
+    fn relative_path_traversal_denied() {
+        let config = test_config().with_mode(SandboxMode::WorkspaceWrite);
+        let ctx = SandboxContext::new(config);
+
+        // Relative path that escapes via `..` should be denied.
+        assert!(ctx.check_path_access("../../etc/passwd").is_err());
     }
 
     #[tokio::test]

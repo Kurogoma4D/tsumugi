@@ -20,13 +20,6 @@ pub enum SandboxError {
         source: std::io::Error,
     },
 
-    /// Failed to apply iptables rules for domain allowlisting.
-    #[error("failed to apply iptables rule: {reason}")]
-    Iptables {
-        /// A human-readable description of the failure.
-        reason: String,
-    },
-
     /// A filesystem access was denied by the sandbox.
     #[error("access denied: {path} is outside the sandbox")]
     AccessDenied {
@@ -54,16 +47,6 @@ pub enum SandboxError {
     Io {
         /// Description of what the sandbox was doing when the error occurred.
         context: String,
-        /// The underlying I/O error.
-        #[source]
-        source: std::io::Error,
-    },
-
-    /// DNS resolution failed for an allowed domain.
-    #[error("DNS resolution failed for domain '{domain}': {source}")]
-    DnsResolution {
-        /// The domain that could not be resolved.
-        domain: String,
         /// The underlying I/O error.
         #[source]
         source: std::io::Error,

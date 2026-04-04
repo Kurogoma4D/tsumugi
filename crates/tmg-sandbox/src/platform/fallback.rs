@@ -40,19 +40,6 @@ pub fn create_network_namespace() -> Result<(), SandboxError> {
     Ok(())
 }
 
-/// No-op: iptables-based network allowlisting is Linux-only.
-///
-/// Returns `Ok(())` -- the caller should proceed without network restrictions.
-pub async fn apply_network_allowlist(allowed_domains: &[String]) -> Result<(), SandboxError> {
-    if !allowed_domains.is_empty() {
-        emit_warning(
-            "Network domain allowlisting is not available on this platform; \
-             all network access is permitted",
-        );
-    }
-    Ok(())
-}
-
 /// No-op: OOM score adjustment is Linux-only.
 ///
 /// Returns `Ok(())`.

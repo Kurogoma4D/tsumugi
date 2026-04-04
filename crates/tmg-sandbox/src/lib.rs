@@ -7,7 +7,7 @@
 //! # Platform support
 //!
 //! - **Linux**: Full support via Landlock (filesystem), network namespaces
-//!   + iptables (network), and `/proc` (OOM score adjustment).
+//!   (network isolation), and `/proc` (OOM score adjustment).
 //! - **macOS / other**: All sandbox operations are no-ops that emit
 //!   warnings. Path validation checks still function as a software-level
 //!   safety net.

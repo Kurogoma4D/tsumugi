@@ -11,11 +11,7 @@ mod linux;
 mod fallback;
 
 #[cfg(target_os = "linux")]
-pub use linux::{
-    adjust_oom_score, apply_landlock, apply_network_allowlist, create_network_namespace,
-};
+pub use linux::{adjust_oom_score, apply_landlock, create_network_namespace};
 
 #[cfg(not(target_os = "linux"))]
-pub use fallback::{
-    adjust_oom_score, apply_landlock, apply_network_allowlist, create_network_namespace,
-};
+pub use fallback::{adjust_oom_score, apply_landlock, create_network_namespace};

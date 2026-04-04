@@ -2,7 +2,6 @@
 //!
 //! This module is only compiled on `target_os = "linux"`.
 
-use std::net::ToSocketAddrs;
 use std::path::Path;
 
 use landlock::{
@@ -16,7 +15,7 @@ use crate::mode::SandboxMode;
 /// The best Landlock ABI version we target.
 const LANDLOCK_ABI: ABI = ABI::V3;
 
-/// System paths that receive read-only access in the sandbox.
+/// System paths that receive read-only access in the Landlock ruleset.
 const SYSTEM_READ_ONLY_PATHS: &[&str] = &["/usr", "/bin", "/lib", "/lib64"];
 
 /// Apply Landlock filesystem restrictions based on the sandbox configuration.
@@ -138,82 +137,6 @@ pub fn create_network_namespace() -> Result<(), SandboxError> {
             source: std::io::Error::last_os_error(),
         });
     }
-    Ok(())
-}
-
-/// Apply iptables rules to allow only the specified domains.
-///
-/// Resolves each domain to IP addresses, adds ACCEPT rules for those
-/// addresses, then sets the default OUTPUT policy to DROP.
-///
-/// # Errors
-///
-/// Returns [`SandboxError::DnsResolution`] if a domain cannot be resolved,
-/// or [`SandboxError::Iptables`] if an iptables command fails.
-pub async fn apply_network_allowlist(allowed_domains: &[String]) -> Result<(), SandboxError> {
-    if allowed_domains.is_empty() {
-        // No domains allowed: set default DROP policy.
-        run_iptables(&["-P", "OUTPUT", "DROP"]).await?;
-        // Allow loopback.
-        run_iptables(&["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"]).await?;
-        return Ok(());
-    }
-
-    // Allow loopback first.
-    run_iptables(&["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"]).await?;
-
-    // Allow DNS resolution (port 53).
-    run_iptables(&["-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", "ACCEPT"]).await?;
-    run_iptables(&["-A", "OUTPUT", "-p", "tcp", "--dport", "53", "-j", "ACCEPT"]).await?;
-
-    // Resolve each domain and add ACCEPT rules.
-    for domain in allowed_domains {
-        let addrs = tokio::task::spawn_blocking({
-            let domain = domain.clone();
-            move || {
-                (domain.as_str(), 0u16)
-                    .to_socket_addrs()
-                    .map(|iter| iter.map(|addr| addr.ip().to_string()).collect::<Vec<_>>())
-            }
-        })
-        .await
-        .map_err(|e| SandboxError::Io {
-            context: format!("DNS resolution task for '{domain}'"),
-            source: std::io::Error::other(e.to_string()),
-        })?
-        .map_err(|e| SandboxError::DnsResolution {
-            domain: domain.clone(),
-            source: e,
-        })?;
-
-        for ip in addrs {
-            run_iptables(&["-A", "OUTPUT", "-d", &ip, "-j", "ACCEPT"]).await?;
-        }
-    }
-
-    // Default policy: DROP everything else.
-    run_iptables(&["-P", "OUTPUT", "DROP"]).await?;
-
-    Ok(())
-}
-
-/// Run an iptables command with the given arguments.
-async fn run_iptables(args: &[&str]) -> Result<(), SandboxError> {
-    let output = tokio::process::Command::new("iptables")
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| SandboxError::Iptables {
-            reason: format!("failed to execute iptables: {e}"),
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SandboxError::Iptables {
-            reason: format!("iptables {} failed: {}", args.join(" "), stderr.trim()),
-        });
-    }
-
     Ok(())
 }
 

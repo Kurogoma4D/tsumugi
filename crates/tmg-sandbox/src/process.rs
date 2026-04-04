@@ -25,7 +25,7 @@ pub async fn run_sandboxed_command(
     timeout_secs: u64,
     oom_score_adj: i32,
 ) -> Result<CommandOutput, SandboxError> {
-    let mut child = tokio::process::Command::new("sh")
+    let child = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(command)
         .stdout(std::process::Stdio::piped())
@@ -42,60 +42,30 @@ pub async fn run_sandboxed_command(
 
     let timeout = Duration::from_secs(timeout_secs);
 
-    // Use `wait()` instead of `wait_with_output()` so we retain ownership
-    // of the child handle for explicit kill on timeout. Capture stdout/stderr
-    // pipes before awaiting.
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-
-    let wait_result = tokio::time::timeout(timeout, child.wait()).await;
+    // Use `wait_with_output()` to read stdout/stderr concurrently with
+    // waiting for the process to exit. This avoids a deadlock that can
+    // occur when reading pipes sequentially after `wait()` -- the child
+    // may block on a full pipe buffer and never exit.
+    let wait_result = tokio::time::timeout(timeout, child.wait_with_output()).await;
 
     match wait_result {
-        Ok(Ok(status)) => {
-            let stdout = read_pipe(stdout_pipe).await;
-            let stderr = read_stderr_pipe(stderr_pipe).await;
-            let exit_code = status.code().unwrap_or(-1);
+        Ok(Ok(output)) => {
+            let exit_code = output.status.code().unwrap_or(-1);
 
             Ok(CommandOutput {
-                stdout,
-                stderr,
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
                 exit_code,
             })
         }
         Ok(Err(e)) => Err(SandboxError::io("waiting for sandboxed command", e)),
         Err(_) => {
-            // Timeout exceeded. Send SIGKILL for immediate cleanup.
-            // `kill_on_drop(true)` is a fallback if this fails.
-            let _ = child.kill().await;
+            // Timeout exceeded. `kill_on_drop(true)` ensures cleanup.
             Err(SandboxError::Timeout {
                 seconds: timeout_secs,
             })
         }
     }
-}
-
-/// Read all bytes from an optional pipe and return as a lossy UTF-8 string.
-async fn read_pipe(pipe: Option<tokio::process::ChildStdout>) -> String {
-    use tokio::io::AsyncReadExt;
-
-    let Some(mut pipe) = pipe else {
-        return String::new();
-    };
-    let mut buf = Vec::new();
-    let _ = pipe.read_to_end(&mut buf).await;
-    String::from_utf8_lossy(&buf).into_owned()
-}
-
-/// Read all bytes from an optional stderr pipe and return as a lossy UTF-8 string.
-async fn read_stderr_pipe(pipe: Option<tokio::process::ChildStderr>) -> String {
-    use tokio::io::AsyncReadExt;
-
-    let Some(mut pipe) = pipe else {
-        return String::new();
-    };
-    let mut buf = Vec::new();
-    let _ = pipe.read_to_end(&mut buf).await;
-    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Output from a sandboxed command execution.
