@@ -107,19 +107,6 @@ pub enum SkillSource {
     ProjectAgents = 4,
 }
 
-impl SkillSource {
-    /// All sources with fixed paths, in priority order (highest first).
-    ///
-    /// Does not include [`SkillSource::Custom`], which requires a
-    /// user-supplied path and is handled separately in discovery logic.
-    pub const ALL: [Self; 4] = [
-        Self::ProjectTsumugi,
-        Self::GlobalConfig,
-        Self::ProjectClaude,
-        Self::ProjectAgents,
-    ];
-}
-
 impl fmt::Display for SkillSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
