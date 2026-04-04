@@ -177,9 +177,9 @@ pub struct ToolCallDelta {
     /// Tool call id (present in the first delta for this call).
     pub id: Option<String>,
 
-    /// Always `"function"` when present.
+    /// Always [`ToolKind::Function`] when present.
     #[serde(rename = "type")]
-    pub kind: Option<String>,
+    pub kind: Option<ToolKind>,
 
     /// Incremental function data.
     pub function: Option<FunctionCallDelta>,
@@ -451,7 +451,7 @@ mod tests {
         let d1 = vec![ToolCallDelta {
             index: 0,
             id: Some("call_1".into()),
-            kind: Some("function".into()),
+            kind: Some(ToolKind::Function),
             function: Some(FunctionCallDelta {
                 name: Some("read_file".into()),
                 arguments: Some("{\"path\":".into()),
@@ -490,7 +490,7 @@ mod tests {
         acc.feed(&[ToolCallDelta {
             index: 0,
             id: Some("call_a".into()),
-            kind: Some("function".into()),
+            kind: Some(ToolKind::Function),
             function: Some(FunctionCallDelta {
                 name: Some("foo".into()),
                 arguments: Some("{}".into()),
@@ -503,7 +503,7 @@ mod tests {
             .feed(&[ToolCallDelta {
                 index: 1,
                 id: Some("call_b".into()),
-                kind: Some("function".into()),
+                kind: Some(ToolKind::Function),
                 function: Some(FunctionCallDelta {
                     name: Some("bar".into()),
                     arguments: Some("{\"x\":1}".into()),
@@ -528,7 +528,7 @@ mod tests {
         let result = acc.feed(&[ToolCallDelta {
             index: u32::MAX,
             id: Some("call_bad".into()),
-            kind: Some("function".into()),
+            kind: Some(ToolKind::Function),
             function: Some(FunctionCallDelta {
                 name: Some("exploit".into()),
                 arguments: Some("{}".into()),
