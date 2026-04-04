@@ -63,11 +63,22 @@ pub trait StreamSink {
     ) -> Result<(), CoreError> {
         Ok(())
     }
+
+    /// Called when a non-fatal warning occurs (e.g., auto-compression failure).
+    fn on_warning(&mut self, _message: &str) -> Result<(), CoreError> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
 // AgentLoop
 // ---------------------------------------------------------------------------
+
+/// Number of recent messages to preserve during compression.
+///
+/// These messages are never summarized to ensure the model has
+/// immediate context for the current task.
+const PRESERVE_RECENT_MESSAGES: usize = 6;
 
 /// An agent loop that manages conversation history, streams LLM
 /// responses, dispatches tool calls, and loops until the model is done.
@@ -76,12 +87,6 @@ pub trait StreamSink {
 /// using a [`JoinSet`]. The loop continues sending tool results back
 /// to the LLM until it produces a final text-only response (or the
 /// maximum round count is reached).
-/// Number of recent messages to preserve during compression.
-///
-/// These messages are never summarized to ensure the model has
-/// immediate context for the current task.
-const PRESERVE_RECENT_MESSAGES: usize = 6;
-
 pub struct AgentLoop {
     /// The LLM client used to send requests.
     client: LlmClient,
@@ -291,9 +296,11 @@ impl AgentLoop {
 
                 // Update token count and check for auto-compression.
                 self.token_counter.request_update(&self.history).await;
-                // Ignore compression errors -- a failed compression should
-                // not prevent the turn from completing successfully.
-                let _ = self.maybe_auto_compress().await;
+                // Surface compression errors as a warning so users know
+                // compression failed, but do not abort the turn.
+                if let Err(e) = self.maybe_auto_compress().await {
+                    sink.on_warning(&format!("auto-compression failed: {e}"))?;
+                }
 
                 return Ok(());
             }

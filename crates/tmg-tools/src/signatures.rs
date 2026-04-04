@@ -11,6 +11,7 @@
 //! - JavaScript / TypeScript (`.js`, `.jsx`, `.ts`, `.tsx`)
 
 use std::fmt::Write as _;
+use std::sync::LazyLock;
 
 use regex::Regex;
 
@@ -30,6 +31,8 @@ pub struct Signature {
 /// Returns `None` if the file extension is not recognized as a
 /// supported language. Returns an empty `Vec` if no signatures
 /// are found.
+// TODO: integrate into `ContextCompressor` in tmg-core to replace large
+// tool-result file contents with structural summaries during compression.
 pub fn extract_signatures(filename: &str, source: &str) -> Option<Vec<Signature>> {
     let ext = filename.rsplit('.').next()?;
     match ext {
@@ -57,40 +60,39 @@ pub fn format_signatures(signatures: &[Signature]) -> String {
 // ---------------------------------------------------------------------------
 
 fn extract_rust(source: &str) -> Vec<Signature> {
+    // Compile-time-known patterns: compiled once via LazyLock.
+    // unwrap is safe here because these are known-valid regex literals.
+    #[expect(clippy::unwrap_used, reason = "compile-time-known regex pattern")]
+    static FN_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?m)^[[:blank:]]*((?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const)\s+)*fn\s+\w+[^{;]*)",
+        )
+        .unwrap()
+    });
+    #[expect(clippy::unwrap_used, reason = "compile-time-known regex pattern")]
+    static TYPE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?m)^[[:blank:]]*((?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait|type|union)\s+\w+[^{;=]*)",
+        )
+        .unwrap()
+    });
+    #[expect(clippy::unwrap_used, reason = "compile-time-known regex pattern")]
+    static IMPL_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?m)^[[:blank:]]*(impl(?:<[^>]*>)?\s+(?:\w+(?:::\w+)*(?:<[^>]*>)?\s+for\s+)?\w+(?:::\w+)*(?:<[^>]*>)?)",
+        )
+        .unwrap()
+    });
+    #[expect(clippy::unwrap_used, reason = "compile-time-known regex pattern")]
+    static MACRO_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^[[:blank:]]*((?:pub(?:\([^)]*\))?\s+)?macro_rules!\s+\w+)").unwrap()
+    });
+
     let mut sigs = Vec::new();
-
-    // Match function definitions (pub/pub(crate)/async/unsafe/const fn)
-    let fn_re = Regex::new(
-        r"(?m)^[[:blank:]]*((?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const)\s+)*fn\s+\w+[^{;]*)",
-    )
-    .ok();
-
-    // Match struct/enum/trait/type definitions
-    let type_re = Regex::new(
-        r"(?m)^[[:blank:]]*((?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait|type|union)\s+\w+[^{;=]*)"
-    ).ok();
-
-    // Match impl blocks
-    let impl_re = Regex::new(
-        r"(?m)^[[:blank:]]*(impl(?:<[^>]*>)?\s+(?:\w+(?:::\w+)*(?:<[^>]*>)?\s+for\s+)?\w+(?:::\w+)*(?:<[^>]*>)?)"
-    ).ok();
-
-    // Match macro definitions
-    let macro_re =
-        Regex::new(r"(?m)^[[:blank:]]*((?:pub(?:\([^)]*\))?\s+)?macro_rules!\s+\w+)").ok();
-
-    if let Some(re) = &fn_re {
-        collect_matches(source, re, "fn", &mut sigs);
-    }
-    if let Some(re) = &type_re {
-        collect_matches(source, re, "type", &mut sigs);
-    }
-    if let Some(re) = &impl_re {
-        collect_matches(source, re, "impl", &mut sigs);
-    }
-    if let Some(re) = &macro_re {
-        collect_matches(source, re, "macro", &mut sigs);
-    }
+    collect_matches(source, &FN_RE, "fn", &mut sigs);
+    collect_matches(source, &TYPE_RE, "type", &mut sigs);
+    collect_matches(source, &IMPL_RE, "impl", &mut sigs);
+    collect_matches(source, &MACRO_RE, "macro", &mut sigs);
 
     sigs.sort_by_key(|s| s.line);
     sigs
@@ -101,22 +103,18 @@ fn extract_rust(source: &str) -> Vec<Signature> {
 // ---------------------------------------------------------------------------
 
 fn extract_python(source: &str) -> Vec<Signature> {
-    let mut sigs = Vec::new();
-
-    // Match function/method definitions
-    let fn_re =
+    #[expect(clippy::unwrap_used, reason = "compile-time-known regex pattern")]
+    static FN_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?m)^[[:blank:]]*((?:async\s+)?def\s+\w+\s*\([^)]*\)(?:\s*->\s*[^\n:]+)?)")
-            .ok();
+            .unwrap()
+    });
+    #[expect(clippy::unwrap_used, reason = "compile-time-known regex pattern")]
+    static CLASS_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^[[:blank:]]*(class\s+\w+(?:\([^)]*\))?)").unwrap());
 
-    // Match class definitions
-    let class_re = Regex::new(r"(?m)^[[:blank:]]*(class\s+\w+(?:\([^)]*\))?)").ok();
-
-    if let Some(re) = &fn_re {
-        collect_matches(source, re, "def", &mut sigs);
-    }
-    if let Some(re) = &class_re {
-        collect_matches(source, re, "class", &mut sigs);
-    }
+    let mut sigs = Vec::new();
+    collect_matches(source, &FN_RE, "def", &mut sigs);
+    collect_matches(source, &CLASS_RE, "class", &mut sigs);
 
     sigs.sort_by_key(|s| s.line);
     sigs
@@ -127,47 +125,45 @@ fn extract_python(source: &str) -> Vec<Signature> {
 // ---------------------------------------------------------------------------
 
 fn extract_javascript(source: &str) -> Vec<Signature> {
+    #[expect(clippy::unwrap_used, reason = "compile-time-known regex pattern")]
+    static FN_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?m)^[[:blank:]]*((?:export\s+)?(?:async\s+)?function\s*\*?\s*\w+\s*(?:<[^>]*>)?\s*\([^)]*\)(?:\s*:\s*[^\n{]+)?)",
+        )
+        .unwrap()
+    });
+    #[expect(clippy::unwrap_used, reason = "compile-time-known regex pattern")]
+    static ARROW_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?m)^[[:blank:]]*((?:export\s+)?(?:const|let|var)\s+\w+\s*(?::\s*[^=]+)?\s*=\s*(?:async\s+)?(?:\([^)]*\)|[a-zA-Z_]\w*)(?:\s*:\s*[^\n=>]+)?\s*=>)",
+        )
+        .unwrap()
+    });
+    #[expect(clippy::unwrap_used, reason = "compile-time-known regex pattern")]
+    static CLASS_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?m)^[[:blank:]]*((?:export\s+)?(?:abstract\s+)?class\s+\w+(?:<[^>]*>)?(?:\s+extends\s+\w+(?:<[^>]*>)?)?(?:\s+implements\s+[^\n{]+)?)",
+        )
+        .unwrap()
+    });
+    #[expect(clippy::unwrap_used, reason = "compile-time-known regex pattern")]
+    static IFACE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?m)^[[:blank:]]*((?:export\s+)?interface\s+\w+(?:<[^>]*>)?(?:\s+extends\s+[^\n{]+)?)",
+        )
+        .unwrap()
+    });
+    #[expect(clippy::unwrap_used, reason = "compile-time-known regex pattern")]
+    static TYPE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^[[:blank:]]*((?:export\s+)?type\s+\w+(?:<[^>]*>)?\s*=)").unwrap()
+    });
+
     let mut sigs = Vec::new();
-
-    // Match function declarations
-    let fn_re = Regex::new(
-        r"(?m)^[[:blank:]]*((?:export\s+)?(?:async\s+)?function\s*\*?\s*\w+\s*(?:<[^>]*>)?\s*\([^)]*\)(?:\s*:\s*[^\n{]+)?)"
-    ).ok();
-
-    // Match arrow functions assigned to const/let/var
-    let arrow_re = Regex::new(
-        r"(?m)^[[:blank:]]*((?:export\s+)?(?:const|let|var)\s+\w+\s*(?::\s*[^=]+)?\s*=\s*(?:async\s+)?(?:\([^)]*\)|[a-zA-Z_]\w*)(?:\s*:\s*[^\n=>]+)?\s*=>)"
-    ).ok();
-
-    // Match class declarations
-    let class_re = Regex::new(
-        r"(?m)^[[:blank:]]*((?:export\s+)?(?:abstract\s+)?class\s+\w+(?:<[^>]*>)?(?:\s+extends\s+\w+(?:<[^>]*>)?)?(?:\s+implements\s+[^\n{]+)?)"
-    ).ok();
-
-    // Match interface declarations (TypeScript)
-    let iface_re = Regex::new(
-        r"(?m)^[[:blank:]]*((?:export\s+)?interface\s+\w+(?:<[^>]*>)?(?:\s+extends\s+[^\n{]+)?)",
-    )
-    .ok();
-
-    // Match type alias declarations (TypeScript)
-    let type_re = Regex::new(r"(?m)^[[:blank:]]*((?:export\s+)?type\s+\w+(?:<[^>]*>)?\s*=)").ok();
-
-    if let Some(re) = &fn_re {
-        collect_matches(source, re, "function", &mut sigs);
-    }
-    if let Some(re) = &arrow_re {
-        collect_matches(source, re, "const fn", &mut sigs);
-    }
-    if let Some(re) = &class_re {
-        collect_matches(source, re, "class", &mut sigs);
-    }
-    if let Some(re) = &iface_re {
-        collect_matches(source, re, "interface", &mut sigs);
-    }
-    if let Some(re) = &type_re {
-        collect_matches(source, re, "type", &mut sigs);
-    }
+    collect_matches(source, &FN_RE, "function", &mut sigs);
+    collect_matches(source, &ARROW_RE, "const fn", &mut sigs);
+    collect_matches(source, &CLASS_RE, "class", &mut sigs);
+    collect_matches(source, &IFACE_RE, "interface", &mut sigs);
+    collect_matches(source, &TYPE_RE, "type", &mut sigs);
 
     sigs.sort_by_key(|s| s.line);
     sigs

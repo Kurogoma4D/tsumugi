@@ -60,7 +60,8 @@ impl ContextConfig {
         reason = "threshold is clamped to 0..1 and max_context_tokens fits in usize; precision loss is acceptable"
     )]
     pub fn compression_trigger(&self) -> usize {
-        (self.max_context_tokens as f64 * self.compression_threshold) as usize
+        let threshold = self.compression_threshold.clamp(0.0, 1.0);
+        (self.max_context_tokens as f64 * threshold) as usize
     }
 }
 
@@ -72,7 +73,6 @@ impl ContextConfig {
 ///
 /// Maintains a cached count that is updated asynchronously so TUI rendering
 /// is never blocked.
-#[derive(Debug)]
 pub struct TokenCounter {
     /// The LLM client used for tokenization requests.
     client: LlmClient,
@@ -80,6 +80,14 @@ pub struct TokenCounter {
     cached_count: Arc<AtomicU64>,
     /// Background task set for managing tokenization requests.
     tasks: Arc<Mutex<JoinSet<()>>>,
+}
+
+impl std::fmt::Debug for TokenCounter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenCounter")
+            .field("cached_count", &self.cached_count.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 impl TokenCounter {
@@ -115,6 +123,9 @@ impl TokenCounter {
         let cached = Arc::clone(&self.cached_count);
 
         let mut tasks = self.tasks.lock().await;
+        // Only the latest count matters; abort all prior tasks and drain them.
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
         tasks.spawn(async move {
             let count = match client.tokenize(&content).await {
                 Ok(count) => count,
@@ -251,9 +262,12 @@ impl ContextCompressor {
             // Truncate very long messages for the summary request.
             let content = msg.content();
             if content.len() > 2000 {
-                context_text.push_str(&content[..1000]);
+                let head_end = find_floor_char_boundary(content, 1000);
+                let tail_start =
+                    find_ceil_char_boundary(content, content.len().saturating_sub(500));
+                context_text.push_str(&content[..head_end]);
                 context_text.push_str("\n...(truncated)...\n");
-                context_text.push_str(&content[content.len() - 500..]);
+                context_text.push_str(&content[tail_start..]);
             } else {
                 context_text.push_str(content);
             }

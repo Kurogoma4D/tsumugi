@@ -71,6 +71,24 @@ pub enum TurnMessage {
         /// Whether the error was a cancellation.
         cancelled: bool,
     },
+    /// The `/compact` background task completed successfully.
+    CompactDone {
+        /// The agent loop returned after compaction.
+        agent: AgentLoop,
+        /// Current token count after compression.
+        token_count: usize,
+        /// Maximum context tokens configured.
+        max_tokens: usize,
+    },
+    /// The `/compact` background task failed.
+    CompactError {
+        /// The agent loop returned after compaction failure.
+        agent: AgentLoop,
+        /// The error message.
+        message: String,
+        /// Whether the error was a cancellation.
+        cancelled: bool,
+    },
 }
 
 /// Handle for a running conversation turn background task.
@@ -383,6 +401,66 @@ impl App {
         self.pending_compact = false;
     }
 
+    /// Start context compression in a background task.
+    ///
+    /// Takes ownership of the agent for the duration, similar to
+    /// [`start_turn`]. Results are communicated via `TurnMessage::CompactDone`
+    /// or `TurnMessage::CompactError`.
+    pub fn start_compact(&mut self, parent_cancel: &CancellationToken) {
+        let Some(mut agent) = self.agent.take() else {
+            return;
+        };
+
+        let turn_cancel = parent_cancel.child_token();
+        agent.set_cancel_token(turn_cancel.clone());
+
+        self.streaming = true;
+
+        let (tx, rx) = mpsc::channel::<TurnMessage>(16);
+
+        let join = tokio::spawn(async move {
+            let result = agent.compact().await;
+
+            match result {
+                Ok(()) => {
+                    let token_count = agent.token_count();
+                    let max_tokens = agent.context_config().max_context_tokens;
+                    let _ = tx
+                        .send(TurnMessage::CompactDone {
+                            agent,
+                            token_count,
+                            max_tokens,
+                        })
+                        .await;
+                }
+                Err(CoreError::Cancelled) => {
+                    let _ = tx
+                        .send(TurnMessage::CompactError {
+                            agent,
+                            message: "Context compression cancelled.".to_owned(),
+                            cancelled: true,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(TurnMessage::CompactError {
+                            agent,
+                            message: format!("Context compression failed: {e}"),
+                            cancelled: false,
+                        })
+                        .await;
+                }
+            }
+        });
+
+        self.turn_handle = Some(TurnHandle {
+            rx,
+            turn_cancel,
+            _join: join,
+        });
+    }
+
     /// Handle a slash command. Returns `Ok(())` if handled.
     fn handle_slash_command(&mut self, cmd: &str) -> Result<(), CoreError> {
         match cmd.trim() {
@@ -553,6 +631,10 @@ impl App {
     ///
     /// Returns `true` if a redraw is needed (i.e., at least one message
     /// was received).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "message dispatch loop handles all TurnMessage variants; splitting would obscure control flow"
+    )]
     pub fn drain_turn_messages(&mut self) -> bool {
         let Some(handle) = &mut self.turn_handle else {
             return false;
@@ -620,6 +702,34 @@ impl App {
                             }
                         }
                     }
+                    self.set_chat_scroll(0);
+                    return true;
+                }
+                Ok(TurnMessage::CompactDone {
+                    agent,
+                    token_count,
+                    max_tokens,
+                }) => {
+                    self.agent = Some(agent);
+                    self.streaming = false;
+                    self.turn_handle = None;
+                    self.context_usage = format_context_usage(token_count, max_tokens);
+                    self.chat_entries.push(ChatEntry {
+                        role: Role::System,
+                        text: "Context compressed successfully.".to_owned(),
+                    });
+                    self.set_chat_scroll(0);
+                    return true;
+                }
+                Ok(TurnMessage::CompactError {
+                    agent,
+                    message,
+                    cancelled: _,
+                }) => {
+                    self.agent = Some(agent);
+                    self.streaming = false;
+                    self.turn_handle = None;
+                    self.error_message = Some(message);
                     self.set_chat_scroll(0);
                     return true;
                 }
