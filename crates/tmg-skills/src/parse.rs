@@ -57,12 +57,10 @@ pub fn parse_skill_md(
 
     let yaml_content = &rest[..end_idx];
     let body_start = end_idx + FRONTMATTER_DELIMITER.len();
-    let body = rest[body_start..]
-        .trim_start_matches('\n')
-        .trim_start_matches('\r');
+    let body = rest[body_start..].trim_start_matches(['\n', '\r']);
 
     let frontmatter: SkillFrontmatter =
-        serde_yaml::from_str(yaml_content).map_err(|e| SkillError::YamlParse {
+        serde_yml::from_str(yaml_content).map_err(|e| SkillError::YamlParse {
             path: file_path.to_owned(),
             source: e,
         })?;
@@ -73,47 +71,34 @@ pub fn parse_skill_md(
 /// Find the byte offset of the closing `---` delimiter within the text
 /// after the opening delimiter has been stripped.
 ///
-/// The closing delimiter must appear at the start of a line.
+/// The closing delimiter must appear at the start of a line. Uses
+/// cumulative byte offsets to avoid mismatch when YAML content contains
+/// `---` substrings.
 fn find_closing_delimiter(text: &str) -> Option<usize> {
-    for (idx, line) in text.lines().enumerate() {
-        // Skip the first "line" which is the remainder of the opening
-        // delimiter line (usually empty or just a newline).
+    let mut offset = 0;
+    for (idx, line) in text.split('\n').enumerate() {
         if idx == 0 {
+            offset += line.len() + 1;
             continue;
         }
         if line.trim() == FRONTMATTER_DELIMITER {
-            // Calculate byte offset: we need to find where this line
-            // starts in the original text.
-            let line_start = text
-                .match_indices(line)
-                .find(|(pos, _)| {
-                    // Make sure this is at a line boundary.
-                    *pos == 0 || text.as_bytes().get(pos - 1) == Some(&b'\n')
-                })
-                .map(|(pos, _)| pos);
-
-            // Only match `---` lines that are exactly the delimiter
-            // (not a longer line starting with `---`).
-            if let Some(start) = line_start {
-                if text[start..].starts_with(FRONTMATTER_DELIMITER) {
-                    return Some(start);
-                }
-            }
+            return Some(offset);
         }
+        offset += line.len() + 1;
     }
     None
 }
 
 /// Serialize a `SkillFrontmatter` back to YAML string (for roundtrip testing).
-pub fn serialize_frontmatter(frontmatter: &SkillFrontmatter) -> Result<String, serde_yaml::Error> {
-    serde_yaml::to_string(frontmatter)
+pub fn serialize_frontmatter(frontmatter: &SkillFrontmatter) -> Result<String, serde_yml::Error> {
+    serde_yml::to_string(frontmatter)
 }
 
 /// Format a full SKILL.md file from frontmatter and body.
 pub fn format_skill_md(
     frontmatter: &SkillFrontmatter,
     body: &str,
-) -> Result<String, serde_yaml::Error> {
+) -> Result<String, serde_yml::Error> {
     let yaml = serialize_frontmatter(frontmatter)?;
     Ok(format!("---\n{yaml}---\n\n{body}"))
 }
@@ -204,8 +189,7 @@ Review the code carefully.
         };
 
         let yaml = serialize_frontmatter(&original).unwrap_or_else(|e| panic!("{e}"));
-        let parsed: SkillFrontmatter =
-            serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("{e}"));
+        let parsed: SkillFrontmatter = serde_yml::from_str(&yaml).unwrap_or_else(|e| panic!("{e}"));
 
         assert_eq!(original, parsed);
     }

@@ -29,7 +29,7 @@ pub enum SkillError {
         path: String,
         /// The underlying YAML error.
         #[source]
-        source: serde_yaml::Error,
+        source: serde_yml::Error,
     },
 
     /// The requested skill was not found.

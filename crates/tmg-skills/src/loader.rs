@@ -1,5 +1,8 @@
 //! Skill loading: reads the full SKILL.md body and associated resource files.
 
+// `write!`/`writeln!` to `String` is infallible (the `fmt::Write` impl for
+// `String` never returns `Err`), so `let _ = writeln!(...)` is intentional
+// throughout this module.
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -9,6 +12,11 @@ use crate::types::{InvocationPolicy, SkillContent, SkillMeta};
 
 /// Load the full content of a skill, including its instruction body
 /// and lists of associated scripts/ and references/ files.
+///
+/// # Panics
+///
+/// Panics if `meta.path` has no parent directory (should be unreachable
+/// since `SkillPath` always points to a file).
 ///
 /// # Errors
 ///
@@ -24,7 +32,13 @@ pub async fn load_skill(meta: &SkillMeta) -> Result<SkillContent, SkillError> {
     let (_frontmatter, body) = parse_skill_md(&content, &file_path_str)?;
 
     // The skill directory is the parent of SKILL.md.
-    let skill_dir = skill_file.parent().unwrap_or(Path::new("."));
+    #[expect(
+        clippy::expect_used,
+        reason = "SkillPath is always a file path with a parent directory"
+    )]
+    let skill_dir = skill_file
+        .parent()
+        .expect("SkillPath always has a parent directory");
 
     let scripts = list_files_in_subdir(skill_dir, "scripts").await?;
     let references = list_files_in_subdir(skill_dir, "references").await?;

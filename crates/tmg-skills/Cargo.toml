@@ -10,7 +10,7 @@ tmg-tools = { workspace = true }
 tmg-llm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+serde_yml = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 dirs = { workspace = true }

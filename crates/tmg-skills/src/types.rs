@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// A unique skill name (e.g. `"code-review"`, `"test-runner"`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct SkillName(pub String);
+pub struct SkillName(String);
 
 impl SkillName {
     /// Create a new `SkillName`.
@@ -26,6 +26,11 @@ impl SkillName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Consume self and return the inner `String`.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
 }
 
 impl fmt::Display for SkillName {
@@ -36,7 +41,7 @@ impl fmt::Display for SkillName {
 
 /// An absolute path to a SKILL.md file.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SkillPath(pub PathBuf);
+pub struct SkillPath(PathBuf);
 
 impl SkillPath {
     /// Create a new `SkillPath`.
@@ -47,6 +52,11 @@ impl SkillPath {
     /// Return the inner path reference.
     pub fn as_path(&self) -> &std::path::Path {
         &self.0
+    }
+
+    /// Consume self and return the inner `PathBuf`.
+    pub fn into_inner(self) -> PathBuf {
+        self.0
     }
 }
 

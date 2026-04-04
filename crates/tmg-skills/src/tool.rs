@@ -73,13 +73,11 @@ impl UseSkillTool {
 
         let name = SkillName::new(skill_name);
         let Some(meta) = self.skills.get(&name) else {
+            let mut available: Vec<&str> = self.skills.keys().map(SkillName::as_str).collect();
+            available.sort_unstable();
             return Ok(ToolResult::error(format!(
                 "Skill not found: {skill_name}. Available skills: {}",
-                self.skills
-                    .keys()
-                    .map(SkillName::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                available.join(", ")
             )));
         };
 
