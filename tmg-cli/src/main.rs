@@ -1,37 +1,50 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
 use clap::Parser;
 use tokio::sync::Mutex;
 
+mod config;
+mod error;
+
+use config::TsumugiConfig;
+
 /// tsumugi - a local-LLM-powered coding agent
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// Send a one-shot prompt to the LLM server and stream the response to stdout.
+    /// Send a one-shot prompt to the LLM server and stream the response
+    /// to stdout.
     #[arg(long)]
     prompt: Option<String>,
 
-    /// LLM server endpoint URL.
-    #[arg(long, default_value = "http://localhost:8080")]
-    endpoint: String,
+    /// LLM server endpoint URL. Overrides config file and environment.
+    #[arg(long)]
+    endpoint: Option<String>,
 
-    /// Model name to use.
-    #[arg(long, default_value = "default")]
-    model: String,
+    /// Model name to use. Overrides config file and environment.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Path to a `tsumugi.toml` configuration file.
+    /// When specified, only this file is loaded (no global/project-local
+    /// discovery).
+    #[arg(long)]
+    config: Option<PathBuf>,
 
     /// Maximum context window tokens.
-    #[arg(long, default_value = "8192")]
-    max_context_tokens: usize,
+    #[arg(long)]
+    max_context_tokens: Option<usize>,
 
     /// Context compression threshold (0.0-1.0). Compression auto-triggers
     /// when context usage exceeds this fraction of `max_context_tokens`.
-    #[arg(long, default_value = "0.8")]
-    context_compression_threshold: f64,
+    #[arg(long)]
+    context_compression_threshold: Option<f64>,
 
     /// Maximum tokens for a single tool result before truncation.
-    #[arg(long, default_value = "4096")]
-    max_tool_result_tokens: usize,
+    #[arg(long)]
+    max_tool_result_tokens: Option<usize>,
 
     /// Tool calling mode: "native", "prompt_based", or "auto".
     ///
@@ -42,26 +55,78 @@ struct Cli {
         clippy::doc_markdown,
         reason = "clap renders doc comments as --help text; backticks would show literally"
     )]
-    #[arg(long, default_value = "auto")]
-    tool_calling: tmg_core::ToolCallingMode,
+    #[arg(long)]
+    tool_calling: Option<String>,
+}
+
+impl Cli {
+    /// Apply CLI overrides to the loaded configuration.
+    ///
+    /// CLI options have the highest priority in the merge chain.
+    fn apply_to(&self, config: &mut TsumugiConfig) {
+        if let Some(ref endpoint) = self.endpoint {
+            config.llm.endpoint.clone_from(endpoint);
+        }
+        if let Some(ref model) = self.model {
+            config.llm.model.clone_from(model);
+        }
+        if let Some(max_ctx) = self.max_context_tokens {
+            config.llm.max_context_tokens = max_ctx;
+        }
+        if let Some(threshold) = self.context_compression_threshold {
+            config.llm.compression_threshold = threshold;
+        }
+        if let Some(max_tool) = self.max_tool_result_tokens {
+            config.llm.max_tool_result_tokens = max_tool;
+        }
+        if let Some(ref tc) = self.tool_calling {
+            config.llm.tool_calling.clone_from(tc);
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Load and merge configuration: global -> project-local -> env -> CLI.
+    let mut config =
+        config::load_config(cli.config.as_deref()).context("loading tsumugi configuration")?;
+    cli.apply_to(&mut config);
+    config.validate().context("validating configuration")?;
+
+    let tool_calling_mode = resolve_tool_calling_mode(&config.llm.tool_calling)
+        .context("resolving tool_calling mode")?;
+
     let context_config = tmg_core::ContextConfig {
-        max_context_tokens: cli.max_context_tokens,
-        compression_threshold: cli.context_compression_threshold,
-        max_tool_result_tokens: cli.max_tool_result_tokens,
+        max_context_tokens: config.llm.max_context_tokens,
+        compression_threshold: config.llm.compression_threshold,
+        max_tool_result_tokens: config.llm.max_tool_result_tokens,
     };
 
     if let Some(prompt) = cli.prompt {
-        run_prompt(&cli.endpoint, &cli.model, &prompt)?;
+        run_prompt(&config.llm.endpoint, &config.llm.model, &prompt)?;
     } else {
-        run_tui(&cli.endpoint, &cli.model, context_config, cli.tool_calling)?;
+        run_tui(
+            &config.llm.endpoint,
+            &config.llm.model,
+            context_config,
+            tool_calling_mode,
+        )?;
     }
 
     Ok(())
+}
+
+/// Resolve a tool-calling mode string to the enum value.
+///
+/// Empty string maps to `Auto` (the default).
+fn resolve_tool_calling_mode(s: &str) -> anyhow::Result<tmg_core::ToolCallingMode> {
+    match s {
+        "" | "auto" => Ok(tmg_core::ToolCallingMode::Auto),
+        "native" => Ok(tmg_core::ToolCallingMode::Native),
+        "prompt_based" => Ok(tmg_core::ToolCallingMode::PromptBased),
+        other => anyhow::bail!("unknown tool_calling mode: {other:?}"),
+    }
 }
 
 /// Run a one-shot streaming prompt against the LLM server.

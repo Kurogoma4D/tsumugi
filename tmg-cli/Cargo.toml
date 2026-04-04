@@ -8,14 +8,22 @@ license.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+dirs = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["signal", "sync"] }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
+toml = { workspace = true }
 tmg-agents = { workspace = true }
 tmg-core = { workspace = true }
 tmg-llm = { workspace = true }
+tmg-skills = { workspace = true }
 tmg-tools = { workspace = true }
 tmg-tui = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

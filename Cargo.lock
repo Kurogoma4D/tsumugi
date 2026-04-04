@@ -1663,14 +1663,20 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dirs",
+ "serde",
+ "tempfile",
+ "thiserror",
  "tmg-agents",
  "tmg-core",
  "tmg-llm",
+ "tmg-skills",
  "tmg-tools",
  "tmg-tui",
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "toml",
 ]
 
 [[package]]
