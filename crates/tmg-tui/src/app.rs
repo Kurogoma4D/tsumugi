@@ -424,10 +424,14 @@ impl App {
                     return changed;
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    // The task ended without sending Done/Error (should
-                    // not happen, but handle gracefully).
+                    // The task ended without sending Done/Error — this
+                    // means it panicked or was dropped unexpectedly.
+                    // Reset streaming state and surface an error so the
+                    // user knows recovery requires a restart.
                     self.streaming = false;
                     self.turn_handle = None;
+                    self.error_message =
+                        Some("Background task ended unexpectedly; please restart.".to_owned());
                     return true;
                 }
             }
@@ -464,11 +468,8 @@ struct ChannelStreamSink {
 
 impl StreamSink for ChannelStreamSink {
     fn on_token(&mut self, token: &str) -> Result<(), CoreError> {
-        // Use blocking_send since StreamSink::on_token is not async.
-        // This will block briefly if the channel is full, which provides
-        // natural back-pressure.
         self.tx
-            .blocking_send(TurnMessage::Token(token.to_owned()))
+            .try_send(TurnMessage::Token(token.to_owned()))
             .map_err(|_| CoreError::Cancelled)
     }
 
