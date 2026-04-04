@@ -852,6 +852,16 @@ impl StreamSink for ChannelStreamSink {
             })
             .map_err(|_| CoreError::Cancelled)
     }
+
+    fn on_warning(&mut self, message: &str) -> Result<(), CoreError> {
+        self.tx
+            .try_send(TurnMessage::ToolResult {
+                name: "system".to_owned(),
+                output: format!("warning: {message}"),
+                is_error: true,
+            })
+            .map_err(|_| CoreError::Cancelled)
+    }
 }
 
 #[cfg(test)]

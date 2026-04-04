@@ -33,6 +33,7 @@ pub struct Signature {
 /// are found.
 // TODO: integrate into `ContextCompressor` in tmg-core to replace large
 // tool-result file contents with structural summaries during compression.
+#[must_use]
 pub fn extract_signatures(filename: &str, source: &str) -> Option<Vec<Signature>> {
     let ext = filename.rsplit('.').next()?;
     match ext {
@@ -47,6 +48,7 @@ pub fn extract_signatures(filename: &str, source: &str) -> Option<Vec<Signature>
 ///
 /// The output shows line numbers and definition types, suitable for
 /// inclusion in compressed context.
+#[must_use]
 pub fn format_signatures(signatures: &[Signature]) -> String {
     let mut buf = String::new();
     for sig in signatures {

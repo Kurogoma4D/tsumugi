@@ -53,6 +53,7 @@ impl Default for ContextConfig {
 
 impl ContextConfig {
     /// The token count at which compression should trigger.
+    #[must_use]
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -104,6 +105,7 @@ impl TokenCounter {
     ///
     /// This value is updated asynchronously and may lag behind the
     /// actual message count by one turn.
+    #[must_use]
     #[expect(
         clippy::cast_possible_truncation,
         reason = "token counts are always well within usize range"
@@ -142,6 +144,7 @@ impl TokenCounter {
     /// Estimate token count using a simple heuristic (characters / 4).
     ///
     /// Useful when the tokenize API is unavailable.
+    #[must_use]
     pub fn estimate_tokens(text: &str) -> usize {
         // Integer division: 4 chars per token heuristic.
         (text.len() / 4).max(1)
@@ -388,6 +391,7 @@ fn find_ceil_char_boundary(s: &str, index: usize) -> usize {
 /// Format token count for display in the TUI header.
 ///
 /// Produces strings like `ctx: 2.1k/8k` or `ctx: 512/8192`.
+#[must_use]
 pub fn format_context_usage(current: usize, max: usize) -> String {
     format!(
         "ctx: {}/{}",
