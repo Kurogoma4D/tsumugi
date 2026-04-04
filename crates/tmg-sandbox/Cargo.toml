@@ -6,6 +6,18 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["process", "time", "io-util"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time", "io-util"] }
+toml = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
