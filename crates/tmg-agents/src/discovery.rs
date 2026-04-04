@@ -62,7 +62,7 @@ pub async fn discover_custom_agents(
 
     // Collect into a sorted Vec for deterministic output.
     let mut agents: Vec<CustomAgentMeta> = agents_by_name.into_values().collect();
-    agents.sort_by(|a, b| a.def.name().cmp(b.def.name()));
+    agents.sort_by(|a, b| a.def().name().cmp(b.def().name()));
 
     Ok(agents)
 }
@@ -129,14 +129,7 @@ async fn scan_agent_directory(
         // Only insert if no higher-priority agent with the same name exists.
         if !agents_by_name.contains_key(def.name()) {
             let name = def.name().to_owned();
-            agents_by_name.insert(
-                name,
-                CustomAgentMeta {
-                    def,
-                    source,
-                    path: entry_path,
-                },
-            );
+            agents_by_name.insert(name, CustomAgentMeta::new(def, source, entry_path));
         }
     }
 
@@ -181,8 +174,8 @@ allow = ["file_read"]
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].def.name(), "reviewer");
-        assert_eq!(agents[0].source, AgentSource::ProjectLocal);
+        assert_eq!(agents[0].def().name(), "reviewer");
+        assert_eq!(agents[0].source(), AgentSource::ProjectLocal);
     }
 
     #[tokio::test]
@@ -198,9 +191,9 @@ allow = ["file_read"]
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(agents.len(), 3);
-        assert_eq!(agents[0].def.name(), "alpha");
-        assert_eq!(agents[1].def.name(), "middle");
-        assert_eq!(agents[2].def.name(), "zebra");
+        assert_eq!(agents[0].def().name(), "alpha");
+        assert_eq!(agents[1].def().name(), "middle");
+        assert_eq!(agents[2].def().name(), "zebra");
     }
 
     #[tokio::test]
@@ -219,7 +212,7 @@ allow = ["file_read"]
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].def.name(), "valid");
+        assert_eq!(agents[0].def().name(), "valid");
     }
 
     #[tokio::test]
@@ -241,8 +234,8 @@ allow = ["file_read"]
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].def.description(), "Project-local version");
-        assert_eq!(agents[0].source, AgentSource::ProjectLocal);
+        assert_eq!(agents[0].def().description(), "Project-local version");
+        assert_eq!(agents[0].source(), AgentSource::ProjectLocal);
     }
 
     #[test]

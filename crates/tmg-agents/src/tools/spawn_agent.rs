@@ -108,12 +108,19 @@ impl Tool for SpawnAgentTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        let valid_names: Vec<serde_json::Value> = self
+            .available_agent_names()
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect();
+
         serde_json::json!({
             "type": "object",
             "properties": {
                 "agent_type": {
                     "type": "string",
-                    "description": "The type of subagent to spawn. Can be a built-in type (explore, worker, plan) or the name of a custom agent."
+                    "description": "The type of subagent to spawn. Can be a built-in type (explore, worker, plan) or the name of a custom agent.",
+                    "enum": valid_names
                 },
                 "task": {
                     "type": "string",

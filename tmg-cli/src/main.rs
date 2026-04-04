@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use clap::Parser;
 use tokio::sync::Mutex;
 
@@ -113,9 +114,9 @@ fn run_tui(endpoint: &str, model: &str) -> anyhow::Result<()> {
         // Discover custom agent definitions.
         let custom_agent_metas = tmg_agents::discover_custom_agents(&project_root)
             .await
-            .unwrap_or_default();
+            .context("discovering custom agents")?;
         let custom_agent_defs: Vec<tmg_agents::CustomAgentDef> =
-            custom_agent_metas.iter().map(|m| m.def.clone()).collect();
+            custom_agent_metas.iter().map(|m| m.def().clone()).collect();
 
         // Create the subagent manager.
         let subagent_manager = Arc::new(Mutex::new(tmg_agents::SubagentManager::new(

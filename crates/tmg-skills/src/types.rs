@@ -108,11 +108,13 @@ pub enum SkillSource {
 }
 
 impl SkillSource {
-    /// All sources in priority order (highest first).
-    pub const ALL: [Self; 5] = [
+    /// All sources with fixed paths, in priority order (highest first).
+    ///
+    /// Does not include [`SkillSource::Custom`], which requires a
+    /// user-supplied path and is handled separately in discovery logic.
+    pub const ALL: [Self; 4] = [
         Self::ProjectTsumugi,
         Self::GlobalConfig,
-        Self::Custom,
         Self::ProjectClaude,
         Self::ProjectAgents,
     ];

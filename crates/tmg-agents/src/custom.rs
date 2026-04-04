@@ -15,7 +15,7 @@
 //! allow = ["file_read", "grep_search"]       # required
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -24,18 +24,16 @@ use tmg_sandbox::SandboxMode;
 use crate::config::AgentType;
 use crate::error::AgentError;
 
-/// Known tool names in the registry.
+/// Return the set of known tool names from the default registry.
 ///
-/// Used for validation warnings. This list should be kept in sync with
-/// [`tmg_tools::default_registry`].
-const KNOWN_TOOL_NAMES: &[&str] = &[
-    "file_read",
-    "file_write",
-    "file_patch",
-    "grep_search",
-    "list_dir",
-    "shell_exec",
-];
+/// Uses [`tmg_tools::default_registry`] so the list stays in sync
+/// automatically when tools are added or removed.
+fn known_tool_names() -> Vec<String> {
+    let registry = tmg_tools::default_registry();
+    let mut names: Vec<String> = registry.tool_names().map(str::to_owned).collect();
+    names.sort();
+    names
+}
 
 /// Validate that an agent name matches `[a-zA-Z][a-zA-Z0-9_-]*`.
 fn is_valid_agent_name(name: &str) -> bool {
@@ -155,13 +153,35 @@ impl std::fmt::Display for AgentSource {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CustomAgentMeta {
     /// The validated agent definition.
-    pub def: CustomAgentDef,
+    def: CustomAgentDef,
 
     /// Where this agent was discovered from.
-    pub source: AgentSource,
+    source: AgentSource,
 
     /// The absolute path to the TOML definition file.
-    pub path: PathBuf,
+    path: PathBuf,
+}
+
+impl CustomAgentMeta {
+    /// Create a new `CustomAgentMeta`.
+    pub(crate) fn new(def: CustomAgentDef, source: AgentSource, path: PathBuf) -> Self {
+        Self { def, source, path }
+    }
+
+    /// The validated agent definition.
+    pub fn def(&self) -> &CustomAgentDef {
+        &self.def
+    }
+
+    /// Where this agent was discovered from.
+    pub fn source(&self) -> AgentSource {
+        self.source
+    }
+
+    /// The absolute path to the TOML definition file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl CustomAgentDef {
@@ -251,9 +271,10 @@ impl CustomAgentDef {
         }
 
         // Validate that all tool names are recognized.
+        let known = known_tool_names();
         let unknown: Vec<&String> = allowed_tools
             .iter()
-            .filter(|t| !KNOWN_TOOL_NAMES.contains(&t.as_str()))
+            .filter(|t| !known.iter().any(|k| k == t.as_str()))
             .collect();
         if !unknown.is_empty() {
             let names: Vec<&str> = unknown.iter().map(|s| s.as_str()).collect();
@@ -262,7 +283,7 @@ impl CustomAgentDef {
                 reason: format!(
                     "unrecognized tool name(s): {}. Known tools: {}",
                     names.join(", "),
-                    KNOWN_TOOL_NAMES.join(", "),
+                    known.join(", "),
                 ),
             });
         }
@@ -607,15 +628,10 @@ allow = ["file_read"]
         }
 
         fn arb_tool_name() -> impl Strategy<Value = String> {
-            // Use known valid tool names to avoid the "spawn_agent" rejection.
-            prop_oneof![
-                Just("file_read".to_owned()),
-                Just("file_write".to_owned()),
-                Just("file_patch".to_owned()),
-                Just("grep_search".to_owned()),
-                Just("list_dir".to_owned()),
-                Just("shell_exec".to_owned()),
-            ]
+            // Use known valid tool names from the registry to stay in sync.
+            let names = known_tool_names();
+            let strategies: Vec<_> = names.into_iter().map(Just).collect();
+            proptest::strategy::Union::new(strategies)
         }
 
         fn arb_optional_string() -> impl Strategy<Value = Option<String>> {
