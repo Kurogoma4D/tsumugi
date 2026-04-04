@@ -14,8 +14,8 @@ use tokio_util::sync::CancellationToken;
 
 use tmg_llm::LlmClient;
 
-use crate::builtins::registry_for_agent_type;
-use crate::config::{AgentType, SubagentConfig};
+use crate::builtins::registry_for_agent_kind;
+use crate::config::{AgentKind, SubagentConfig};
 use crate::error::AgentError;
 use crate::runner::SubagentRunner;
 use crate::status::SubagentStatus;
@@ -42,8 +42,8 @@ impl fmt::Display for SubagentId {
 pub struct SubagentSummary {
     /// The subagent's unique identifier.
     pub id: SubagentId,
-    /// The type of subagent.
-    pub agent_type: AgentType,
+    /// The display name of the agent kind (e.g. "explore", "reviewer").
+    pub agent_name: String,
     /// The task description.
     pub task: String,
     /// The current status.
@@ -52,7 +52,7 @@ pub struct SubagentSummary {
 
 /// Internal state for a tracked subagent instance.
 struct SubagentInstance {
-    agent_type: AgentType,
+    agent_name: String,
     task: String,
     status: SubagentStatus,
 }
@@ -65,6 +65,12 @@ struct SubagentInstance {
 pub struct SubagentManager {
     /// The LLM client shared with all subagents.
     client: LlmClient,
+
+    /// Default endpoint URL (used when a custom agent does not override it).
+    default_endpoint: String,
+
+    /// Default model name (used when a custom agent does not override it).
+    default_model: String,
 
     /// The parent cancellation token.
     parent_cancel: CancellationToken,
@@ -84,9 +90,19 @@ pub struct SubagentManager {
 
 impl SubagentManager {
     /// Create a new subagent manager.
-    pub fn new(client: LlmClient, parent_cancel: CancellationToken) -> Self {
+    ///
+    /// The `default_endpoint` and `default_model` are used when a custom
+    /// agent does not specify its own endpoint/model overrides.
+    pub fn new(
+        client: LlmClient,
+        parent_cancel: CancellationToken,
+        default_endpoint: impl Into<String>,
+        default_model: impl Into<String>,
+    ) -> Self {
         Self {
             client,
+            default_endpoint: default_endpoint.into(),
+            default_model: default_model.into(),
             parent_cancel,
             join_set: JoinSet::new(),
             instances: Arc::new(Mutex::new(BTreeMap::new())),
@@ -99,7 +115,12 @@ impl SubagentManager {
     /// The subagent runs as a task in the internal `JoinSet`. Use
     /// [`collect_completed`] to drain finished results, or
     /// [`wait_for`] to await a specific subagent.
-    pub async fn spawn(&mut self, config: SubagentConfig) -> SubagentId {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Llm`] if a custom agent requires a
+    /// dedicated `LlmClient` and client creation fails.
+    pub async fn spawn(&mut self, config: SubagentConfig) -> Result<SubagentId, AgentError> {
         self.spawn_inner(config, None).await
     }
 
@@ -109,13 +130,17 @@ impl SubagentManager {
     /// This is designed for foreground spawns where the caller needs to
     /// drop the manager lock before awaiting the result (e.g., so the
     /// TUI can still call `summaries()` while the subagent runs).
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Llm`] if a custom agent requires a
+    /// dedicated `LlmClient` and client creation fails.
     pub async fn spawn_with_notify(
         &mut self,
         config: SubagentConfig,
-    ) -> (SubagentId, oneshot::Receiver<Result<String, AgentError>>) {
+    ) -> Result<(SubagentId, oneshot::Receiver<Result<String, AgentError>>), AgentError> {
         let (tx, rx) = oneshot::channel();
-        let id = self.spawn_inner(config, Some(tx)).await;
-        (id, rx)
+        let id = self.spawn_inner(config, Some(tx)).await?;
+        Ok((id, rx))
     }
 
     /// Internal spawn implementation shared by `spawn` and `spawn_with_notify`.
@@ -123,14 +148,16 @@ impl SubagentManager {
         &mut self,
         config: SubagentConfig,
         notify: Option<oneshot::Sender<Result<String, AgentError>>>,
-    ) -> SubagentId {
+    ) -> Result<SubagentId, AgentError> {
         let id = SubagentId(self.next_id);
         self.next_id += 1;
+
+        let agent_name = config.agent_kind.name().to_owned();
 
         // Insert directly as Running -- no need for the Pending ->
         // Running transition since we spawn the task immediately.
         let instance = SubagentInstance {
-            agent_type: config.agent_type,
+            agent_name: agent_name.clone(),
             task: config.task.clone(),
             status: SubagentStatus::Running,
         };
@@ -140,15 +167,29 @@ impl SubagentManager {
             instances.insert(id, instance);
         }
 
-        let client = self.client.clone();
-        let agent_type = config.agent_type;
+        // For custom agents with a specific endpoint/model, create a
+        // dedicated LlmClient. Otherwise, use the shared client.
+        let client = if let AgentKind::Custom(ref def) = config.agent_kind {
+            if def.endpoint().is_some() || def.model().is_some() {
+                let endpoint = def.endpoint().unwrap_or(&self.default_endpoint);
+                let model = def.model().unwrap_or(&self.default_model);
+                let llm_config = tmg_llm::LlmClientConfig::new(endpoint, model);
+                tmg_llm::LlmClient::new(llm_config).map_err(AgentError::Llm)?
+            } else {
+                self.client.clone()
+            }
+        } else {
+            self.client.clone()
+        };
+
+        let agent_kind = config.agent_kind.clone();
         let task = config.task.clone();
         let cancel = self.parent_cancel.child_token();
         let instances = Arc::clone(&self.instances);
 
         self.join_set.spawn(async move {
-            let registry = registry_for_agent_type(agent_type);
-            let mut runner = SubagentRunner::new(client, registry, agent_type, cancel);
+            let registry = registry_for_agent_kind(&agent_kind);
+            let mut runner = SubagentRunner::new(client, registry, &agent_kind, cancel);
 
             let result = runner.run(&task).await;
 
@@ -186,7 +227,7 @@ impl SubagentManager {
             (id, result)
         });
 
-        id
+        Ok(id)
     }
 
     /// Wait for a specific subagent to complete and return its result.
@@ -241,7 +282,7 @@ impl SubagentManager {
             .iter()
             .map(|(&id, inst)| SubagentSummary {
                 id,
-                agent_type: inst.agent_type,
+                agent_name: inst.agent_name.clone(),
                 task: inst.task.clone(),
                 status: inst.status.clone(),
             })
@@ -266,20 +307,22 @@ impl SubagentManager {
 }
 
 #[cfg(test)]
+#[expect(clippy::panic, reason = "test assertions")]
 mod tests {
     use super::*;
+    use crate::config::AgentType;
 
     #[test]
     fn subagent_summary_fields() {
         let summary = SubagentSummary {
             id: SubagentId(1),
-            agent_type: AgentType::Explore,
+            agent_name: "explore".to_owned(),
             task: "test task".to_owned(),
             status: SubagentStatus::Running,
         };
 
         assert_eq!(summary.id, SubagentId(1));
-        assert_eq!(summary.agent_type, AgentType::Explore);
+        assert_eq!(summary.agent_name, "explore");
         assert_eq!(summary.task, "test task");
         assert_eq!(summary.status, SubagentStatus::Running);
     }
@@ -295,21 +338,28 @@ mod tests {
         };
 
         let cancel = CancellationToken::new();
-        let mut manager = SubagentManager::new(client, cancel.clone());
+        let mut manager =
+            SubagentManager::new(client, cancel.clone(), "http://localhost:9999", "test");
 
         let config1 = SubagentConfig {
-            agent_type: AgentType::Explore,
+            agent_kind: AgentKind::Builtin(AgentType::Explore),
             task: "task 1".to_owned(),
             background: true,
         };
         let config2 = SubagentConfig {
-            agent_type: AgentType::Plan,
+            agent_kind: AgentKind::Builtin(AgentType::Plan),
             task: "task 2".to_owned(),
             background: true,
         };
 
-        let id1 = manager.spawn(config1).await;
-        let id2 = manager.spawn(config2).await;
+        let id1 = manager
+            .spawn(config1)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let id2 = manager
+            .spawn(config2)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
 
         assert_eq!(id1, SubagentId(1));
         assert_eq!(id2, SubagentId(2));
@@ -327,18 +377,22 @@ mod tests {
         };
 
         let cancel = CancellationToken::new();
-        let mut manager = SubagentManager::new(client, cancel.clone());
+        let mut manager =
+            SubagentManager::new(client, cancel.clone(), "http://localhost:9999", "test");
 
         let config1 = SubagentConfig {
-            agent_type: AgentType::Explore,
+            agent_kind: AgentKind::Builtin(AgentType::Explore),
             task: "task 1".to_owned(),
             background: true,
         };
-        manager.spawn(config1).await;
+        manager
+            .spawn(config1)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
 
         let summaries = manager.summaries().await;
         assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].agent_type, AgentType::Explore);
+        assert_eq!(summaries[0].agent_name, "explore");
 
         cancel.cancel();
         manager.shutdown().await;

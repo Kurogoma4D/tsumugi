@@ -14,7 +14,7 @@ pub use error::TuiError;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tmg_agents::SubagentManager;
+use tmg_agents::{CustomAgentDef, SubagentManager};
 use tmg_core::AgentLoop;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 /// * `project_root` - Project root directory for prompt file loading.
 /// * `cwd` - Current working directory for prompt file loading.
 /// * `subagent_manager` - Optional shared subagent manager for status display.
+/// * `custom_agents` - Custom agent definitions for `/agents` list display.
 ///
 /// # Errors
 ///
@@ -44,6 +45,7 @@ pub async fn run(
     project_root: PathBuf,
     cwd: PathBuf,
     subagent_manager: Option<Arc<Mutex<SubagentManager>>>,
+    custom_agents: Vec<CustomAgentDef>,
 ) -> Result<(), TuiError> {
     // Install a panic hook that restores the terminal before printing
     // the panic message.  Without this, a panic during TUI operation
@@ -59,6 +61,10 @@ pub async fn run(
 
     if let Some(manager) = subagent_manager {
         app.set_subagent_manager(manager);
+    }
+
+    if !custom_agents.is_empty() {
+        app.set_custom_agents(custom_agents);
     }
 
     let result = event::run_event_loop(&mut terminal, &mut app, cancel).await;

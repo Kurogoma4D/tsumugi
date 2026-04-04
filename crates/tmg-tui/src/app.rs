@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tmg_agents::{AgentType, SubagentManager, SubagentSummary, truncate_str};
+use tmg_agents::{AgentType, CustomAgentDef, SubagentManager, SubagentSummary, truncate_str};
 use tmg_core::{AgentLoop, CoreError, StreamSink};
 use tmg_llm::Role;
 use tokio::sync::Mutex;
@@ -133,6 +133,9 @@ pub struct App {
 
     /// Cached subagent summaries for display (updated periodically).
     subagent_summaries: Vec<SubagentSummary>,
+
+    /// Custom agent definitions for display in `/agents` list.
+    custom_agents: Vec<CustomAgentDef>,
 }
 
 impl App {
@@ -155,12 +158,18 @@ impl App {
             turn_handle: None,
             subagent_manager: None,
             subagent_summaries: Vec::new(),
+            custom_agents: Vec::new(),
         }
     }
 
     /// Set the subagent manager for status display.
     pub fn set_subagent_manager(&mut self, manager: Arc<Mutex<SubagentManager>>) {
         self.subagent_manager = Some(manager);
+    }
+
+    /// Set the custom agent definitions for display in `/agents` list.
+    pub fn set_custom_agents(&mut self, agents: Vec<CustomAgentDef>) {
+        self.custom_agents = agents;
     }
 
     /// Whether the application should exit.
@@ -379,7 +388,7 @@ impl App {
 
     /// Display the list of available subagent types and running subagents.
     fn show_agents_list(&mut self) {
-        let mut text = String::from("Available subagent types:\n");
+        let mut text = String::from("Built-in subagent types:\n");
         for agent_type in AgentType::ALL {
             let _ = writeln!(
                 text,
@@ -387,6 +396,20 @@ impl App {
                 agent_type.name(),
                 agent_type.description()
             );
+        }
+
+        if !self.custom_agents.is_empty() {
+            text.push_str("\nCustom subagents:\n");
+            for agent in &self.custom_agents {
+                let tools_summary = agent.allowed_tools().join(", ");
+                let _ = writeln!(
+                    text,
+                    "  - {}: {} [tools: {}]",
+                    agent.name(),
+                    agent.description(),
+                    tools_summary
+                );
+            }
         }
 
         if !self.subagent_summaries.is_empty() {
@@ -401,7 +424,7 @@ impl App {
                     text,
                     "  [{}] {} ({}): {}",
                     summary.id,
-                    summary.agent_type,
+                    summary.agent_name,
                     summary.status.label(),
                     task_preview,
                 );

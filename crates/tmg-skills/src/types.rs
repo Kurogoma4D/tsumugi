@@ -99,20 +99,12 @@ pub enum SkillSource {
     ProjectTsumugi = 0,
     /// `~/.config/tsumugi/skills/` in the global config directory.
     GlobalConfig = 1,
+    /// User-specified additional discovery path (from `[skills].discovery_paths`).
+    Custom = 2,
     /// `.claude/skills/` in the project root.
-    ProjectClaude = 2,
+    ProjectClaude = 3,
     /// `.agents/skills/` in the project root.
-    ProjectAgents = 3,
-}
-
-impl SkillSource {
-    /// All sources in priority order (highest first).
-    pub const ALL: [Self; 4] = [
-        Self::ProjectTsumugi,
-        Self::GlobalConfig,
-        Self::ProjectClaude,
-        Self::ProjectAgents,
-    ];
+    ProjectAgents = 4,
 }
 
 impl fmt::Display for SkillSource {
@@ -120,6 +112,7 @@ impl fmt::Display for SkillSource {
         match self {
             Self::ProjectTsumugi => write!(f, ".tsumugi/skills"),
             Self::GlobalConfig => write!(f, "~/.config/tsumugi/skills"),
+            Self::Custom => write!(f, "custom discovery path"),
             Self::ProjectClaude => write!(f, ".claude/skills"),
             Self::ProjectAgents => write!(f, ".agents/skills"),
         }

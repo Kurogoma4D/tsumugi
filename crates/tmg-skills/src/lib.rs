@@ -19,9 +19,11 @@
 //!
 //! 1. `.tsumugi/skills/` (project-local, highest priority)
 //! 2. `~/.config/tsumugi/skills/` (global config)
-//! 3. `.claude/skills/` (compatibility)
-//! 4. `.agents/skills/` (compatibility)
+//! 3. Additional paths from `[skills].discovery_paths` in `tsumugi.toml`
+//! 4. `.claude/skills/` (compatibility, controlled by `compat_claude`)
+//! 5. `.agents/skills/` (compatibility, controlled by `compat_agent_skills`)
 
+pub mod config;
 pub mod discovery;
 pub mod error;
 pub mod loader;
@@ -30,7 +32,8 @@ pub mod slash;
 pub mod tool;
 pub mod types;
 
-pub use discovery::discover_skills;
+pub use config::SkillsConfig;
+pub use discovery::{discover_skills, discover_skills_with_config};
 pub use error::SkillError;
 pub use loader::{format_skill_for_tool_result, format_skill_metadata, load_skill};
 pub use parse::parse_skill_md;

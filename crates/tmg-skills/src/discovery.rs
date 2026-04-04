@@ -3,14 +3,16 @@
 //! Priority order (highest first):
 //! 1. `.tsumugi/skills/`
 //! 2. `~/.config/tsumugi/skills/`
-//! 3. `.claude/skills/`
-//! 4. `.agents/skills/`
+//! 3. Additional paths from `[skills].discovery_paths` in `tsumugi.toml`
+//! 4. `.claude/skills/` (if `compat_claude` is enabled)
+//! 5. `.agents/skills/` (if `compat_agent_skills` is enabled)
 //!
 //! Same-named skills from higher-priority sources shadow lower ones.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::config::SkillsConfig;
 use crate::error::SkillError;
 use crate::parse::parse_skill_md;
 use crate::types::{SkillMeta, SkillName, SkillPath, SkillSource};
@@ -33,15 +35,30 @@ const SKILL_FILENAME: &str = "SKILL.md";
 /// Returns [`SkillError`] if a SKILL.md file exists but cannot be read
 /// or contains invalid frontmatter.
 pub async fn discover_skills(project_root: impl AsRef<Path>) -> Result<Vec<SkillMeta>, SkillError> {
+    discover_skills_with_config(project_root, &SkillsConfig::default()).await
+}
+
+/// Discover all skills using a custom [`SkillsConfig`].
+///
+/// This allows controlling which compatibility paths are enabled
+/// and adding extra discovery directories.
+///
+/// # Errors
+///
+/// Returns [`SkillError`] if a SKILL.md file exists but cannot be read
+/// or contains invalid frontmatter.
+pub async fn discover_skills_with_config(
+    project_root: impl AsRef<Path>,
+    config: &SkillsConfig,
+) -> Result<Vec<SkillMeta>, SkillError> {
     let project_root = project_root.as_ref();
     let mut skills_by_name: HashMap<SkillName, SkillMeta> = HashMap::new();
 
-    for source in SkillSource::ALL {
-        let dir = source_directory(source, project_root);
+    // Build the ordered list of directories to scan.
+    let scan_dirs = build_scan_dirs(project_root, config);
 
-        let Some(dir) = dir else { continue };
-
-        let entries = match tokio::fs::read_dir(&dir).await {
+    for (source, dir) in &scan_dirs {
+        let entries = match tokio::fs::read_dir(dir).await {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => continue,
@@ -53,7 +70,7 @@ pub async fn discover_skills(project_root: impl AsRef<Path>) -> Result<Vec<Skill
             }
         };
 
-        scan_directory(entries, source, &mut skills_by_name).await?;
+        scan_directory(entries, *source, &mut skills_by_name).await?;
     }
 
     // Collect into a sorted Vec for deterministic output.
@@ -61,6 +78,48 @@ pub async fn discover_skills(project_root: impl AsRef<Path>) -> Result<Vec<Skill
     skills.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
 
     Ok(skills)
+}
+
+/// Build the ordered list of directories to scan based on config.
+fn build_scan_dirs(project_root: &Path, config: &SkillsConfig) -> Vec<(SkillSource, PathBuf)> {
+    let mut dirs = Vec::new();
+
+    // 1. Project-local tsumugi skills (always).
+    dirs.push((
+        SkillSource::ProjectTsumugi,
+        project_root.join(".tsumugi").join("skills"),
+    ));
+
+    // 2. Global config skills (always).
+    if let Some(config_dir) = dirs::config_dir() {
+        dirs.push((
+            SkillSource::GlobalConfig,
+            config_dir.join("tsumugi").join("skills"),
+        ));
+    }
+
+    // 3. Additional discovery paths from config.
+    for extra_path in &config.discovery_paths {
+        dirs.push((SkillSource::Custom, extra_path.clone()));
+    }
+
+    // 4. .claude/skills/ compatibility.
+    if config.compat_claude {
+        dirs.push((
+            SkillSource::ProjectClaude,
+            project_root.join(".claude").join("skills"),
+        ));
+    }
+
+    // 5. .agents/skills/ compatibility.
+    if config.compat_agent_skills {
+        dirs.push((
+            SkillSource::ProjectAgents,
+            project_root.join(".agents").join("skills"),
+        ));
+    }
+
+    dirs
 }
 
 /// Scan a single directory for skill subdirectories containing SKILL.md.
@@ -123,16 +182,6 @@ async fn scan_directory(
     }
 
     Ok(())
-}
-
-/// Resolve the filesystem path for a given skill source.
-fn source_directory(source: SkillSource, project_root: &Path) -> Option<PathBuf> {
-    match source {
-        SkillSource::ProjectTsumugi => Some(project_root.join(".tsumugi").join("skills")),
-        SkillSource::GlobalConfig => dirs::config_dir().map(|d| d.join("tsumugi").join("skills")),
-        SkillSource::ProjectClaude => Some(project_root.join(".claude").join("skills")),
-        SkillSource::ProjectAgents => Some(project_root.join(".agents").join("skills")),
-    }
 }
 
 #[cfg(test)]
@@ -219,5 +268,91 @@ mod tests {
         assert_eq!(skills[0].name.as_str(), "alpha-skill");
         assert_eq!(skills[1].name.as_str(), "middle-skill");
         assert_eq!(skills[2].name.as_str(), "zebra-skill");
+    }
+
+    #[tokio::test]
+    async fn compat_claude_disabled() {
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+
+        // Create a skill in .claude/skills/.
+        let claude_dir = tmp
+            .path()
+            .join(".claude")
+            .join("skills")
+            .join("claude-skill");
+        std::fs::create_dir_all(&claude_dir).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(
+            claude_dir.join("SKILL.md"),
+            "---\nname: claude-skill\ndescription: From claude\n---\n\nBody.\n",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        // Disable compat_claude.
+        let config = SkillsConfig {
+            discovery_paths: Vec::new(),
+            compat_claude: false,
+            compat_agent_skills: true,
+        };
+
+        let skills = discover_skills_with_config(tmp.path(), &config)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(skills.is_empty());
+    }
+
+    #[tokio::test]
+    async fn compat_agent_skills_disabled() {
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+
+        // Create a skill in .agents/skills/.
+        let agents_dir = tmp
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("agent-skill");
+        std::fs::create_dir_all(&agents_dir).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(
+            agents_dir.join("SKILL.md"),
+            "---\nname: agent-skill\ndescription: From agents\n---\n\nBody.\n",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        // Disable compat_agent_skills.
+        let config = SkillsConfig {
+            discovery_paths: Vec::new(),
+            compat_claude: true,
+            compat_agent_skills: false,
+        };
+
+        let skills = discover_skills_with_config(tmp.path(), &config)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(skills.is_empty());
+    }
+
+    #[tokio::test]
+    async fn additional_discovery_paths() {
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+
+        // Create a skill in an additional discovery path.
+        let extra_dir = tmp.path().join("extra-skills").join("bonus-skill");
+        std::fs::create_dir_all(&extra_dir).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(
+            extra_dir.join("SKILL.md"),
+            "---\nname: bonus-skill\ndescription: From extra\n---\n\nBody.\n",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        let config = SkillsConfig {
+            discovery_paths: vec![tmp.path().join("extra-skills")],
+            compat_claude: false,
+            compat_agent_skills: false,
+        };
+
+        let skills = discover_skills_with_config(tmp.path(), &config)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name.as_str(), "bonus-skill");
     }
 }

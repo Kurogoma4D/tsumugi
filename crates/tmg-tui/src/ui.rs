@@ -291,7 +291,7 @@ fn draw_subagent_pane(frame: &mut Frame, summaries: &[tmg_agents::SubagentSummar
 
         lines.push(Line::from(vec![
             Span::styled(
-                format!("[{}:{}] ", summary.id, summary.agent_type),
+                format!("[{}:{}] ", summary.id, summary.agent_name),
                 Style::default()
                     .fg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),

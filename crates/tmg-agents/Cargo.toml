@@ -8,15 +8,20 @@ license.workspace = true
 [dependencies]
 tmg-llm = { workspace = true }
 tmg-tools = { workspace = true }
+tmg-sandbox = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+toml = { workspace = true }
+tokio = { workspace = true, features = ["sync", "fs"] }
 tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
 thiserror = { workspace = true }
+dirs = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "fs"] }
+tempfile = { workspace = true }
+proptest = { workspace = true }
 
 [lints]
 workspace = true

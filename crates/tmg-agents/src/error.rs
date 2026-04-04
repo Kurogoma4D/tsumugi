@@ -36,4 +36,40 @@ pub enum AgentError {
     /// JSON serialization/deserialization error.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// TOML parsing error for custom agent definitions.
+    #[error("toml parse error in {path}: {source}")]
+    TomlParse {
+        /// Path to the TOML file.
+        path: String,
+        /// The underlying TOML deserialization error.
+        #[source]
+        source: toml::de::Error,
+    },
+
+    /// TOML serialization error.
+    #[error("toml serialization error: {reason}")]
+    TomlSerialize {
+        /// Description of the serialization failure.
+        reason: String,
+    },
+
+    /// A custom agent definition is invalid (missing required fields, etc.).
+    #[error("invalid custom agent in {path}: {reason}")]
+    InvalidCustomAgent {
+        /// Path to the TOML file.
+        path: String,
+        /// Description of the validation issue.
+        reason: String,
+    },
+
+    /// An I/O error occurred during agent discovery.
+    #[error("{context}: {source}")]
+    Io {
+        /// Description of what was being done when the error occurred.
+        context: String,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
 }
