@@ -12,3 +12,6 @@ pub use context::{
 };
 pub use error::CoreError;
 pub use message::Message;
+
+// Re-export ToolCallingMode from tmg-llm for downstream consumers.
+pub use tmg_llm::ToolCallingMode;

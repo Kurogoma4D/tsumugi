@@ -32,6 +32,14 @@ struct Cli {
     /// Maximum tokens for a single tool result before truncation.
     #[arg(long, default_value = "4096")]
     max_tool_result_tokens: usize,
+
+    /// Tool calling mode: "native", "prompt\_based", or "auto".
+    ///
+    /// - native: use OpenAI-compatible function calling API
+    /// - prompt\_based: inject tool descriptions in system prompt
+    /// - auto (default): try native first, fall back to prompt\_based parsing
+    #[arg(long, default_value = "auto")]
+    tool_calling: tmg_core::ToolCallingMode,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -46,7 +54,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(prompt) = cli.prompt {
         run_prompt(&cli.endpoint, &cli.model, &prompt)?;
     } else {
-        run_tui(&cli.endpoint, &cli.model, context_config)?;
+        run_tui(&cli.endpoint, &cli.model, context_config, cli.tool_calling)?;
     }
 
     Ok(())
@@ -114,6 +122,7 @@ fn run_tui(
     endpoint: &str,
     model: &str,
     context_config: tmg_core::ContextConfig,
+    tool_calling_mode: tmg_core::ToolCallingMode,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -163,6 +172,7 @@ fn run_tui(
             &project_root,
             &cwd,
             context_config,
+            tool_calling_mode,
         )?;
 
         tmg_tui::run(

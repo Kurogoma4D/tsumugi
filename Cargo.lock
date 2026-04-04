@@ -1694,6 +1694,7 @@ dependencies = [
  "eventsource-stream",
  "futures-core",
  "pin-project-lite",
+ "proptest",
  "rand",
  "reqwest",
  "serde",
