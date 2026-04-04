@@ -10,7 +10,7 @@ tmg-core = { workspace = true }
 tmg-llm = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
-tokio = { workspace = true, features = ["signal"] }
+tokio = { workspace = true, features = ["signal", "sync"] }
 tokio-util = { workspace = true }
 thiserror = { workspace = true }
 

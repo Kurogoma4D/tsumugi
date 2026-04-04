@@ -88,22 +88,23 @@ fn draw_chat_pane(frame: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             tmg_llm::Role::Assistant => ("Agent: ", Style::default().fg(Color::Blue)),
-            _ => ("", Style::default().fg(Color::DarkGray)),
+            tmg_llm::Role::System | tmg_llm::Role::Tool => {
+                ("", Style::default().fg(Color::DarkGray))
+            }
         };
 
-        // First line with prefix.
-        let content_lines: Vec<&str> = entry.text.split('\n').collect();
-        if let Some((first, rest)) = content_lines.split_first() {
+        // First line with prefix; remaining lines indented to align.
+        let mut content_lines = entry.text.split('\n');
+        if let Some(first) = content_lines.next() {
             lines.push(Line::from(vec![
                 Span::styled(prefix, style),
-                Span::styled((*first).to_owned(), style),
+                Span::styled(first, style),
             ]));
-            for line in rest {
-                // Indent continuation lines to align with content after prefix.
-                let indent = " ".repeat(prefix.len());
+            let indent = " ".repeat(prefix.len());
+            for line in content_lines {
                 lines.push(Line::from(vec![
-                    Span::raw(indent),
-                    Span::styled((*line).to_owned(), style),
+                    Span::raw(indent.clone()),
+                    Span::styled(line, style),
                 ]));
             }
         }

@@ -4,6 +4,9 @@ use std::path::PathBuf;
 
 use tmg_core::{AgentLoop, CoreError, StreamSink};
 use tmg_llm::Role;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 /// Represents a single entry in the chat display.
 #[derive(Debug, Clone)]
@@ -14,10 +17,46 @@ pub struct ChatEntry {
     pub text: String,
 }
 
+/// Messages sent from the background turn task to the event loop.
+pub enum TurnMessage {
+    /// An incremental token from the LLM stream.
+    Token(String),
+    /// The turn completed successfully. Contains the `AgentLoop` back
+    /// and the turn count for context display.
+    Done {
+        /// The agent loop returned after the turn completes.
+        agent: AgentLoop,
+        /// Number of user turns so far (for context usage display).
+        user_turns: usize,
+    },
+    /// The turn failed with an error. Contains the `AgentLoop` back.
+    Error {
+        /// The agent loop returned after the turn fails.
+        agent: AgentLoop,
+        /// The error message.
+        message: String,
+        /// Whether the error was a cancellation.
+        cancelled: bool,
+    },
+}
+
+/// Handle for a running conversation turn background task.
+struct TurnHandle {
+    /// Receiver for turn messages (tokens, done, error).
+    rx: mpsc::Receiver<TurnMessage>,
+    /// Child cancellation token for this specific turn.
+    turn_cancel: CancellationToken,
+    /// Join handle for the spawned task.
+    _join: JoinHandle<()>,
+}
+
 /// The main application state.
 pub struct App {
     /// The agent loop driving LLM conversations.
-    agent: AgentLoop,
+    ///
+    /// This is `None` while a turn is running in a background task
+    /// (the task temporarily takes ownership).
+    agent: Option<AgentLoop>,
 
     /// Chat entries displayed in the chat pane.
     chat_entries: Vec<ChatEntry>,
@@ -51,13 +90,16 @@ pub struct App {
 
     /// Optional error message to display.
     error_message: Option<String>,
+
+    /// Handle for the currently running turn, if any.
+    turn_handle: Option<TurnHandle>,
 }
 
 impl App {
     /// Create a new `App` with the given agent loop and model name.
     pub fn new(agent: AgentLoop, model_name: &str, project_root: PathBuf, cwd: PathBuf) -> Self {
         Self {
-            agent,
+            agent: Some(agent),
             chat_entries: Vec::new(),
             input: String::new(),
             cursor_pos: 0,
@@ -69,6 +111,7 @@ impl App {
             project_root,
             cwd,
             error_message: None,
+            turn_handle: None,
         }
     }
 
@@ -202,8 +245,9 @@ impl App {
         self.cursor_pos = self.input.len();
     }
 
-    /// Submit the current input. Returns `true` if a turn was initiated,
-    /// `false` if the input was empty or a slash command was handled.
+    /// Submit the current input. Returns `Some(text)` if a conversation
+    /// turn should be started, `None` if the input was empty or a slash
+    /// command was handled.
     ///
     /// # Errors
     ///
@@ -241,7 +285,9 @@ impl App {
             "clear" => {
                 self.chat_entries.clear();
                 self.chat_scroll = 0;
-                self.agent.clear_history(&self.project_root, &self.cwd)?;
+                if let Some(agent) = &mut self.agent {
+                    agent.clear_history(&self.project_root, &self.cwd)?;
+                }
             }
             other => {
                 self.error_message = Some(format!("Unknown command: /{other}"));
@@ -250,16 +296,31 @@ impl App {
         Ok(())
     }
 
-    /// Execute a conversation turn with the given user input.
+    /// Start a conversation turn in a background task.
     ///
-    /// This is called from the event loop after `submit_input` returns
-    /// `Some(text)`. The streaming response is delivered via a
-    /// [`TuiStreamSink`] that appends tokens to the last chat entry.
+    /// The turn runs on a spawned tokio task. Streaming tokens are sent
+    /// through an `mpsc` channel that the event loop drains on each
+    /// tick. A child `CancellationToken` is used so that cancelling a
+    /// turn does not shut down the entire application.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns `CoreError` on LLM failure or cancellation.
-    pub async fn run_turn(&mut self, user_input: &str) -> Result<(), CoreError> {
+    /// Panics if called while the agent is `None` (i.e., another turn
+    /// is already running). This is guarded by `is_streaming()` checks
+    /// in the event loop.
+    pub fn start_turn(&mut self, user_input: String, parent_cancel: &CancellationToken) {
+        let Some(mut agent) = self.agent.take() else {
+            // Should not happen: the event loop checks `is_streaming()`
+            // before calling `start_turn`.
+            return;
+        };
+
+        // Create a child token for this turn.
+        let turn_cancel = parent_cancel.child_token();
+
+        // Set the child token on the agent so `chat_streaming` uses it.
+        agent.set_cancel_token(turn_cancel.clone());
+
         // Prepare an assistant entry for streaming output.
         self.chat_entries.push(ChatEntry {
             role: Role::Assistant,
@@ -267,23 +328,117 @@ impl App {
         });
         self.streaming = true;
 
-        let mut sink = TuiStreamSink {
-            entries: &mut self.chat_entries,
+        let (tx, rx) = mpsc::channel::<TurnMessage>(256);
+
+        let join = tokio::spawn(async move {
+            let mut sink = ChannelStreamSink { tx: tx.clone() };
+            let result = agent.turn(&user_input, &mut sink).await;
+
+            match result {
+                Ok(()) => {
+                    let user_turns = agent
+                        .history()
+                        .iter()
+                        .filter(|m| m.role() == Role::User)
+                        .count();
+                    // Ignore send errors — the receiver may have been
+                    // dropped if the app is shutting down.
+                    let _ = tx.send(TurnMessage::Done { agent, user_turns }).await;
+                }
+                Err(CoreError::Cancelled) => {
+                    let _ = tx
+                        .send(TurnMessage::Error {
+                            agent,
+                            message: "Request cancelled".to_owned(),
+                            cancelled: true,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(TurnMessage::Error {
+                            agent,
+                            message: e.to_string(),
+                            cancelled: false,
+                        })
+                        .await;
+                }
+            }
+        });
+
+        self.turn_handle = Some(TurnHandle {
+            rx,
+            turn_cancel,
+            _join: join,
+        });
+    }
+
+    /// Drain pending turn messages from the background task channel.
+    ///
+    /// Returns `true` if a redraw is needed (i.e., at least one message
+    /// was received).
+    pub fn drain_turn_messages(&mut self) -> bool {
+        let Some(handle) = &mut self.turn_handle else {
+            return false;
         };
 
-        let result = self.agent.turn(user_input, &mut sink).await;
-        self.streaming = false;
+        let mut changed = false;
 
-        // Update context usage with conversation turn count (dummy).
-        let user_turns = self
-            .agent
-            .history()
-            .iter()
-            .filter(|m| m.role() == Role::User)
-            .count();
-        self.context_usage = format!("{user_turns} turns");
+        loop {
+            match handle.rx.try_recv() {
+                Ok(TurnMessage::Token(token)) => {
+                    if let Some(last) = self.chat_entries.last_mut() {
+                        last.text.push_str(&token);
+                    }
+                    changed = true;
+                }
+                Ok(TurnMessage::Done { agent, user_turns }) => {
+                    self.agent = Some(agent);
+                    self.streaming = false;
+                    self.turn_handle = None;
+                    self.context_usage = format!("{user_turns} turns");
+                    self.set_chat_scroll(0);
+                    return true;
+                }
+                Ok(TurnMessage::Error {
+                    agent,
+                    message,
+                    cancelled,
+                }) => {
+                    self.agent = Some(agent);
+                    self.streaming = false;
+                    self.turn_handle = None;
+                    self.error_message = Some(message);
+                    if cancelled {
+                        // Remove the empty/partial assistant entry on cancellation.
+                        if let Some(last) = self.chat_entries.last() {
+                            if last.role == Role::Assistant && last.text.is_empty() {
+                                self.chat_entries.pop();
+                            }
+                        }
+                    }
+                    self.set_chat_scroll(0);
+                    return true;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    return changed;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    // The task ended without sending Done/Error (should
+                    // not happen, but handle gracefully).
+                    self.streaming = false;
+                    self.turn_handle = None;
+                    return true;
+                }
+            }
+        }
+    }
 
-        result
+    /// Cancel the currently running turn, if any.
+    pub fn cancel_turn(&mut self) {
+        if let Some(handle) = &self.turn_handle {
+            handle.turn_cancel.cancel();
+        }
     }
 
     /// Set an error message to display in the TUI.
@@ -302,17 +457,19 @@ impl App {
     }
 }
 
-/// A [`StreamSink`] that appends tokens to the last chat entry.
-struct TuiStreamSink<'a> {
-    entries: &'a mut Vec<ChatEntry>,
+/// A [`StreamSink`] that sends tokens through an `mpsc` channel.
+struct ChannelStreamSink {
+    tx: mpsc::Sender<TurnMessage>,
 }
 
-impl StreamSink for TuiStreamSink<'_> {
+impl StreamSink for ChannelStreamSink {
     fn on_token(&mut self, token: &str) -> Result<(), CoreError> {
-        if let Some(last) = self.entries.last_mut() {
-            last.text.push_str(token);
-        }
-        Ok(())
+        // Use blocking_send since StreamSink::on_token is not async.
+        // This will block briefly if the channel is full, which provides
+        // natural back-pressure.
+        self.tx
+            .blocking_send(TurnMessage::Token(token.to_owned()))
+            .map_err(|_| CoreError::Cancelled)
     }
 
     fn on_done(&mut self) -> Result<(), CoreError> {

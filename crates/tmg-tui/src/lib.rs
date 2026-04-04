@@ -19,7 +19,8 @@ use tokio_util::sync::CancellationToken;
 /// Run the TUI application.
 ///
 /// Sets up the terminal, creates the application state, and runs the
-/// event loop. The terminal is restored on exit (including on error).
+/// event loop. The terminal is restored on exit (including on error
+/// or panic).
 ///
 /// # Arguments
 ///
@@ -39,6 +40,15 @@ pub async fn run(
     project_root: PathBuf,
     cwd: PathBuf,
 ) -> Result<(), TuiError> {
+    // Install a panic hook that restores the terminal before printing
+    // the panic message.  Without this, a panic during TUI operation
+    // leaves the terminal in raw mode, making the shell unusable.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ratatui::restore();
+        original_hook(info);
+    }));
+
     let mut terminal = ratatui::init();
     let mut app = App::new(agent, model_name, project_root, cwd);
 

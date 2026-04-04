@@ -39,6 +39,9 @@ pub async fn run_event_loop(
     cancel: CancellationToken,
 ) -> Result<(), TuiError> {
     loop {
+        // Drain any pending turn messages before drawing.
+        app.drain_turn_messages();
+
         // Draw the current state.
         terminal.draw(|frame| ui::draw(frame, app))?;
 
@@ -55,10 +58,11 @@ pub async fn run_event_loop(
             maybe_event = poll_event() => {
                 match maybe_event {
                     Ok(Some(event)) => {
-                        handle_event(app, event, &cancel).await?;
+                        handle_event(app, &event, &cancel);
                     }
                     Ok(None) => {
-                        // No event within tick rate, continue (allows redraw during streaming).
+                        // No event within tick rate, continue
+                        // (allows redraw with new streaming tokens).
                     }
                     Err(e) => {
                         return Err(TuiError::Io(e));
@@ -89,44 +93,36 @@ async fn poll_event() -> Result<Option<Event>, std::io::Error> {
 }
 
 /// Handle a single terminal event.
-async fn handle_event(
-    app: &mut App,
-    event: Event,
-    cancel: &CancellationToken,
-) -> Result<(), TuiError> {
+fn handle_event(app: &mut App, event: &Event, cancel: &CancellationToken) {
     // Terminal resize and other events are handled automatically by
     // ratatui on the next draw call.
     if let Event::Key(key_event) = event {
-        handle_key(app, key_event, cancel).await?;
+        handle_key(app, *key_event, cancel);
     }
-    Ok(())
 }
 
 /// Handle a key event.
-async fn handle_key(
-    app: &mut App,
-    key: KeyEvent,
-    cancel: &CancellationToken,
-) -> Result<(), TuiError> {
+fn handle_key(app: &mut App, key: KeyEvent, cancel: &CancellationToken) {
     // Clear error on any keypress.
     app.clear_error();
 
-    // Don't accept input while streaming (except Ctrl+C to cancel).
+    // While streaming, only Ctrl+C cancels the current turn.
     if app.is_streaming() {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            cancel.cancel();
+            app.cancel_turn();
         }
-        return Ok(());
+        return;
     }
 
     match (key.code, key.modifiers) {
-        // Ctrl+C: exit.
+        // Ctrl+C: exit (only when not streaming).
         (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+            cancel.cancel();
             app.request_exit();
         }
-        // Ctrl+Enter: submit input.
+        // Ctrl+Enter: submit input and start turn.
         (KeyCode::Enter, m) if m.contains(KeyModifiers::CONTROL) => {
-            submit_and_run_turn(app).await?;
+            submit_and_start_turn(app, cancel);
         }
         // Enter alone: insert newline.
         (KeyCode::Enter, _) => {
@@ -167,33 +163,18 @@ async fn handle_key(
         }
         _ => {}
     }
-
-    Ok(())
 }
 
-/// Submit input and execute a conversation turn.
-async fn submit_and_run_turn(app: &mut App) -> Result<(), TuiError> {
+/// Submit input and start a background conversation turn.
+fn submit_and_start_turn(app: &mut App, cancel: &CancellationToken) {
     let user_input = match app.submit_input() {
         Ok(Some(text)) => text,
-        Ok(None) => return Ok(()),
+        Ok(None) => return,
         Err(e) => {
             app.set_error(e.to_string());
-            return Ok(());
+            return;
         }
     };
 
-    match app.run_turn(&user_input).await {
-        Ok(()) => {}
-        Err(tmg_core::CoreError::Cancelled) => {
-            app.set_error("Request cancelled".to_owned());
-        }
-        Err(e) => {
-            app.set_error(e.to_string());
-        }
-    }
-
-    // Auto-scroll to bottom after turn.
-    app.set_chat_scroll(0);
-
-    Ok(())
+    app.start_turn(user_input, cancel);
 }

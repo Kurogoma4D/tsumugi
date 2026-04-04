@@ -74,6 +74,14 @@ impl AgentLoop {
         })
     }
 
+    /// Replace the cancellation token used for future turns.
+    ///
+    /// This is useful for using a child token per conversation turn so
+    /// that cancelling one turn does not shut down the entire app.
+    pub fn set_cancel_token(&mut self, token: CancellationToken) {
+        self.cancel = token;
+    }
+
     /// Return a read-only view of the conversation history.
     pub fn history(&self) -> &[Message] {
         &self.history
