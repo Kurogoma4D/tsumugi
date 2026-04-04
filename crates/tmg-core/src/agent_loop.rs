@@ -79,6 +79,23 @@ impl AgentLoop {
         &self.history
     }
 
+    /// Clear conversation history, retaining only the system prompt and
+    /// any injected prompt-file messages.
+    ///
+    /// This reloads prompt files from `project_root`/`cwd` so the
+    /// conversation restarts with a fresh context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Io`] if a prompt file exists but cannot be read.
+    pub fn clear_history(&mut self, project_root: &Path, cwd: &Path) -> Result<(), CoreError> {
+        let mut history = vec![Message::system(DEFAULT_SYSTEM_PROMPT)];
+        let prompt_messages = prompt::load_prompt_files(project_root, cwd)?;
+        history.extend(prompt_messages);
+        self.history = history;
+        Ok(())
+    }
+
     /// Execute a single conversation turn.
     ///
     /// Adds the user message to history, streams the LLM response through
