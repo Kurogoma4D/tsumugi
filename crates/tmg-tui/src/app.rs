@@ -17,10 +17,37 @@ pub struct ChatEntry {
     pub text: String,
 }
 
+/// A single log entry in the tool activity pane.
+#[derive(Debug, Clone)]
+pub struct ToolActivityEntry {
+    /// The tool name.
+    pub tool_name: String,
+    /// A summary of the tool activity (call parameters or result excerpt).
+    pub summary: String,
+    /// Whether this entry represents an error.
+    pub is_error: bool,
+}
+
 /// Messages sent from the background turn task to the event loop.
 pub enum TurnMessage {
     /// An incremental token from the LLM stream.
     Token(String),
+    /// A tool call is being dispatched.
+    ToolCall {
+        /// The tool name.
+        name: String,
+        /// The tool call arguments (JSON string).
+        arguments: String,
+    },
+    /// A tool call completed with a result.
+    ToolResult {
+        /// The tool name.
+        name: String,
+        /// The tool output (may be truncated for display).
+        output: String,
+        /// Whether the tool reported an error.
+        is_error: bool,
+    },
     /// The turn completed successfully. Contains the `AgentLoop` back
     /// and the turn count for context display.
     Done {
@@ -60,6 +87,9 @@ pub struct App {
 
     /// Chat entries displayed in the chat pane.
     chat_entries: Vec<ChatEntry>,
+
+    /// Tool activity log displayed in the tool pane.
+    tool_activity: Vec<ToolActivityEntry>,
 
     /// The current text in the input area.
     input: String,
@@ -101,6 +131,7 @@ impl App {
         Self {
             agent: Some(agent),
             chat_entries: Vec::new(),
+            tool_activity: Vec::new(),
             input: String::new(),
             cursor_pos: 0,
             chat_scroll: 0,
@@ -143,6 +174,11 @@ impl App {
     /// Return a reference to the chat entries.
     pub fn chat_entries(&self) -> &[ChatEntry] {
         &self.chat_entries
+    }
+
+    /// Return a reference to the tool activity log.
+    pub fn tool_activity(&self) -> &[ToolActivityEntry] {
+        &self.tool_activity
     }
 
     /// Return the current input text.
@@ -284,6 +320,7 @@ impl App {
             }
             "clear" => {
                 self.chat_entries.clear();
+                self.tool_activity.clear();
                 self.chat_scroll = 0;
                 if let Some(agent) = &mut self.agent {
                     agent.clear_history(&self.project_root, &self.cwd)?;
@@ -298,10 +335,10 @@ impl App {
 
     /// Start a conversation turn in a background task.
     ///
-    /// The turn runs on a spawned tokio task. Streaming tokens are sent
-    /// through an `mpsc` channel that the event loop drains on each
-    /// tick. A child `CancellationToken` is used so that cancelling a
-    /// turn does not shut down the entire application.
+    /// The turn runs on a spawned tokio task. Streaming tokens and tool
+    /// activity are sent through an `mpsc` channel that the event loop
+    /// drains on each tick. A child `CancellationToken` is used so that
+    /// cancelling a turn does not shut down the entire application.
     ///
     /// # Panics
     ///
@@ -341,7 +378,7 @@ impl App {
                         .iter()
                         .filter(|m| m.role() == Role::User)
                         .count();
-                    // Ignore send errors — the receiver may have been
+                    // Ignore send errors -- the receiver may have been
                     // dropped if the app is shutting down.
                     let _ = tx.send(TurnMessage::Done { agent, user_turns }).await;
                 }
@@ -392,6 +429,29 @@ impl App {
                     }
                     changed = true;
                 }
+                Ok(TurnMessage::ToolCall { name, arguments }) => {
+                    // Truncate arguments for display.
+                    let summary = truncate_for_display(&arguments, 120);
+                    self.tool_activity.push(ToolActivityEntry {
+                        tool_name: name,
+                        summary: format!("calling: {summary}"),
+                        is_error: false,
+                    });
+                    changed = true;
+                }
+                Ok(TurnMessage::ToolResult {
+                    name,
+                    output,
+                    is_error,
+                }) => {
+                    let summary = truncate_for_display(&output, 200);
+                    self.tool_activity.push(ToolActivityEntry {
+                        tool_name: name,
+                        summary,
+                        is_error,
+                    });
+                    changed = true;
+                }
                 Ok(TurnMessage::Done { agent, user_turns }) => {
                     self.agent = Some(agent);
                     self.streaming = false;
@@ -424,7 +484,7 @@ impl App {
                     return changed;
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    // The task ended without sending Done/Error — this
+                    // The task ended without sending Done/Error -- this
                     // means it panicked or was dropped unexpectedly.
                     // Reset streaming state and surface an error so the
                     // user knows recovery requires a restart.
@@ -461,7 +521,28 @@ impl App {
     }
 }
 
-/// A [`StreamSink`] that sends tokens through an `mpsc` channel.
+/// Truncate a string for display, replacing middle with ellipsis if
+/// it exceeds `max_len` characters (measured in `char` count, not bytes).
+fn truncate_for_display(s: &str, max_len: usize) -> String {
+    let first_line = s.lines().next().unwrap_or(s);
+    if first_line.chars().count() <= max_len {
+        return first_line.to_owned();
+    }
+    let half = max_len / 2;
+    let start: String = first_line.chars().take(half).collect();
+    let end: String = first_line
+        .chars()
+        .rev()
+        .take(half)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{start}...{end}")
+}
+
+/// A [`StreamSink`] that sends tokens and tool activity through an
+/// `mpsc` channel.
 struct ChannelStreamSink {
     tx: mpsc::Sender<TurnMessage>,
 }
@@ -476,10 +557,36 @@ impl StreamSink for ChannelStreamSink {
     fn on_done(&mut self) -> Result<(), CoreError> {
         Ok(())
     }
+
+    fn on_tool_call(&mut self, name: &str, arguments: &str) -> Result<(), CoreError> {
+        self.tx
+            .try_send(TurnMessage::ToolCall {
+                name: name.to_owned(),
+                arguments: arguments.to_owned(),
+            })
+            .map_err(|_| CoreError::Cancelled)
+    }
+
+    fn on_tool_result(
+        &mut self,
+        name: &str,
+        output: &str,
+        is_error: bool,
+    ) -> Result<(), CoreError> {
+        self.tx
+            .try_send(TurnMessage::ToolResult {
+                name: name.to_owned(),
+                output: output.to_owned(),
+                is_error,
+            })
+            .map_err(|_| CoreError::Cancelled)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn insert_and_delete_chars() {
         // We can't easily create an AgentLoop without an LlmClient,
@@ -519,5 +626,26 @@ mod tests {
 
         let text = "hello";
         assert!(text.strip_prefix('/').is_none());
+    }
+
+    #[test]
+    fn truncate_for_display_short() {
+        let result = truncate_for_display("hello", 10);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn truncate_for_display_long() {
+        let long = "a".repeat(300);
+        let result = truncate_for_display(&long, 20);
+        assert!(result.len() < 30);
+        assert!(result.contains("..."));
+    }
+
+    #[test]
+    fn truncate_for_display_multiline() {
+        let text = "first line\nsecond line\nthird line";
+        let result = truncate_for_display(text, 100);
+        assert_eq!(result, "first line");
     }
 }

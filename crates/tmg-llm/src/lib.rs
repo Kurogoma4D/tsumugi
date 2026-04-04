@@ -7,6 +7,6 @@ pub mod types;
 pub use client::{ChatStream, LlmClient, LlmClientConfig};
 pub use error::LlmError;
 pub use types::{
-    ChatMessage, ChatRequest, ChatResponse, Role, StreamEvent, ToolCall, ToolCallAccumulator,
-    ToolCallIndexError, ToolDefinition, ToolKind,
+    ChatMessage, ChatRequest, ChatResponse, FunctionCall, FunctionDefinition, Role, StreamEvent,
+    ToolCall, ToolCallAccumulator, ToolCallIndexError, ToolDefinition, ToolKind,
 };
