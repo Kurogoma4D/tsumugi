@@ -46,6 +46,9 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
 
+# Platform directories
+dirs = "6"
+
 # Sandbox
 landlock = "0.4"
 
