@@ -234,7 +234,6 @@ impl AgentLoop {
 
         let mut response_text = String::new();
         let mut tool_calls = Vec::new();
-        let mut done_called = false;
 
         while let Some(event) = stream.next().await {
             match event {
@@ -246,7 +245,6 @@ impl AgentLoop {
                     tool_calls.push(tc);
                 }
                 Ok(StreamEvent::Done(_)) => {
-                    done_called = true;
                     break;
                 }
                 Err(tmg_llm::LlmError::Cancelled) => {
@@ -258,9 +256,7 @@ impl AgentLoop {
             }
         }
 
-        if !done_called {
-            sink.on_done()?;
-        }
+        sink.on_done()?;
 
         Ok((response_text, tool_calls))
     }

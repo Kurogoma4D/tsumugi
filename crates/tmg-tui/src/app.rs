@@ -522,18 +522,23 @@ impl App {
 }
 
 /// Truncate a string for display, replacing middle with ellipsis if
-/// it exceeds `max_len` characters.
+/// it exceeds `max_len` characters (measured in `char` count, not bytes).
 fn truncate_for_display(s: &str, max_len: usize) -> String {
     let first_line = s.lines().next().unwrap_or(s);
-    if first_line.len() <= max_len {
+    if first_line.chars().count() <= max_len {
         return first_line.to_owned();
     }
     let half = max_len / 2;
-    format!(
-        "{}...{}",
-        &first_line[..half],
-        &first_line[first_line.len() - half..]
-    )
+    let start: String = first_line.chars().take(half).collect();
+    let end: String = first_line
+        .chars()
+        .rev()
+        .take(half)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{start}...{end}")
 }
 
 /// A [`StreamSink`] that sends tokens and tool activity through an
