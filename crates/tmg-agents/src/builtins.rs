@@ -35,7 +35,9 @@ fn register_tool_by_name(registry: &mut ToolRegistry, name: &str) {
         "grep_search" => registry.register(tmg_tools::tools::GrepSearchTool),
         "list_dir" => registry.register(tmg_tools::tools::ListDirTool),
         "shell_exec" => registry.register(tmg_tools::tools::ShellExecTool),
-        _ => {} // Unknown tool names are silently skipped.
+        _ => {
+            debug_assert!(false, "register_tool_by_name: unknown tool name: {name}");
+        }
     }
 }
 

@@ -4,10 +4,11 @@
 //! as tokio tasks in a [`JoinSet`], and provides methods to query
 //! status and collect results.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -20,7 +21,21 @@ use crate::runner::SubagentRunner;
 use crate::status::SubagentStatus;
 
 /// A unique identifier for a subagent instance.
-pub type SubagentId = u64;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SubagentId(u64);
+
+impl SubagentId {
+    /// Return the inner `u64` value.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for SubagentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Summary information about a subagent for display purposes.
 #[derive(Debug, Clone)]
@@ -58,10 +73,13 @@ pub struct SubagentManager {
     join_set: JoinSet<(SubagentId, Result<String, AgentError>)>,
 
     /// Shared state for all tracked subagent instances.
-    instances: Arc<Mutex<HashMap<SubagentId, SubagentInstance>>>,
+    ///
+    /// Uses `BTreeMap` for sorted iteration (by ID) and better cache
+    /// locality on the small collections expected here.
+    instances: Arc<Mutex<BTreeMap<SubagentId, SubagentInstance>>>,
 
     /// Counter for generating unique subagent IDs.
-    next_id: SubagentId,
+    next_id: u64,
 }
 
 impl SubagentManager {
@@ -71,7 +89,7 @@ impl SubagentManager {
             client,
             parent_cancel,
             join_set: JoinSet::new(),
-            instances: Arc::new(Mutex::new(HashMap::new())),
+            instances: Arc::new(Mutex::new(BTreeMap::new())),
             next_id: 1,
         }
     }
@@ -82,28 +100,44 @@ impl SubagentManager {
     /// [`collect_completed`] to drain finished results, or
     /// [`wait_for`] to await a specific subagent.
     pub async fn spawn(&mut self, config: SubagentConfig) -> SubagentId {
-        let id = self.next_id;
+        self.spawn_inner(config, None).await
+    }
+
+    /// Spawn a subagent and return both its ID and a oneshot receiver
+    /// that will deliver the result when the subagent completes.
+    ///
+    /// This is designed for foreground spawns where the caller needs to
+    /// drop the manager lock before awaiting the result (e.g., so the
+    /// TUI can still call `summaries()` while the subagent runs).
+    pub async fn spawn_with_notify(
+        &mut self,
+        config: SubagentConfig,
+    ) -> (SubagentId, oneshot::Receiver<Result<String, AgentError>>) {
+        let (tx, rx) = oneshot::channel();
+        let id = self.spawn_inner(config, Some(tx)).await;
+        (id, rx)
+    }
+
+    /// Internal spawn implementation shared by `spawn` and `spawn_with_notify`.
+    async fn spawn_inner(
+        &mut self,
+        config: SubagentConfig,
+        notify: Option<oneshot::Sender<Result<String, AgentError>>>,
+    ) -> SubagentId {
+        let id = SubagentId(self.next_id);
         self.next_id += 1;
 
+        // Insert directly as Running -- no need for the Pending ->
+        // Running transition since we spawn the task immediately.
         let instance = SubagentInstance {
             agent_type: config.agent_type,
             task: config.task.clone(),
-            status: SubagentStatus::Pending,
+            status: SubagentStatus::Running,
         };
 
         {
             let mut instances = self.instances.lock().await;
             instances.insert(id, instance);
-        }
-
-        // Transition to Running.
-        {
-            let mut instances = self.instances.lock().await;
-            if let Some(inst) = instances.get_mut(&id) {
-                if let Some(new_status) = inst.status.clone().transition_to_running() {
-                    inst.status = new_status;
-                }
-            }
         }
 
         let client = self.client.clone();
@@ -122,43 +156,37 @@ impl SubagentManager {
             {
                 let mut insts = instances.lock().await;
                 if let Some(inst) = insts.get_mut(&id) {
-                    let current = inst.status.clone();
                     match &result {
                         Ok(output) => {
-                            if let Some(new_status) = current.complete(output.clone()) {
-                                inst.status = new_status;
-                            }
+                            inst.status.complete(output.clone());
                         }
                         Err(AgentError::Cancelled) => {
-                            if let Some(new_status) = current.cancel() {
-                                inst.status = new_status;
-                            }
+                            inst.status.cancel();
                         }
                         Err(e) => {
-                            if let Some(new_status) = current.fail(e.to_string()) {
-                                inst.status = new_status;
-                            }
+                            inst.status.fail(e.to_string());
                         }
                     }
                 }
+            }
+
+            // If a foreground caller is waiting via oneshot, deliver the
+            // result. Ignore send errors (the receiver may have been
+            // dropped if the caller was cancelled).
+            if let Some(tx) = notify {
+                let to_send = match &result {
+                    Ok(output) => Ok(output.clone()),
+                    Err(e) => Err(AgentError::JoinError {
+                        message: e.to_string(),
+                    }),
+                };
+                let _ = tx.send(to_send);
             }
 
             (id, result)
         });
 
         id
-    }
-
-    /// Spawn a subagent and wait for it to complete, returning its result.
-    ///
-    /// This is the synchronous (foreground) spawn mode.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AgentError`] if the subagent fails or is cancelled.
-    pub async fn spawn_and_wait(&mut self, config: SubagentConfig) -> Result<String, AgentError> {
-        let id = self.spawn(config).await;
-        self.wait_for(id).await
     }
 
     /// Wait for a specific subagent to complete and return its result.
@@ -205,9 +233,11 @@ impl SubagentManager {
     }
 
     /// Return summaries of all tracked subagent instances.
+    ///
+    /// Results are sorted by ID (guaranteed by `BTreeMap` iteration order).
     pub async fn summaries(&self) -> Vec<SubagentSummary> {
         let instances = self.instances.lock().await;
-        let mut summaries: Vec<SubagentSummary> = instances
+        instances
             .iter()
             .map(|(&id, inst)| SubagentSummary {
                 id,
@@ -215,11 +245,7 @@ impl SubagentManager {
                 task: inst.task.clone(),
                 status: inst.status.clone(),
             })
-            .collect();
-
-        // Sort by ID for deterministic output.
-        summaries.sort_by_key(|s| s.id);
-        summaries
+            .collect()
     }
 
     /// Return the number of currently running (non-terminal) subagents.
@@ -246,13 +272,13 @@ mod tests {
     #[test]
     fn subagent_summary_fields() {
         let summary = SubagentSummary {
-            id: 1,
+            id: SubagentId(1),
             agent_type: AgentType::Explore,
             task: "test task".to_owned(),
             status: SubagentStatus::Running,
         };
 
-        assert_eq!(summary.id, 1);
+        assert_eq!(summary.id, SubagentId(1));
         assert_eq!(summary.agent_type, AgentType::Explore);
         assert_eq!(summary.task, "test task");
         assert_eq!(summary.status, SubagentStatus::Running);
@@ -285,8 +311,8 @@ mod tests {
         let id1 = manager.spawn(config1).await;
         let id2 = manager.spawn(config2).await;
 
-        assert_eq!(id1, 1);
-        assert_eq!(id2, 2);
+        assert_eq!(id1, SubagentId(1));
+        assert_eq!(id2, SubagentId(2));
 
         // Clean up: cancel and shutdown to avoid dangling tasks.
         cancel.cancel();

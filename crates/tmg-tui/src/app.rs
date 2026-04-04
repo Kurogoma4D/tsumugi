@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tmg_agents::{AgentType, SubagentManager, SubagentSummary};
+use tmg_agents::{AgentType, SubagentManager, SubagentSummary, truncate_str};
 use tmg_core::{AgentLoop, CoreError, StreamSink};
 use tmg_llm::Role;
 use tokio::sync::Mutex;
@@ -392,8 +392,8 @@ impl App {
         if !self.subagent_summaries.is_empty() {
             text.push_str("\nActive subagents:\n");
             for summary in &self.subagent_summaries {
-                let task_preview = if summary.task.len() > 60 {
-                    format!("{}...", &summary.task[..57])
+                let task_preview = if summary.task.chars().count() > 60 {
+                    format!("{}...", truncate_str(&summary.task, 57))
                 } else {
                     summary.task.clone()
                 };

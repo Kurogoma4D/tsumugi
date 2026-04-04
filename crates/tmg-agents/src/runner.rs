@@ -184,6 +184,13 @@ impl SubagentRunner {
     }
 
     /// Stream one round of LLM output.
+    ///
+    /// # Cancel safety
+    ///
+    /// Uses `tokio::select!` to respond to cancellation promptly even
+    /// during slow LLM responses. The `stream.next()` future is
+    /// cancel-safe (dropping it just means we stop reading from the
+    /// stream).
     async fn stream_one_round(&self) -> Result<(String, Vec<ToolCall>), AgentError> {
         let chat_messages: Vec<_> = self
             .history
@@ -200,26 +207,36 @@ impl SubagentRunner {
         let mut response_text = String::new();
         let mut tool_calls = Vec::new();
 
-        while let Some(event) = stream.next().await {
-            match event {
-                Ok(StreamEvent::ContentDelta(token)) => {
-                    response_text.push_str(&token);
-                }
-                Ok(StreamEvent::ToolCallComplete(tc)) => {
-                    // Check: subagents must not call spawn_agent.
-                    if tc.function.name == "spawn_agent" {
-                        return Err(AgentError::NestingForbidden);
-                    }
-                    tool_calls.push(tc);
-                }
-                Ok(StreamEvent::Done(_)) => {
-                    break;
-                }
-                Err(tmg_llm::LlmError::Cancelled) => {
+        loop {
+            tokio::select! {
+                () = self.cancel.cancelled() => {
                     return Err(AgentError::Cancelled);
                 }
-                Err(e) => {
-                    return Err(AgentError::Llm(e));
+                maybe_event = stream.next() => {
+                    let Some(event) = maybe_event else {
+                        break;
+                    };
+                    match event {
+                        Ok(StreamEvent::ContentDelta(token)) => {
+                            response_text.push_str(&token);
+                        }
+                        Ok(StreamEvent::ToolCallComplete(tc)) => {
+                            // Check: subagents must not call spawn_agent.
+                            if tc.function.name == "spawn_agent" {
+                                return Err(AgentError::NestingForbidden);
+                            }
+                            tool_calls.push(tc);
+                        }
+                        Ok(StreamEvent::Done(_)) => {
+                            break;
+                        }
+                        Err(tmg_llm::LlmError::Cancelled) => {
+                            return Err(AgentError::Cancelled);
+                        }
+                        Err(e) => {
+                            return Err(AgentError::Llm(e));
+                        }
+                    }
                 }
             }
         }
@@ -228,6 +245,15 @@ impl SubagentRunner {
     }
 
     /// Execute tool calls in parallel via `JoinSet`.
+    ///
+    /// # Cancellation behaviour
+    ///
+    /// If any tool task returns `AgentError::Cancelled`, the `?`
+    /// propagation causes this method to return early and discard
+    /// results from other (potentially completed) tool calls. This is
+    /// intentional: once cancellation is signaled the entire subagent
+    /// loop is shutting down, so preserving partial results is not
+    /// useful. The `JoinSet` is dropped, which aborts remaining tasks.
     async fn dispatch_tool_calls(&mut self, tool_calls: &[ToolCall]) -> Result<(), AgentError> {
         let mut join_set = JoinSet::new();
 

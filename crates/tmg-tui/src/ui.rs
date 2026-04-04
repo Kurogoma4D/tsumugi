@@ -8,6 +8,8 @@ use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 
+use tmg_agents::truncate_str;
+
 use crate::app::App;
 
 /// Render the full application UI into the given frame.
@@ -281,8 +283,8 @@ fn draw_subagent_pane(frame: &mut Frame, summaries: &[tmg_agents::SubagentSummar
             _ => Style::default().fg(Color::DarkGray),
         };
 
-        let task_preview = if summary.task.len() > 40 {
-            format!("{}...", &summary.task[..37])
+        let task_preview = if summary.task.chars().count() > 40 {
+            format!("{}...", truncate_str(&summary.task, 37))
         } else {
             summary.task.clone()
         };

@@ -20,8 +20,11 @@ use crate::manager::SubagentManager;
 
 /// A tool that spawns subagents from the main agent loop.
 ///
-/// When `background` is `false` (default), the tool awaits the
-/// subagent's completion and returns its result as the tool output.
+/// When `background` is `false` (default), the tool acquires the
+/// manager lock to spawn (obtaining the ID and a oneshot receiver),
+/// then **drops the lock** and awaits the oneshot. This avoids holding
+/// the lock for the entire subagent lifetime, which would freeze the
+/// TUI's periodic `refresh_subagent_summaries` calls.
 ///
 /// When `background` is `true`, the tool spawns the subagent, returns
 /// its ID immediately, and the subagent runs concurrently.
@@ -112,19 +115,34 @@ impl Tool for SpawnAgentTool {
                 background,
             };
 
-            let mut manager = self.manager.lock().await;
-
             if background {
-                let id = manager.spawn(config).await;
+                // Background: acquire lock, spawn, release lock, return ID.
+                let id = {
+                    let mut manager = self.manager.lock().await;
+                    manager.spawn(config).await
+                };
                 Ok(ToolResult::success(format!(
                     "Subagent spawned in background with ID {id}. \
                      It will run concurrently and results will be \
                      available when it completes."
                 )))
             } else {
-                match manager.spawn_and_wait(config).await {
-                    Ok(result) => Ok(ToolResult::success(result)),
-                    Err(e) => Ok(ToolResult::error(format!("Subagent failed: {e}"))),
+                // Foreground: acquire lock, spawn with oneshot notification,
+                // release lock, then await the oneshot receiver. This
+                // ensures the TUI can still acquire the lock for
+                // `refresh_subagent_summaries` while the subagent runs.
+                let (_id, rx) = {
+                    let mut manager = self.manager.lock().await;
+                    manager.spawn_with_notify(config).await
+                };
+                // Lock is now dropped -- the TUI can freely poll summaries.
+
+                match rx.await {
+                    Ok(Ok(output)) => Ok(ToolResult::success(output)),
+                    Ok(Err(e)) => Ok(ToolResult::error(format!("Subagent failed: {e}"))),
+                    Err(_) => Ok(ToolResult::error(
+                        "Subagent task dropped without producing a result".to_owned(),
+                    )),
                 }
             }
         })

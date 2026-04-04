@@ -14,7 +14,7 @@ pub mod tools;
 
 pub use config::{AgentType, SubagentConfig};
 pub use error::AgentError;
-pub use manager::{SubagentManager, SubagentSummary};
+pub use manager::{SubagentId, SubagentManager, SubagentSummary};
 pub use runner::SubagentRunner;
-pub use status::SubagentStatus;
+pub use status::{SubagentStatus, truncate_str};
 pub use tools::SpawnAgentTool;

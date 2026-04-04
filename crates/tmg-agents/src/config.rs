@@ -91,13 +91,12 @@ impl AgentType {
     }
 
     /// Parse an agent type from a string name.
+    ///
+    /// Delegates to serde deserialization so the canonical name mapping
+    /// is defined in a single place (`#[serde(rename_all = "snake_case")]`).
     pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "explore" => Some(Self::Explore),
-            "worker" => Some(Self::Worker),
-            "plan" => Some(Self::Plan),
-            _ => None,
-        }
+        let quoted = format!("\"{name}\"");
+        serde_json::from_str(&quoted).ok()
     }
 }
 

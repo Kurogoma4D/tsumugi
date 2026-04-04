@@ -1,6 +1,6 @@
 //! Event loop: polls terminal events and drives the application.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::DefaultTerminal;
@@ -15,6 +15,13 @@ use crate::ui;
 /// This controls how often the TUI checks for new terminal events
 /// and redraws the screen during streaming.
 const TICK_RATE: Duration = Duration::from_millis(33); // ~30 fps
+
+/// Minimum interval between subagent summary refreshes.
+///
+/// Refreshing every tick (~33ms) is excessive since it acquires a
+/// `tokio::sync::Mutex` lock. Once per second is sufficient for
+/// human-readable status updates.
+const SUBAGENT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Run the TUI event loop.
 ///
@@ -38,12 +45,20 @@ pub async fn run_event_loop(
     app: &mut App,
     cancel: CancellationToken,
 ) -> Result<(), TuiError> {
+    let mut last_subagent_refresh = Instant::now()
+        .checked_sub(SUBAGENT_REFRESH_INTERVAL)
+        .unwrap_or_else(Instant::now);
+
     loop {
         // Drain any pending turn messages before drawing.
         app.drain_turn_messages();
 
-        // Refresh subagent summaries for display.
-        app.refresh_subagent_summaries().await;
+        // Refresh subagent summaries at a throttled rate (once per second)
+        // to avoid excessive lock contention with the manager mutex.
+        if last_subagent_refresh.elapsed() >= SUBAGENT_REFRESH_INTERVAL {
+            app.refresh_subagent_summaries().await;
+            last_subagent_refresh = Instant::now();
+        }
 
         // Draw the current state.
         terminal.draw(|frame| ui::draw(frame, app))?;

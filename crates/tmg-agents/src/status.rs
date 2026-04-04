@@ -1,9 +1,8 @@
-//! Subagent status with type-level state transitions.
+//! Subagent status with enum-based state transitions.
 //!
-//! Uses an enum with explicit transition methods to prevent invalid
-//! state changes at the type level. The `transition_to_running`,
-//! `complete`, and `fail` methods consume the status value and return
-//! the new status, enforcing valid transitions.
+//! Uses `&mut self` methods that return `bool` to indicate success,
+//! preventing invalid state changes while allowing ergonomic in-place
+//! mutation without requiring `clone()`.
 
 /// The lifecycle status of a subagent instance.
 ///
@@ -38,41 +37,53 @@ pub enum SubagentStatus {
 impl SubagentStatus {
     /// Transition from `Pending` to `Running`.
     ///
-    /// Returns `None` if the current status is not `Pending`.
-    pub fn transition_to_running(self) -> Option<Self> {
-        match self {
-            Self::Pending => Some(Self::Running),
-            _ => None,
+    /// Returns `true` if the transition was applied, `false` if the
+    /// current status is not `Pending`.
+    pub fn transition_to_running(&mut self) -> bool {
+        if matches!(self, Self::Pending) {
+            *self = Self::Running;
+            true
+        } else {
+            false
         }
     }
 
     /// Transition from `Running` to `Completed` with a result.
     ///
-    /// Returns `None` if the current status is not `Running`.
-    pub fn complete(self, result: String) -> Option<Self> {
-        match self {
-            Self::Running => Some(Self::Completed { result }),
-            _ => None,
+    /// Returns `true` if the transition was applied, `false` if the
+    /// current status is not `Running`.
+    pub fn complete(&mut self, result: String) -> bool {
+        if matches!(self, Self::Running) {
+            *self = Self::Completed { result };
+            true
+        } else {
+            false
         }
     }
 
     /// Transition from `Running` to `Failed` with an error message.
     ///
-    /// Returns `None` if the current status is not `Running`.
-    pub fn fail(self, error: String) -> Option<Self> {
-        match self {
-            Self::Running => Some(Self::Failed { error }),
-            _ => None,
+    /// Returns `true` if the transition was applied, `false` if the
+    /// current status is not `Running`.
+    pub fn fail(&mut self, error: String) -> bool {
+        if matches!(self, Self::Running) {
+            *self = Self::Failed { error };
+            true
+        } else {
+            false
         }
     }
 
     /// Transition from `Running` to `Cancelled`.
     ///
-    /// Returns `None` if the current status is not `Running`.
-    pub fn cancel(self) -> Option<Self> {
-        match self {
-            Self::Running => Some(Self::Cancelled),
-            _ => None,
+    /// Returns `true` if the transition was applied, `false` if the
+    /// current status is not `Running`.
+    pub fn cancel(&mut self) -> bool {
+        if matches!(self, Self::Running) {
+            *self = Self::Cancelled;
+            true
+        } else {
+            false
         }
     }
 
@@ -97,14 +108,24 @@ impl SubagentStatus {
     }
 }
 
+/// Truncate a string to at most `max_chars` characters, returning a
+/// `&str` slice. This is safe for multi-byte UTF-8 (CJK, emoji, etc.)
+/// because it uses `char_indices` to find the correct byte boundary.
+pub fn truncate_str(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
+
 impl std::fmt::Display for SubagentStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Pending => write!(f, "pending"),
             Self::Running => write!(f, "running"),
             Self::Completed { result } => {
-                let preview = if result.len() > 80 {
-                    format!("{}...", &result[..77])
+                let preview = if result.chars().count() > 80 {
+                    format!("{}...", truncate_str(result, 77))
                 } else {
                     result.clone()
                 };
@@ -122,65 +143,63 @@ mod tests {
 
     #[test]
     fn pending_to_running() {
-        let status = SubagentStatus::Pending;
-        let status = status.transition_to_running();
-        assert_eq!(status, Some(SubagentStatus::Running));
+        let mut status = SubagentStatus::Pending;
+        assert!(status.transition_to_running());
+        assert_eq!(status, SubagentStatus::Running);
     }
 
     #[test]
     fn running_to_completed() {
-        let status = SubagentStatus::Running;
-        let status = status.complete("done".to_owned());
+        let mut status = SubagentStatus::Running;
+        assert!(status.complete("done".to_owned()));
         assert_eq!(
             status,
-            Some(SubagentStatus::Completed {
+            SubagentStatus::Completed {
                 result: "done".to_owned()
-            })
+            }
         );
     }
 
     #[test]
     fn running_to_failed() {
-        let status = SubagentStatus::Running;
-        let status = status.fail("oops".to_owned());
+        let mut status = SubagentStatus::Running;
+        assert!(status.fail("oops".to_owned()));
         assert_eq!(
             status,
-            Some(SubagentStatus::Failed {
+            SubagentStatus::Failed {
                 error: "oops".to_owned()
-            })
+            }
         );
     }
 
     #[test]
     fn running_to_cancelled() {
-        let status = SubagentStatus::Running;
-        let status = status.cancel();
-        assert_eq!(status, Some(SubagentStatus::Cancelled));
+        let mut status = SubagentStatus::Running;
+        assert!(status.cancel());
+        assert_eq!(status, SubagentStatus::Cancelled);
     }
 
     #[test]
     fn invalid_pending_to_completed() {
-        let status = SubagentStatus::Pending;
-        let result = status.complete("done".to_owned());
-        assert!(result.is_none());
+        let mut status = SubagentStatus::Pending;
+        assert!(!status.complete("done".to_owned()));
+        assert_eq!(status, SubagentStatus::Pending);
     }
 
     #[test]
     fn invalid_completed_to_running() {
-        let status = SubagentStatus::Completed {
+        let mut status = SubagentStatus::Completed {
             result: "done".to_owned(),
         };
-        let result = status.transition_to_running();
-        assert!(result.is_none());
+        assert!(!status.transition_to_running());
     }
 
     #[test]
     fn invalid_failed_to_completed() {
-        let status = SubagentStatus::Failed {
+        let mut status = SubagentStatus::Failed {
             error: "err".to_owned(),
         };
-        let result = status.complete("done".to_owned());
-        assert!(result.is_none());
+        assert!(!status.complete("done".to_owned()));
     }
 
     #[test]
@@ -221,5 +240,34 @@ mod tests {
             "failed"
         );
         assert_eq!(SubagentStatus::Cancelled.label(), "cancelled");
+    }
+
+    #[test]
+    fn truncate_str_ascii() {
+        assert_eq!(truncate_str("hello world", 5), "hello");
+        assert_eq!(truncate_str("hi", 10), "hi");
+    }
+
+    #[test]
+    fn truncate_str_multibyte() {
+        // CJK characters are 3 bytes each in UTF-8.
+        let cjk = "あいうえお";
+        assert_eq!(truncate_str(cjk, 3), "あいう");
+        assert_eq!(truncate_str(cjk, 10), cjk);
+    }
+
+    #[test]
+    fn truncate_str_emoji() {
+        let emoji = "😀😁😂🤣😃";
+        assert_eq!(truncate_str(emoji, 2), "😀😁");
+    }
+
+    #[test]
+    fn display_completed_truncates_long_result() {
+        let long = "あ".repeat(100);
+        let display = SubagentStatus::Completed { result: long }.to_string();
+        assert!(display.starts_with("completed: "));
+        assert!(display.ends_with("..."));
+        // Should not panic on multi-byte truncation.
     }
 }
