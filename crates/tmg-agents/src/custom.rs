@@ -21,7 +21,30 @@ use serde::{Deserialize, Serialize};
 
 use tmg_sandbox::SandboxMode;
 
+use crate::config::AgentType;
 use crate::error::AgentError;
+
+/// Known tool names in the registry.
+///
+/// Used for validation warnings. This list should be kept in sync with
+/// [`tmg_tools::default_registry`].
+const KNOWN_TOOL_NAMES: &[&str] = &[
+    "file_read",
+    "file_write",
+    "file_patch",
+    "grep_search",
+    "list_dir",
+    "shell_exec",
+];
+
+/// Validate that an agent name matches `[a-zA-Z][a-zA-Z0-9_-]*`.
+fn is_valid_agent_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic() && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
 
 /// Raw TOML representation of a custom subagent definition.
 ///
@@ -45,28 +68,69 @@ struct RawToolsSection {
 }
 
 /// A validated custom subagent definition.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Does not derive `Deserialize` to force all parsing through
+/// [`CustomAgentDef::from_toml`], which performs validation that
+/// serde cannot express (e.g. `allowed_tools` maps from `tools.allow`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CustomAgentDef {
     /// The unique name of this custom agent (e.g. `"reviewer"`).
-    pub name: String,
+    name: String,
 
     /// A human-readable description of this agent's purpose.
-    pub description: String,
+    description: String,
 
     /// Optional model override (uses the default model if `None`).
-    pub model: Option<String>,
+    model: Option<String>,
 
     /// Optional endpoint override (uses the default endpoint if `None`).
-    pub endpoint: Option<String>,
+    endpoint: Option<String>,
 
     /// Optional sandbox mode override.
-    pub sandbox_mode: Option<SandboxMode>,
+    sandbox_mode: Option<SandboxMode>,
 
     /// The system instructions for this agent.
-    pub instructions: String,
+    instructions: String,
 
     /// The list of tool names this agent is allowed to use.
-    pub allowed_tools: Vec<String>,
+    allowed_tools: Vec<String>,
+}
+
+impl CustomAgentDef {
+    /// The unique name of this custom agent.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// A human-readable description of this agent's purpose.
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    /// Optional model override (uses the default model if `None`).
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// Optional endpoint override (uses the default endpoint if `None`).
+    pub fn endpoint(&self) -> Option<&str> {
+        self.endpoint.as_deref()
+    }
+
+    /// Optional sandbox mode override.
+    pub fn sandbox_mode(&self) -> Option<SandboxMode> {
+        self.sandbox_mode
+    }
+
+    /// The system instructions for this agent.
+    pub fn instructions(&self) -> &str {
+        &self.instructions
+    }
+
+    /// The list of tool names this agent is allowed to use.
+    pub fn allowed_tools(&self) -> &[String] {
+        &self.allowed_tools
+    }
 }
 
 /// The source priority of a discovered custom agent definition.
@@ -125,6 +189,23 @@ impl CustomAgentDef {
             });
         };
 
+        // Validate name format: must start with a letter, followed by
+        // letters, digits, underscores, or hyphens.
+        if !is_valid_agent_name(&name) {
+            return Err(AgentError::InvalidCustomAgent {
+                path: file_path.to_owned(),
+                reason: format!("invalid agent name '{name}': must match [a-zA-Z][a-zA-Z0-9_-]*"),
+            });
+        }
+
+        // Reject names that collide with built-in agent types.
+        if AgentType::from_name(&name).is_some() {
+            return Err(AgentError::InvalidCustomAgent {
+                path: file_path.to_owned(),
+                reason: format!("agent name '{name}' conflicts with built-in agent type"),
+            });
+        }
+
         let Some(description) = raw.description else {
             return Err(AgentError::InvalidCustomAgent {
                 path: file_path.to_owned(),
@@ -166,6 +247,23 @@ impl CustomAgentDef {
                 path: file_path.to_owned(),
                 reason: "tools.allow must not include 'spawn_agent' (nesting is forbidden)"
                     .to_owned(),
+            });
+        }
+
+        // Validate that all tool names are recognized.
+        let unknown: Vec<&String> = allowed_tools
+            .iter()
+            .filter(|t| !KNOWN_TOOL_NAMES.contains(&t.as_str()))
+            .collect();
+        if !unknown.is_empty() {
+            let names: Vec<&str> = unknown.iter().map(|s| s.as_str()).collect();
+            return Err(AgentError::InvalidCustomAgent {
+                path: file_path.to_owned(),
+                reason: format!(
+                    "unrecognized tool name(s): {}. Known tools: {}",
+                    names.join(", "),
+                    KNOWN_TOOL_NAMES.join(", "),
+                ),
             });
         }
 
@@ -369,6 +467,74 @@ allow = ["file_read", "spawn_agent"]
     }
 
     #[test]
+    fn builtin_name_collision_rejected() {
+        let toml = r#"
+name = "explore"
+description = "Test"
+instructions = "Do something."
+
+[tools]
+allow = ["file_read"]
+"#;
+
+        let err = CustomAgentDef::from_toml(toml, "bad.toml").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("conflicts with built-in agent type")
+        );
+    }
+
+    #[test]
+    fn invalid_name_format_rejected() {
+        let toml = r#"
+name = "123bad"
+description = "Test"
+instructions = "Do something."
+
+[tools]
+allow = ["file_read"]
+"#;
+
+        let err = CustomAgentDef::from_toml(toml, "bad.toml").unwrap_err();
+        assert!(err.to_string().contains("invalid agent name"));
+    }
+
+    #[test]
+    fn unrecognized_tool_name_rejected() {
+        let toml = r#"
+name = "test"
+description = "Test"
+instructions = "Do something."
+
+[tools]
+allow = ["file_read", "nonexistent_tool"]
+"#;
+
+        let err = CustomAgentDef::from_toml(toml, "bad.toml").unwrap_err();
+        assert!(err.to_string().contains("unrecognized tool name"));
+    }
+
+    #[test]
+    fn valid_name_formats_accepted() {
+        for name in &["myAgent", "a", "my-agent", "my_agent", "Agent123"] {
+            let toml = format!(
+                r#"
+name = "{name}"
+description = "Test"
+instructions = "Do something."
+
+[tools]
+allow = ["file_read"]
+"#
+            );
+            assert!(
+                CustomAgentDef::from_toml(&toml, "test.toml").is_ok(),
+                "expected name '{name}' to be valid"
+            );
+        }
+    }
+
+    #[test]
     fn invalid_toml_syntax_returns_error() {
         let err = CustomAgentDef::from_toml("not valid toml [[[", "bad.toml").unwrap_err();
         assert!(err.to_string().contains("toml parse error"));
@@ -432,6 +598,14 @@ allow = ["file_read", "spawn_agent"]
             "[a-zA-Z][a-zA-Z0-9 _-]{0,30}[a-zA-Z0-9]"
         }
 
+        /// Generate a valid agent name that won't collide with built-in names.
+        fn arb_agent_name() -> impl Strategy<Value = String> {
+            "[a-zA-Z][a-zA-Z0-9_-]{2,20}"
+                .prop_filter("must not collide with built-in names", |name| {
+                    crate::config::AgentType::from_name(name).is_none()
+                })
+        }
+
         fn arb_tool_name() -> impl Strategy<Value = String> {
             // Use known valid tool names to avoid the "spawn_agent" rejection.
             prop_oneof![
@@ -459,7 +633,7 @@ allow = ["file_read", "spawn_agent"]
 
         fn arb_custom_agent_def() -> impl Strategy<Value = CustomAgentDef> {
             (
-                arb_toml_safe_string(),
+                arb_agent_name(),
                 arb_toml_safe_string(),
                 arb_optional_string(),
                 arb_optional_endpoint(),

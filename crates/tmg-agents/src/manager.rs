@@ -115,7 +115,12 @@ impl SubagentManager {
     /// The subagent runs as a task in the internal `JoinSet`. Use
     /// [`collect_completed`] to drain finished results, or
     /// [`wait_for`] to await a specific subagent.
-    pub async fn spawn(&mut self, config: SubagentConfig) -> SubagentId {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Llm`] if a custom agent requires a
+    /// dedicated `LlmClient` and client creation fails.
+    pub async fn spawn(&mut self, config: SubagentConfig) -> Result<SubagentId, AgentError> {
         self.spawn_inner(config, None).await
     }
 
@@ -125,13 +130,17 @@ impl SubagentManager {
     /// This is designed for foreground spawns where the caller needs to
     /// drop the manager lock before awaiting the result (e.g., so the
     /// TUI can still call `summaries()` while the subagent runs).
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Llm`] if a custom agent requires a
+    /// dedicated `LlmClient` and client creation fails.
     pub async fn spawn_with_notify(
         &mut self,
         config: SubagentConfig,
-    ) -> (SubagentId, oneshot::Receiver<Result<String, AgentError>>) {
+    ) -> Result<(SubagentId, oneshot::Receiver<Result<String, AgentError>>), AgentError> {
         let (tx, rx) = oneshot::channel();
-        let id = self.spawn_inner(config, Some(tx)).await;
-        (id, rx)
+        let id = self.spawn_inner(config, Some(tx)).await?;
+        Ok((id, rx))
     }
 
     /// Internal spawn implementation shared by `spawn` and `spawn_with_notify`.
@@ -139,7 +148,7 @@ impl SubagentManager {
         &mut self,
         config: SubagentConfig,
         notify: Option<oneshot::Sender<Result<String, AgentError>>>,
-    ) -> SubagentId {
+    ) -> Result<SubagentId, AgentError> {
         let id = SubagentId(self.next_id);
         self.next_id += 1;
 
@@ -161,14 +170,11 @@ impl SubagentManager {
         // For custom agents with a specific endpoint/model, create a
         // dedicated LlmClient. Otherwise, use the shared client.
         let client = if let AgentKind::Custom(ref def) = config.agent_kind {
-            if def.endpoint.is_some() || def.model.is_some() {
-                let endpoint = def.endpoint.as_deref().unwrap_or(&self.default_endpoint);
-                let model = def.model.as_deref().unwrap_or(&self.default_model);
+            if def.endpoint().is_some() || def.model().is_some() {
+                let endpoint = def.endpoint().unwrap_or(&self.default_endpoint);
+                let model = def.model().unwrap_or(&self.default_model);
                 let llm_config = tmg_llm::LlmClientConfig::new(endpoint, model);
-                match tmg_llm::LlmClient::new(llm_config) {
-                    Ok(c) => c,
-                    Err(_) => self.client.clone(),
-                }
+                tmg_llm::LlmClient::new(llm_config).map_err(AgentError::Llm)?
             } else {
                 self.client.clone()
             }
@@ -221,7 +227,7 @@ impl SubagentManager {
             (id, result)
         });
 
-        id
+        Ok(id)
     }
 
     /// Wait for a specific subagent to complete and return its result.
@@ -301,6 +307,7 @@ impl SubagentManager {
 }
 
 #[cfg(test)]
+#[expect(clippy::panic, reason = "test assertions")]
 mod tests {
     use super::*;
     use crate::config::AgentType;
@@ -345,8 +352,14 @@ mod tests {
             background: true,
         };
 
-        let id1 = manager.spawn(config1).await;
-        let id2 = manager.spawn(config2).await;
+        let id1 = manager
+            .spawn(config1)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let id2 = manager
+            .spawn(config2)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
 
         assert_eq!(id1, SubagentId(1));
         assert_eq!(id2, SubagentId(2));
@@ -372,7 +385,10 @@ mod tests {
             task: "task 1".to_owned(),
             background: true,
         };
-        manager.spawn(config1).await;
+        manager
+            .spawn(config1)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
 
         let summaries = manager.summaries().await;
         assert_eq!(summaries.len(), 1);

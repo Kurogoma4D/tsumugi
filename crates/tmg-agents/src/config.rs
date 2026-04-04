@@ -4,6 +4,8 @@
 //! [`AgentKind`] (built-in or custom), and
 //! [`SubagentConfig`] (the parameters for spawning a subagent).
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::custom::CustomAgentDef;
@@ -117,7 +119,10 @@ pub enum AgentKind {
     Builtin(AgentType),
 
     /// A custom agent loaded from a TOML definition file.
-    Custom(CustomAgentDef),
+    ///
+    /// Wrapped in `Arc` to avoid cloning the entire definition each time
+    /// the agent kind is passed around.
+    Custom(Arc<CustomAgentDef>),
 }
 
 impl AgentKind {
@@ -125,7 +130,7 @@ impl AgentKind {
     pub fn name(&self) -> &str {
         match self {
             Self::Builtin(t) => t.name(),
-            Self::Custom(def) => &def.name,
+            Self::Custom(def) => def.name(),
         }
     }
 
@@ -133,7 +138,7 @@ impl AgentKind {
     pub fn description(&self) -> &str {
         match self {
             Self::Builtin(t) => t.description(),
-            Self::Custom(def) => &def.description,
+            Self::Custom(def) => def.description(),
         }
     }
 
@@ -141,7 +146,7 @@ impl AgentKind {
     pub fn system_prompt(&self) -> &str {
         match self {
             Self::Builtin(t) => t.system_prompt(),
-            Self::Custom(def) => &def.instructions,
+            Self::Custom(def) => def.instructions(),
         }
     }
 
@@ -149,7 +154,7 @@ impl AgentKind {
     pub fn allowed_tool_names(&self) -> Vec<&str> {
         match self {
             Self::Builtin(t) => t.allowed_tools().to_vec(),
-            Self::Custom(def) => def.allowed_tools.iter().map(String::as_str).collect(),
+            Self::Custom(def) => def.allowed_tools().iter().map(String::as_str).collect(),
         }
     }
 }

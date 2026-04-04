@@ -18,8 +18,8 @@ dirs = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs"] }
-tempfile = "3"
-proptest = "1"
+tempfile = { workspace = true }
+proptest = { workspace = true }
 
 [lints]
 workspace = true

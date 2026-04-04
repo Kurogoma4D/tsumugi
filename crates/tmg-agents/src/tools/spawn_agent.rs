@@ -36,7 +36,10 @@ pub struct SpawnAgentTool {
     manager: Arc<Mutex<SubagentManager>>,
 
     /// Custom agent definitions indexed by name.
-    custom_agents: Arc<HashMap<String, CustomAgentDef>>,
+    ///
+    /// Uses `Arc<CustomAgentDef>` to avoid cloning the entire definition
+    /// on every agent resolution.
+    custom_agents: Arc<HashMap<String, Arc<CustomAgentDef>>>,
 }
 
 impl SpawnAgentTool {
@@ -53,9 +56,9 @@ impl SpawnAgentTool {
         manager: Arc<Mutex<SubagentManager>>,
         custom_agents: Vec<CustomAgentDef>,
     ) -> Self {
-        let map: HashMap<String, CustomAgentDef> = custom_agents
+        let map: HashMap<String, Arc<CustomAgentDef>> = custom_agents
             .into_iter()
-            .map(|def| (def.name.clone(), def))
+            .map(|def| (def.name().to_owned(), Arc::new(def)))
             .collect();
         Self {
             manager,
@@ -66,6 +69,8 @@ impl SpawnAgentTool {
     /// Resolve an `agent_type` string to an `AgentKind`.
     ///
     /// First checks built-in types, then falls back to custom agents.
+    /// Uses `Arc::clone` for custom agents to avoid copying the entire
+    /// definition on each resolution.
     fn resolve_agent_kind(&self, name: &str) -> Option<AgentKind> {
         // Try built-in first.
         if let Some(builtin) = AgentType::from_name(name) {
@@ -75,7 +80,7 @@ impl SpawnAgentTool {
         // Try custom agents.
         self.custom_agents
             .get(name)
-            .map(|def| AgentKind::Custom(def.clone()))
+            .map(|def| AgentKind::Custom(Arc::clone(def)))
     }
 
     /// Return all available agent type names for error messages.
@@ -169,7 +174,12 @@ impl Tool for SpawnAgentTool {
                 // Background: acquire lock, spawn, release lock, return ID.
                 let id = {
                     let mut manager = self.manager.lock().await;
-                    manager.spawn(config).await
+                    manager
+                        .spawn(config)
+                        .await
+                        .map_err(|e| ToolError::InvalidParams {
+                            message: format!("failed to spawn subagent: {e}"),
+                        })?
                 };
                 Ok(ToolResult::success(format!(
                     "Subagent spawned in background with ID {id}. \
@@ -183,7 +193,11 @@ impl Tool for SpawnAgentTool {
                 // `refresh_subagent_summaries` while the subagent runs.
                 let (_id, rx) = {
                     let mut manager = self.manager.lock().await;
-                    manager.spawn_with_notify(config).await
+                    manager.spawn_with_notify(config).await.map_err(|e| {
+                        ToolError::InvalidParams {
+                            message: format!("failed to spawn subagent: {e}"),
+                        }
+                    })?
                 };
                 // Lock is now dropped -- the TUI can freely poll summaries.
 

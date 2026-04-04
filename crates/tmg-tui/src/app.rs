@@ -401,11 +401,13 @@ impl App {
         if !self.custom_agents.is_empty() {
             text.push_str("\nCustom subagents:\n");
             for agent in &self.custom_agents {
-                let tools_summary = agent.allowed_tools.join(", ");
+                let tools_summary = agent.allowed_tools().join(", ");
                 let _ = writeln!(
                     text,
                     "  - {}: {} [tools: {}]",
-                    agent.name, agent.description, tools_summary
+                    agent.name(),
+                    agent.description(),
+                    tools_summary
                 );
             }
         }

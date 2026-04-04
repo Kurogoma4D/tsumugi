@@ -99,9 +99,8 @@ fn build_scan_dirs(project_root: &Path, config: &SkillsConfig) -> Vec<(SkillSour
     }
 
     // 3. Additional discovery paths from config.
-    // These use GlobalConfig source since they are user-configured paths.
     for extra_path in &config.discovery_paths {
-        dirs.push((SkillSource::GlobalConfig, extra_path.clone()));
+        dirs.push((SkillSource::Custom, extra_path.clone()));
     }
 
     // 4. .claude/skills/ compatibility.

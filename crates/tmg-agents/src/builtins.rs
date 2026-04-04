@@ -54,6 +54,7 @@ fn register_tool_by_name(registry: &mut ToolRegistry, name: &str) {
 }
 
 #[cfg(test)]
+#[expect(clippy::panic, reason = "test assertions")]
 mod tests {
     use super::*;
 
@@ -99,16 +100,17 @@ mod tests {
 
     #[test]
     fn custom_agent_kind_registry() {
-        let def = crate::custom::CustomAgentDef {
-            name: "test-custom".to_owned(),
-            description: "Test".to_owned(),
-            model: None,
-            endpoint: None,
-            sandbox_mode: None,
-            instructions: "Do things.".to_owned(),
-            allowed_tools: vec!["file_read".to_owned(), "grep_search".to_owned()],
-        };
-        let kind = AgentKind::Custom(def);
+        let toml = r#"
+name = "test-custom"
+description = "Test"
+instructions = "Do things."
+
+[tools]
+allow = ["file_read", "grep_search"]
+"#;
+        let def = crate::custom::CustomAgentDef::from_toml(toml, "test.toml")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let kind = AgentKind::Custom(std::sync::Arc::new(def));
         let registry = registry_for_agent_kind(&kind);
 
         assert!(registry.get("file_read").is_some());
