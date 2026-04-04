@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 tmg-core = { workspace = true }
 tmg-llm = { workspace = true }
+tmg-agents = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true, features = ["signal", "sync"] }

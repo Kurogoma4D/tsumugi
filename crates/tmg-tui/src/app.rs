@@ -1,9 +1,13 @@
 //! Application state and business logic for the TUI.
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use tmg_agents::{AgentType, SubagentManager, SubagentSummary, truncate_str};
 use tmg_core::{AgentLoop, CoreError, StreamSink};
 use tmg_llm::Role;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -123,6 +127,12 @@ pub struct App {
 
     /// Handle for the currently running turn, if any.
     turn_handle: Option<TurnHandle>,
+
+    /// Shared reference to the subagent manager for status display.
+    subagent_manager: Option<Arc<Mutex<SubagentManager>>>,
+
+    /// Cached subagent summaries for display (updated periodically).
+    subagent_summaries: Vec<SubagentSummary>,
 }
 
 impl App {
@@ -143,7 +153,14 @@ impl App {
             cwd,
             error_message: None,
             turn_handle: None,
+            subagent_manager: None,
+            subagent_summaries: Vec::new(),
         }
+    }
+
+    /// Set the subagent manager for status display.
+    pub fn set_subagent_manager(&mut self, manager: Arc<Mutex<SubagentManager>>) {
+        self.subagent_manager = Some(manager);
     }
 
     /// Whether the application should exit.
@@ -209,6 +226,30 @@ impl App {
     /// Clear the error message.
     pub fn clear_error(&mut self) {
         self.error_message = None;
+    }
+
+    /// Return the cached subagent summaries for display.
+    pub fn subagent_summaries(&self) -> &[SubagentSummary] {
+        &self.subagent_summaries
+    }
+
+    /// Return the count of running subagents from cached summaries.
+    pub fn running_subagent_count(&self) -> usize {
+        self.subagent_summaries
+            .iter()
+            .filter(|s| !s.status.is_terminal())
+            .count()
+    }
+
+    /// Refresh the cached subagent summaries from the manager.
+    ///
+    /// This is called periodically from the event loop to update
+    /// the TUI display.
+    pub async fn refresh_subagent_summaries(&mut self) {
+        if let Some(manager) = &self.subagent_manager {
+            let manager = manager.lock().await;
+            self.subagent_summaries = manager.summaries().await;
+        }
     }
 
     /// Insert a character at the cursor position.
@@ -326,11 +367,51 @@ impl App {
                     agent.clear_history(&self.project_root, &self.cwd)?;
                 }
             }
+            "agents" => {
+                self.show_agents_list();
+            }
             other => {
                 self.error_message = Some(format!("Unknown command: /{other}"));
             }
         }
         Ok(())
+    }
+
+    /// Display the list of available subagent types and running subagents.
+    fn show_agents_list(&mut self) {
+        let mut text = String::from("Available subagent types:\n");
+        for agent_type in AgentType::ALL {
+            let _ = writeln!(
+                text,
+                "  - {}: {}",
+                agent_type.name(),
+                agent_type.description()
+            );
+        }
+
+        if !self.subagent_summaries.is_empty() {
+            text.push_str("\nActive subagents:\n");
+            for summary in &self.subagent_summaries {
+                let task_preview = if summary.task.chars().count() > 60 {
+                    format!("{}...", truncate_str(&summary.task, 57))
+                } else {
+                    summary.task.clone()
+                };
+                let _ = writeln!(
+                    text,
+                    "  [{}] {} ({}): {}",
+                    summary.id,
+                    summary.agent_type,
+                    summary.status.label(),
+                    task_preview,
+                );
+            }
+        }
+
+        self.chat_entries.push(ChatEntry {
+            role: Role::System,
+            text,
+        });
     }
 
     /// Start a conversation turn in a background task.
