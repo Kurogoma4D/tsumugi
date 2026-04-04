@@ -54,6 +54,7 @@ dirs = "6"
 
 # Sandbox
 landlock = "0.4"
+libc = "0.2"
 
 # Workspace crates
 tmg-core = { path = "crates/tmg-core" }
