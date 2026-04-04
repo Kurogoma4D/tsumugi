@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use clap::Parser;
+use tmg_llm::ToolCallingMode;
 use tokio::sync::Mutex;
 
 mod config;
@@ -56,7 +57,7 @@ struct Cli {
         reason = "clap renders doc comments as --help text; backticks would show literally"
     )]
     #[arg(long)]
-    tool_calling: Option<String>,
+    tool_calling: Option<ToolCallingMode>,
 }
 
 impl Cli {
@@ -79,8 +80,8 @@ impl Cli {
         if let Some(max_tool) = self.max_tool_result_tokens {
             config.llm.max_tool_result_tokens = max_tool;
         }
-        if let Some(ref tc) = self.tool_calling {
-            config.llm.tool_calling.clone_from(tc);
+        if let Some(tc) = self.tool_calling {
+            config.llm.tool_calling = tc;
         }
     }
 }
@@ -93,9 +94,6 @@ fn main() -> anyhow::Result<()> {
         config::load_config(cli.config.as_deref()).context("loading tsumugi configuration")?;
     cli.apply_to(&mut config);
     config.validate().context("validating configuration")?;
-
-    let tool_calling_mode = resolve_tool_calling_mode(&config.llm.tool_calling)
-        .context("resolving tool_calling mode")?;
 
     let context_config = tmg_core::ContextConfig {
         max_context_tokens: config.llm.max_context_tokens,
@@ -110,23 +108,11 @@ fn main() -> anyhow::Result<()> {
             &config.llm.endpoint,
             &config.llm.model,
             context_config,
-            tool_calling_mode,
+            config.llm.tool_calling,
         )?;
     }
 
     Ok(())
-}
-
-/// Resolve a tool-calling mode string to the enum value.
-///
-/// Empty string maps to `Auto` (the default).
-fn resolve_tool_calling_mode(s: &str) -> anyhow::Result<tmg_core::ToolCallingMode> {
-    match s {
-        "" | "auto" => Ok(tmg_core::ToolCallingMode::Auto),
-        "native" => Ok(tmg_core::ToolCallingMode::Native),
-        "prompt_based" => Ok(tmg_core::ToolCallingMode::PromptBased),
-        other => anyhow::bail!("unknown tool_calling mode: {other:?}"),
-    }
 }
 
 /// Run a one-shot streaming prompt against the LLM server.

@@ -44,6 +44,21 @@ impl SandboxMode {
     }
 }
 
+impl std::str::FromStr for SandboxMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "read_only" => Ok(Self::ReadOnly),
+            "workspace_write" => Ok(Self::WorkspaceWrite),
+            "full" => Ok(Self::Full),
+            other => Err(format!(
+                "invalid sandbox mode: {other:?} (expected \"read_only\", \"workspace_write\", or \"full\")"
+            )),
+        }
+    }
+}
+
 impl std::fmt::Display for SandboxMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

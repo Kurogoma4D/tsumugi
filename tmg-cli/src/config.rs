@@ -13,39 +13,238 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tmg_llm::ToolCallingMode;
+use tmg_sandbox::SandboxMode;
 
 use crate::error::ConfigError;
 
 // ---------------------------------------------------------------------------
-// Section types
+// Partial types for deserialization / merging
+// ---------------------------------------------------------------------------
+
+/// Partial LLM config used for deserialization from TOML.
+///
+/// All fields are `Option` so we can distinguish "not set" from
+/// "explicitly set to the default value".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PartialLlmConfig {
+    pub endpoint: Option<String>,
+    pub model: Option<String>,
+    pub max_context_tokens: Option<usize>,
+    pub compression_threshold: Option<f64>,
+    pub max_tool_result_tokens: Option<usize>,
+    pub tool_calling: Option<ToolCallingMode>,
+}
+
+impl PartialLlmConfig {
+    /// Merge `other` into `self`. `Some` fields in `other` take precedence.
+    fn merge_from(&mut self, other: &Self) {
+        if other.endpoint.is_some() {
+            self.endpoint.clone_from(&other.endpoint);
+        }
+        if other.model.is_some() {
+            self.model.clone_from(&other.model);
+        }
+        if other.max_context_tokens.is_some() {
+            self.max_context_tokens = other.max_context_tokens;
+        }
+        if other.compression_threshold.is_some() {
+            self.compression_threshold = other.compression_threshold;
+        }
+        if other.max_tool_result_tokens.is_some() {
+            self.max_tool_result_tokens = other.max_tool_result_tokens;
+        }
+        if other.tool_calling.is_some() {
+            self.tool_calling = other.tool_calling;
+        }
+    }
+
+    /// Convert to final `LlmConfig`, filling in defaults for unset fields.
+    fn into_final(self) -> LlmConfig {
+        LlmConfig {
+            endpoint: self.endpoint.unwrap_or_else(default_endpoint),
+            model: self.model.unwrap_or_else(default_model),
+            max_context_tokens: self
+                .max_context_tokens
+                .unwrap_or(default_max_context_tokens()),
+            compression_threshold: self
+                .compression_threshold
+                .unwrap_or(default_compression_threshold()),
+            max_tool_result_tokens: self
+                .max_tool_result_tokens
+                .unwrap_or(default_max_tool_result_tokens()),
+            tool_calling: self.tool_calling.unwrap_or_default(),
+        }
+    }
+}
+
+/// Partial skills config used for deserialization from TOML.
+///
+/// Boolean fields use `Option<bool>` so that an explicit `false` in a
+/// project-local config can override a global `true`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PartialSkillsConfig {
+    #[serde(default)]
+    pub discovery_paths: Vec<PathBuf>,
+    pub compat_claude: Option<bool>,
+    pub compat_agent_skills: Option<bool>,
+}
+
+impl PartialSkillsConfig {
+    /// Merge `other` into `self`. `Some` fields and non-empty paths in
+    /// `other` take precedence.
+    fn merge_from(&mut self, other: &Self) {
+        if !other.discovery_paths.is_empty() {
+            self.discovery_paths.clone_from(&other.discovery_paths);
+        }
+        if other.compat_claude.is_some() {
+            self.compat_claude = other.compat_claude;
+        }
+        if other.compat_agent_skills.is_some() {
+            self.compat_agent_skills = other.compat_agent_skills;
+        }
+    }
+
+    /// Convert to final `SkillsConfig`, filling in defaults for unset fields.
+    fn into_final(self) -> tmg_skills::SkillsConfig {
+        tmg_skills::SkillsConfig {
+            discovery_paths: self.discovery_paths,
+            compat_claude: self.compat_claude.unwrap_or(true),
+            compat_agent_skills: self.compat_agent_skills.unwrap_or(true),
+        }
+    }
+}
+
+/// Partial top-level config used for deserialization and merging.
+///
+/// Deserialized from TOML, merged across sources, then converted to
+/// the final [`TsumugiConfig`] via [`into_final`](Self::into_final).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PartialTsumugiConfig {
+    #[serde(default)]
+    pub llm: PartialLlmConfig,
+    #[serde(default)]
+    pub sandbox: SandboxConfigSection,
+    #[serde(default)]
+    pub tui: TuiConfig,
+    #[serde(default)]
+    pub skills: PartialSkillsConfig,
+}
+
+impl PartialTsumugiConfig {
+    /// Merge `other` into `self`. Fields explicitly set in `other` take
+    /// precedence.
+    fn merge_from(&mut self, other: &Self) {
+        self.llm.merge_from(&other.llm);
+        self.sandbox.merge_from(&other.sandbox);
+        self.tui.merge_from(&other.tui);
+        self.skills.merge_from(&other.skills);
+    }
+
+    /// Apply environment variable overrides (`TMG_*` prefix).
+    ///
+    /// Returns an error if a numeric environment variable is present but
+    /// cannot be parsed.
+    fn apply_env_overrides(
+        &mut self,
+        env_fn: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), ConfigError> {
+        if let Some(v) = env_fn("TMG_LLM_ENDPOINT") {
+            self.llm.endpoint = Some(v);
+        }
+        if let Some(v) = env_fn("TMG_LLM_MODEL") {
+            self.llm.model = Some(v);
+        }
+        if let Some(v) = env_fn("TMG_LLM_MAX_CONTEXT_TOKENS") {
+            let n = v.parse::<usize>().map_err(|_| ConfigError::InvalidValue {
+                field: "TMG_LLM_MAX_CONTEXT_TOKENS".to_owned(),
+                value: v,
+                reason: "must be a non-negative integer".to_owned(),
+            })?;
+            self.llm.max_context_tokens = Some(n);
+        }
+        if let Some(v) = env_fn("TMG_LLM_COMPRESSION_THRESHOLD") {
+            let n = v.parse::<f64>().map_err(|_| ConfigError::InvalidValue {
+                field: "TMG_LLM_COMPRESSION_THRESHOLD".to_owned(),
+                value: v,
+                reason: "must be a floating-point number".to_owned(),
+            })?;
+            self.llm.compression_threshold = Some(n);
+        }
+        if let Some(v) = env_fn("TMG_LLM_MAX_TOOL_RESULT_TOKENS") {
+            let n = v.parse::<usize>().map_err(|_| ConfigError::InvalidValue {
+                field: "TMG_LLM_MAX_TOOL_RESULT_TOKENS".to_owned(),
+                value: v,
+                reason: "must be a non-negative integer".to_owned(),
+            })?;
+            self.llm.max_tool_result_tokens = Some(n);
+        }
+        if let Some(v) = env_fn("TMG_LLM_TOOL_CALLING") {
+            let mode = v
+                .parse::<ToolCallingMode>()
+                .map_err(|_| ConfigError::InvalidValue {
+                    field: "TMG_LLM_TOOL_CALLING".to_owned(),
+                    value: v,
+                    reason: "must be one of: native, prompt_based, auto".to_owned(),
+                })?;
+            self.llm.tool_calling = Some(mode);
+        }
+        if let Some(v) = env_fn("TMG_SANDBOX_MODE") {
+            let mode = v
+                .parse::<SandboxMode>()
+                .map_err(|_| ConfigError::InvalidValue {
+                    field: "TMG_SANDBOX_MODE".to_owned(),
+                    value: v,
+                    reason: "must be one of: read_only, workspace_write, full".to_owned(),
+                })?;
+            self.sandbox.mode = Some(mode);
+        }
+        if let Some(v) = env_fn("TMG_SANDBOX_TIMEOUT_SECS") {
+            let n = v.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
+                field: "TMG_SANDBOX_TIMEOUT_SECS".to_owned(),
+                value: v,
+                reason: "must be a non-negative integer".to_owned(),
+            })?;
+            self.sandbox.timeout_secs = Some(n);
+        }
+        Ok(())
+    }
+
+    /// Convert to final [`TsumugiConfig`], filling defaults for unset fields.
+    fn into_final(self) -> TsumugiConfig {
+        TsumugiConfig {
+            llm: self.llm.into_final(),
+            sandbox: self.sandbox,
+            tui: self.tui,
+            skills: self.skills.into_final(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Section types (final, validated)
 // ---------------------------------------------------------------------------
 
 /// LLM connection settings from `[llm]` section.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmConfig {
     /// llama-server endpoint URL.
-    #[serde(default = "default_endpoint")]
     pub endpoint: String,
 
     /// Model name to use in requests.
-    #[serde(default = "default_model")]
     pub model: String,
 
     /// Maximum context window tokens.
-    #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: usize,
 
     /// Fraction of max context at which compression auto-triggers (0.0..=1.0).
-    #[serde(default = "default_compression_threshold")]
     pub compression_threshold: f64,
 
     /// Maximum tokens allowed in a single tool result before truncation.
-    #[serde(default = "default_max_tool_result_tokens")]
     pub max_tool_result_tokens: usize,
 
-    /// Tool calling mode: `native`, `prompt_based`, or `auto`.
-    #[serde(default)]
-    pub tool_calling: String,
+    /// Tool calling mode.
+    pub tool_calling: ToolCallingMode,
 }
 
 fn default_endpoint() -> String {
@@ -76,7 +275,7 @@ impl Default for LlmConfig {
             max_context_tokens: default_max_context_tokens(),
             compression_threshold: default_compression_threshold(),
             max_tool_result_tokens: default_max_tool_result_tokens(),
-            tool_calling: String::new(),
+            tool_calling: ToolCallingMode::default(),
         }
     }
 }
@@ -88,9 +287,9 @@ impl Default for LlmConfig {
 /// and merged independently.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct SandboxConfigSection {
-    /// Sandbox operating mode: `read_only`, `workspace_write`, or `full`.
+    /// Sandbox operating mode.
     #[serde(default)]
-    pub mode: Option<String>,
+    pub mode: Option<SandboxMode>,
 
     /// Domains allowed for outbound network access.
     #[serde(default)]
@@ -114,7 +313,7 @@ pub struct TuiConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Top-level config
+// Top-level config (final, validated)
 // ---------------------------------------------------------------------------
 
 /// Root configuration, corresponding to the entire `tsumugi.toml` file.
@@ -138,41 +337,14 @@ pub struct TsumugiConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Merging
+// Merging (SandboxConfigSection, TuiConfig -- still needed for partial merges)
 // ---------------------------------------------------------------------------
-
-impl LlmConfig {
-    /// Merge `other` into `self`. Non-default fields in `other` take
-    /// precedence.
-    fn merge_from(&mut self, other: &Self) {
-        let defaults = Self::default();
-
-        if other.endpoint != defaults.endpoint {
-            self.endpoint.clone_from(&other.endpoint);
-        }
-        if other.model != defaults.model {
-            self.model.clone_from(&other.model);
-        }
-        if other.max_context_tokens != defaults.max_context_tokens {
-            self.max_context_tokens = other.max_context_tokens;
-        }
-        if (other.compression_threshold - defaults.compression_threshold).abs() > f64::EPSILON {
-            self.compression_threshold = other.compression_threshold;
-        }
-        if other.max_tool_result_tokens != defaults.max_tool_result_tokens {
-            self.max_tool_result_tokens = other.max_tool_result_tokens;
-        }
-        if !other.tool_calling.is_empty() {
-            self.tool_calling.clone_from(&other.tool_calling);
-        }
-    }
-}
 
 impl SandboxConfigSection {
     /// Merge `other` into `self`. `Some` fields in `other` take precedence.
     fn merge_from(&mut self, other: &Self) {
         if other.mode.is_some() {
-            self.mode.clone_from(&other.mode);
+            self.mode = other.mode;
         }
         if other.allowed_domains.is_some() {
             self.allowed_domains.clone_from(&other.allowed_domains);
@@ -195,68 +367,11 @@ impl TuiConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
 impl TsumugiConfig {
-    /// Merge `other` into `self`. Fields explicitly set in `other` take
-    /// precedence.
-    pub fn merge_from(&mut self, other: &Self) {
-        self.llm.merge_from(&other.llm);
-        self.sandbox.merge_from(&other.sandbox);
-        self.tui.merge_from(&other.tui);
-        // For skills, non-empty discovery_paths in other replaces self.
-        if !other.skills.discovery_paths.is_empty() {
-            self.skills
-                .discovery_paths
-                .clone_from(&other.skills.discovery_paths);
-        }
-        // Explicit false overrides default true.
-        if !other.skills.compat_claude {
-            self.skills.compat_claude = false;
-        }
-        if !other.skills.compat_agent_skills {
-            self.skills.compat_agent_skills = false;
-        }
-    }
-
-    /// Apply environment variable overrides (`TMG_*` prefix).
-    ///
-    /// This accepts an environment lookup function so that tests can
-    /// inject values without modifying the process environment (which is
-    /// `unsafe` in Edition 2024).
-    pub fn apply_env_overrides(&mut self, env_fn: &dyn Fn(&str) -> Option<String>) {
-        if let Some(v) = env_fn("TMG_LLM_ENDPOINT") {
-            self.llm.endpoint = v;
-        }
-        if let Some(v) = env_fn("TMG_LLM_MODEL") {
-            self.llm.model = v;
-        }
-        if let Some(v) = env_fn("TMG_LLM_MAX_CONTEXT_TOKENS") {
-            if let Ok(n) = v.parse::<usize>() {
-                self.llm.max_context_tokens = n;
-            }
-        }
-        if let Some(v) = env_fn("TMG_LLM_COMPRESSION_THRESHOLD") {
-            if let Ok(n) = v.parse::<f64>() {
-                self.llm.compression_threshold = n;
-            }
-        }
-        if let Some(v) = env_fn("TMG_LLM_MAX_TOOL_RESULT_TOKENS") {
-            if let Ok(n) = v.parse::<usize>() {
-                self.llm.max_tool_result_tokens = n;
-            }
-        }
-        if let Some(v) = env_fn("TMG_LLM_TOOL_CALLING") {
-            self.llm.tool_calling = v;
-        }
-        if let Some(v) = env_fn("TMG_SANDBOX_MODE") {
-            self.sandbox.mode = Some(v);
-        }
-        if let Some(v) = env_fn("TMG_SANDBOX_TIMEOUT_SECS") {
-            if let Ok(n) = v.parse::<u64>() {
-                self.sandbox.timeout_secs = Some(n);
-            }
-        }
-    }
-
     /// Validate the configuration, returning a structured error on failure.
     pub fn validate(&self) -> Result<(), ConfigError> {
         // Validate endpoint is a valid URL.
@@ -287,29 +402,9 @@ impl TsumugiConfig {
             });
         }
 
-        // Validate tool_calling mode if specified.
-        if !self.llm.tool_calling.is_empty() {
-            let valid = ["native", "prompt_based", "auto"];
-            if !valid.contains(&self.llm.tool_calling.as_str()) {
-                return Err(ConfigError::InvalidValue {
-                    field: "llm.tool_calling".to_owned(),
-                    value: self.llm.tool_calling.clone(),
-                    reason: "must be one of: native, prompt_based, auto".to_owned(),
-                });
-            }
-        }
-
-        // Validate sandbox mode if specified.
-        if let Some(ref mode) = self.sandbox.mode {
-            let valid = ["read_only", "workspace_write", "full"];
-            if !valid.contains(&mode.as_str()) {
-                return Err(ConfigError::InvalidValue {
-                    field: "sandbox.mode".to_owned(),
-                    value: mode.clone(),
-                    reason: "must be one of: read_only, workspace_write, full".to_owned(),
-                });
-            }
-        }
+        // No need to validate tool_calling or sandbox.mode -- they are
+        // already strongly typed enums that reject invalid values at
+        // deserialization time.
 
         Ok(())
     }
@@ -323,7 +418,7 @@ impl TsumugiConfig {
 ///
 /// Returns `Ok(None)` if the file does not exist, `Err` if it exists
 /// but cannot be read or parsed.
-fn load_toml_file(path: &Path) -> Result<Option<TsumugiConfig>, ConfigError> {
+fn load_toml_file(path: &Path) -> Result<Option<PartialTsumugiConfig>, ConfigError> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -335,21 +430,30 @@ fn load_toml_file(path: &Path) -> Result<Option<TsumugiConfig>, ConfigError> {
         }
     };
 
-    let config: TsumugiConfig = toml::from_str(&content).map_err(|e| ConfigError::Parse {
-        path: path.to_owned(),
-        source: e,
-    })?;
+    let config: PartialTsumugiConfig =
+        toml::from_str(&content).map_err(|e| ConfigError::Parse {
+            path: path.to_owned(),
+            source: e,
+        })?;
 
     Ok(Some(config))
 }
 
 /// Resolve the global config path (`~/.config/tsumugi/tsumugi.toml`).
+///
+/// Returns `None` if the platform config directory cannot be determined
+/// (e.g. `$HOME` is not set). This is intentional: the caller falls
+/// through to the next source in the priority chain.
 fn global_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("tsumugi").join("tsumugi.toml"))
 }
 
 /// Resolve the project-local config path (`.tsumugi/tsumugi.toml`
 /// relative to the current directory).
+///
+/// Returns `None` if the current working directory cannot be determined
+/// (e.g. it has been deleted). This is intentional: the caller falls
+/// through to the next source in the priority chain.
 fn project_config_path() -> Option<PathBuf> {
     std::env::current_dir()
         .ok()
@@ -373,7 +477,7 @@ pub fn load_config_with_env(
     config_path: Option<&Path>,
     env_fn: &dyn Fn(&str) -> Option<String>,
 ) -> Result<TsumugiConfig, ConfigError> {
-    let mut config = TsumugiConfig::default();
+    let mut config = PartialTsumugiConfig::default();
 
     if let Some(path) = config_path {
         // Explicit --config path: only load that file.
@@ -400,9 +504,9 @@ pub fn load_config_with_env(
     }
 
     // Apply environment variable overrides.
-    config.apply_env_overrides(env_fn);
+    config.apply_env_overrides(env_fn)?;
 
-    Ok(config)
+    Ok(config.into_final())
 }
 
 // ---------------------------------------------------------------------------
@@ -422,23 +526,77 @@ mod tests {
 
     #[test]
     fn merge_project_overrides_global() {
-        let mut global = TsumugiConfig::default();
-        global.llm.endpoint = "http://global:8080".to_owned();
-        global.llm.model = "global-model".to_owned();
+        let mut global = PartialTsumugiConfig::default();
+        global.llm.endpoint = Some("http://global:8080".to_owned());
+        global.llm.model = Some("global-model".to_owned());
 
-        let mut project = TsumugiConfig::default();
-        project.llm.endpoint = "http://project:9090".to_owned();
-        // model stays default, should not override global
+        let mut project = PartialTsumugiConfig::default();
+        project.llm.endpoint = Some("http://project:9090".to_owned());
+        // model stays None, should not override global
 
         global.merge_from(&project);
+        let final_config = global.into_final();
 
-        assert_eq!(global.llm.endpoint, "http://project:9090");
-        assert_eq!(global.llm.model, "global-model");
+        assert_eq!(final_config.llm.endpoint, "http://project:9090");
+        assert_eq!(final_config.llm.model, "global-model");
+    }
+
+    #[test]
+    fn merge_explicitly_set_default_value_still_overrides() {
+        // Fix #2: explicitly setting a value equal to the default must still
+        // override the other layer's non-default value.
+        let mut global = PartialTsumugiConfig::default();
+        global.llm.max_context_tokens = Some(16384);
+
+        let mut project = PartialTsumugiConfig::default();
+        // Explicitly set back to the default value of 8192.
+        project.llm.max_context_tokens = Some(default_max_context_tokens());
+
+        global.merge_from(&project);
+        let final_config = global.into_final();
+
+        assert_eq!(
+            final_config.llm.max_context_tokens,
+            default_max_context_tokens()
+        );
+    }
+
+    #[test]
+    fn skills_compat_override_false_over_true() {
+        // Fix #1: project-local `compat_claude = false` must override global `true`.
+        let mut global = PartialTsumugiConfig::default();
+        global.skills.compat_claude = Some(true);
+        global.skills.compat_agent_skills = Some(true);
+
+        let mut project = PartialTsumugiConfig::default();
+        project.skills.compat_claude = Some(false);
+        // compat_agent_skills not set in project, should remain true.
+
+        global.merge_from(&project);
+        let final_config = global.into_final();
+
+        assert!(!final_config.skills.compat_claude);
+        assert!(final_config.skills.compat_agent_skills);
+    }
+
+    #[test]
+    fn skills_compat_override_true_over_false() {
+        // Fix #1: project-local `compat_claude = true` must override global `false`.
+        let mut global = PartialTsumugiConfig::default();
+        global.skills.compat_claude = Some(false);
+
+        let mut project = PartialTsumugiConfig::default();
+        project.skills.compat_claude = Some(true);
+
+        global.merge_from(&project);
+        let final_config = global.into_final();
+
+        assert!(final_config.skills.compat_claude);
     }
 
     #[test]
     fn env_overrides_apply() {
-        let mut config = TsumugiConfig::default();
+        let mut config = PartialTsumugiConfig::default();
         let env_fn = |key: &str| -> Option<String> {
             match key {
                 "TMG_LLM_ENDPOINT" => Some("http://env:1234".to_owned()),
@@ -449,12 +607,82 @@ mod tests {
             }
         };
 
-        config.apply_env_overrides(&env_fn);
+        config
+            .apply_env_overrides(&env_fn)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let final_config = config.into_final();
 
-        assert_eq!(config.llm.endpoint, "http://env:1234");
-        assert_eq!(config.llm.model, "env-model");
-        assert_eq!(config.llm.max_context_tokens, 16384);
-        assert_eq!(config.sandbox.mode.as_deref(), Some("read_only"));
+        assert_eq!(final_config.llm.endpoint, "http://env:1234");
+        assert_eq!(final_config.llm.model, "env-model");
+        assert_eq!(final_config.llm.max_context_tokens, 16384);
+        assert_eq!(final_config.sandbox.mode, Some(SandboxMode::ReadOnly));
+    }
+
+    #[test]
+    fn env_override_bad_numeric_returns_error() {
+        // Fix #3: unparseable numeric env vars must produce errors.
+        let mut config = PartialTsumugiConfig::default();
+        let env_fn = |key: &str| -> Option<String> {
+            if key == "TMG_LLM_MAX_CONTEXT_TOKENS" {
+                Some("not_a_number".to_owned())
+            } else {
+                None
+            }
+        };
+
+        let result = config.apply_env_overrides(&env_fn);
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidValue { ref field, .. })
+                    if field == "TMG_LLM_MAX_CONTEXT_TOKENS"
+            ),
+            "expected InvalidValue error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn env_override_bad_tool_calling_returns_error() {
+        let mut config = PartialTsumugiConfig::default();
+        let env_fn = |key: &str| -> Option<String> {
+            if key == "TMG_LLM_TOOL_CALLING" {
+                Some("invalid_mode".to_owned())
+            } else {
+                None
+            }
+        };
+
+        let result = config.apply_env_overrides(&env_fn);
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidValue { ref field, .. })
+                    if field == "TMG_LLM_TOOL_CALLING"
+            ),
+            "expected InvalidValue error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn env_override_bad_sandbox_mode_returns_error() {
+        let mut config = PartialTsumugiConfig::default();
+        let env_fn = |key: &str| -> Option<String> {
+            if key == "TMG_SANDBOX_MODE" {
+                Some("invalid_mode".to_owned())
+            } else {
+                None
+            }
+        };
+
+        let result = config.apply_env_overrides(&env_fn);
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidValue { ref field, .. })
+                    if field == "TMG_SANDBOX_MODE"
+            ),
+            "expected InvalidValue error, got {result:?}"
+        );
     }
 
     #[test]
@@ -500,34 +728,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_tool_calling_rejected() {
-        let mut config = TsumugiConfig::default();
-        config.llm.tool_calling = "invalid".to_owned();
-
-        let Err(err) = config.validate() else {
-            panic!("expected validation to fail for invalid tool_calling");
-        };
-        assert!(
-            matches!(err, ConfigError::InvalidValue { ref field, .. } if field == "llm.tool_calling"),
-            "expected InvalidValue for llm.tool_calling, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn invalid_sandbox_mode_rejected() {
-        let mut config = TsumugiConfig::default();
-        config.sandbox.mode = Some("bad".to_owned());
-
-        let Err(err) = config.validate() else {
-            panic!("expected validation to fail for invalid sandbox mode");
-        };
-        assert!(
-            matches!(err, ConfigError::InvalidValue { ref field, .. } if field == "sandbox.mode"),
-            "expected InvalidValue for sandbox.mode, got {err:?}"
-        );
-    }
-
-    #[test]
     fn load_nonexistent_explicit_path_is_error() {
         let result = load_config_with_env(Some(Path::new("/nonexistent/tsumugi.toml")), &|_| None);
         assert!(matches!(result, Err(ConfigError::NotFound { .. })));
@@ -540,6 +740,7 @@ mod tests {
 endpoint = "http://custom:1234"
 model = "my-model"
 max_context_tokens = 4096
+tool_calling = "native"
 
 [sandbox]
 mode = "read_only"
@@ -552,12 +753,15 @@ show_token_usage = true
 discovery_paths = ["/extra"]
 compat_claude = false
 "#;
-        let config: TsumugiConfig = toml::from_str(toml_str).unwrap_or_else(|e| panic!("{e}"));
+        let partial: PartialTsumugiConfig =
+            toml::from_str(toml_str).unwrap_or_else(|e| panic!("{e}"));
+        let config = partial.into_final();
 
         assert_eq!(config.llm.endpoint, "http://custom:1234");
         assert_eq!(config.llm.model, "my-model");
         assert_eq!(config.llm.max_context_tokens, 4096);
-        assert_eq!(config.sandbox.mode.as_deref(), Some("read_only"));
+        assert_eq!(config.llm.tool_calling, ToolCallingMode::Native);
+        assert_eq!(config.sandbox.mode, Some(SandboxMode::ReadOnly));
         assert_eq!(config.sandbox.timeout_secs, Some(60));
         assert_eq!(config.tui.show_token_usage, Some(true));
         assert!(!config.skills.compat_claude);
@@ -604,54 +808,64 @@ compat_claude = false
 
     #[test]
     fn sandbox_section_merge() {
-        let mut base = TsumugiConfig::default();
+        let mut base = PartialTsumugiConfig::default();
         base.sandbox.timeout_secs = Some(30);
-        base.sandbox.mode = Some("workspace_write".to_owned());
+        base.sandbox.mode = Some(SandboxMode::WorkspaceWrite);
 
-        let mut overlay = TsumugiConfig::default();
-        overlay.sandbox.mode = Some("read_only".to_owned());
+        let mut overlay = PartialTsumugiConfig::default();
+        overlay.sandbox.mode = Some(SandboxMode::ReadOnly);
         // timeout_secs is None, should not override
 
         base.merge_from(&overlay);
+        let final_config = base.into_final();
 
-        assert_eq!(base.sandbox.mode.as_deref(), Some("read_only"));
-        assert_eq!(base.sandbox.timeout_secs, Some(30));
+        assert_eq!(final_config.sandbox.mode, Some(SandboxMode::ReadOnly));
+        assert_eq!(final_config.sandbox.timeout_secs, Some(30));
     }
 
     #[test]
     fn tui_section_merge() {
-        let mut base = TsumugiConfig::default();
+        let mut base = PartialTsumugiConfig::default();
         base.tui.show_token_usage = Some(false);
 
-        let mut overlay = TsumugiConfig::default();
+        let mut overlay = PartialTsumugiConfig::default();
         overlay.tui.show_token_usage = Some(true);
 
         base.merge_from(&overlay);
-        assert_eq!(base.tui.show_token_usage, Some(true));
+        let final_config = base.into_final();
+        assert_eq!(final_config.tui.show_token_usage, Some(true));
     }
 
     #[test]
     fn valid_tool_calling_modes_accepted() {
-        for mode in ["native", "prompt_based", "auto"] {
+        for mode in [
+            ToolCallingMode::Native,
+            ToolCallingMode::PromptBased,
+            ToolCallingMode::Auto,
+        ] {
             let mut config = TsumugiConfig::default();
-            config.llm.tool_calling = mode.to_owned();
+            config.llm.tool_calling = mode;
             assert!(config.validate().is_ok(), "mode {mode} should be valid");
         }
     }
 
     #[test]
     fn valid_sandbox_modes_accepted() {
-        for mode in ["read_only", "workspace_write", "full"] {
+        for mode in [
+            SandboxMode::ReadOnly,
+            SandboxMode::WorkspaceWrite,
+            SandboxMode::Full,
+        ] {
             let mut config = TsumugiConfig::default();
-            config.sandbox.mode = Some(mode.to_owned());
+            config.sandbox.mode = Some(mode);
             assert!(config.validate().is_ok(), "mode {mode} should be valid");
         }
     }
 
     #[test]
-    fn empty_tool_calling_is_valid() {
+    fn default_tool_calling_is_auto() {
         let config = TsumugiConfig::default();
-        // Default empty tool_calling should pass validation (means "auto").
+        assert_eq!(config.llm.tool_calling, ToolCallingMode::Auto);
         assert!(config.validate().is_ok());
     }
 }

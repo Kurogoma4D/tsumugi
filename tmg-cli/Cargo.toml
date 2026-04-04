@@ -18,6 +18,7 @@ toml = { workspace = true }
 tmg-agents = { workspace = true }
 tmg-core = { workspace = true }
 tmg-llm = { workspace = true }
+tmg-sandbox = { workspace = true }
 tmg-skills = { workspace = true }
 tmg-tools = { workspace = true }
 tmg-tui = { workspace = true }

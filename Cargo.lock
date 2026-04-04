@@ -1670,6 +1670,7 @@ dependencies = [
  "tmg-agents",
  "tmg-core",
  "tmg-llm",
+ "tmg-sandbox",
  "tmg-skills",
  "tmg-tools",
  "tmg-tui",
