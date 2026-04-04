@@ -8,7 +8,11 @@ license.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
 tmg-core = { workspace = true }
+tmg-llm = { workspace = true }
 tmg-tui = { workspace = true }
 
 [lints]
