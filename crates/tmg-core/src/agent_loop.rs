@@ -9,7 +9,10 @@ use tokio::task::JoinSet;
 use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 
-use tmg_llm::{LlmClient, StreamEvent, ToolCall, ToolDefinition};
+use tmg_llm::{
+    LlmClient, StreamEvent, ToolCall, ToolCallingMode, ToolDefinition, build_tool_calling_prompt,
+    parse_tool_calls,
+};
 use tmg_tools::ToolRegistry;
 
 use crate::context::{ContextCompressor, ContextConfig, TokenCounter, truncate_tool_result};
@@ -95,7 +98,9 @@ pub struct AgentLoop {
     registry: Arc<ToolRegistry>,
 
     /// Pre-computed tool definitions for the `tools` field in requests.
-    tool_defs: Vec<ToolDefinition>,
+    /// Wrapped in `Arc` to avoid deep-cloning every round when passed to
+    /// the streaming request in `Native` / `Auto` modes.
+    tool_defs: Arc<Vec<ToolDefinition>>,
 
     /// Conversation history (system prompt + user/assistant/tool messages).
     history: Vec<Message>,
@@ -111,6 +116,9 @@ pub struct AgentLoop {
 
     /// Context compressor for automatic and manual compression.
     compressor: ContextCompressor,
+
+    /// Tool calling strategy (native, `prompt_based`, or auto).
+    tool_calling_mode: ToolCallingMode,
 }
 
 impl AgentLoop {
@@ -137,6 +145,7 @@ impl AgentLoop {
             project_root,
             cwd,
             ContextConfig::default(),
+            ToolCallingMode::Auto,
         )
     }
 
@@ -152,14 +161,18 @@ impl AgentLoop {
         project_root: &Path,
         cwd: &Path,
         context_config: ContextConfig,
+        tool_calling_mode: ToolCallingMode,
     ) -> Result<Self, CoreError> {
-        let mut history = vec![Message::system(DEFAULT_SYSTEM_PROMPT)];
+        let tool_defs = Arc::new(registry.tool_definitions());
+
+        let system_prompt = Self::build_system_prompt(tool_calling_mode, &tool_defs);
+
+        let mut history = vec![Message::system(system_prompt)];
 
         // Load prompt files and inject as initial messages.
         let prompt_messages = prompt::load_prompt_files(project_root, cwd)?;
         history.extend(prompt_messages);
 
-        let tool_defs = registry.tool_definitions();
         let registry = Arc::new(registry);
         let token_counter = TokenCounter::new(client.clone());
         let compressor = ContextCompressor::new(client.clone());
@@ -173,7 +186,25 @@ impl AgentLoop {
             context_config,
             token_counter,
             compressor,
+            tool_calling_mode,
         })
+    }
+
+    /// Build the system prompt string based on the tool calling mode.
+    ///
+    /// In `PromptBased` or `Auto` mode, appends the tool calling convention
+    /// so the model knows how to emit `<tool_call>` tags.
+    fn build_system_prompt(
+        tool_calling_mode: ToolCallingMode,
+        tool_defs: &[ToolDefinition],
+    ) -> String {
+        match tool_calling_mode {
+            ToolCallingMode::Native => DEFAULT_SYSTEM_PROMPT.to_owned(),
+            ToolCallingMode::PromptBased | ToolCallingMode::Auto => {
+                let suffix = build_tool_calling_prompt(tool_defs);
+                format!("{DEFAULT_SYSTEM_PROMPT}{suffix}")
+            }
+        }
     }
 
     /// Replace the cancellation token used for future turns.
@@ -199,7 +230,8 @@ impl AgentLoop {
     ///
     /// Returns [`CoreError::Io`] if a prompt file exists but cannot be read.
     pub fn clear_history(&mut self, project_root: &Path, cwd: &Path) -> Result<(), CoreError> {
-        let mut history = vec![Message::system(DEFAULT_SYSTEM_PROMPT)];
+        let system_prompt = Self::build_system_prompt(self.tool_calling_mode, &self.tool_defs);
+        let mut history = vec![Message::system(system_prompt)];
         let prompt_messages = prompt::load_prompt_files(project_root, cwd)?;
         history.extend(prompt_messages);
         self.history = history;
@@ -209,6 +241,11 @@ impl AgentLoop {
     /// Return the context configuration.
     pub fn context_config(&self) -> &ContextConfig {
         &self.context_config
+    }
+
+    /// Return the active tool calling mode.
+    pub fn tool_calling_mode(&self) -> ToolCallingMode {
+        self.tool_calling_mode
     }
 
     /// Return the current cached token count.
@@ -331,19 +368,33 @@ impl AgentLoop {
 
     /// Stream one round of LLM output, returning the accumulated text
     /// and any completed tool calls.
+    ///
+    /// Tool call extraction depends on [`ToolCallingMode`]:
+    /// - **Native**: tool calls come via the streaming API's `tool_call` deltas.
+    /// - **Prompt-based**: tool calls are extracted by parsing `<tool_call>` tags
+    ///   from the text content. Native `tools` are not sent in the request.
+    /// - **Auto**: native tool calls are used if present; otherwise the text
+    ///   content is scanned for `<tool_call>` tags as a fallback.
     async fn stream_one_round(
         &self,
         sink: &mut impl StreamSink,
     ) -> Result<(String, Vec<ToolCall>), CoreError> {
         let chat_messages: Vec<_> = self.history.iter().map(Message::to_chat_message).collect();
 
+        // In prompt_based mode, do not send native tool definitions;
+        // the model learns tools from the system prompt instead.
+        let request_tools = match self.tool_calling_mode {
+            ToolCallingMode::PromptBased => vec![],
+            ToolCallingMode::Native | ToolCallingMode::Auto => self.tool_defs.to_vec(),
+        };
+
         let mut stream = self
             .client
-            .chat_streaming(chat_messages, self.tool_defs.clone(), self.cancel.clone())
+            .chat_streaming(chat_messages, request_tools, self.cancel.clone())
             .await?;
 
         let mut response_text = String::new();
-        let mut tool_calls = Vec::new();
+        let mut native_tool_calls = Vec::new();
 
         while let Some(event) = stream.next().await {
             match event {
@@ -352,7 +403,7 @@ impl AgentLoop {
                     sink.on_token(&token)?;
                 }
                 Ok(StreamEvent::ToolCallComplete(tc)) => {
-                    tool_calls.push(tc);
+                    native_tool_calls.push(tc);
                 }
                 Ok(StreamEvent::Done(_)) => {
                     break;
@@ -368,7 +419,47 @@ impl AgentLoop {
 
         sink.on_done()?;
 
-        Ok((response_text, tool_calls))
+        // Determine final tool calls based on mode.
+        let (final_text, tool_calls) = match self.tool_calling_mode {
+            ToolCallingMode::Native => (response_text, native_tool_calls),
+            ToolCallingMode::PromptBased => {
+                // NOTE: During streaming, raw `<tool_call>` tags are delivered
+                // to the sink before we can parse and strip them here. This is
+                // expected behavior — buffering the entire response to strip
+                // tags before streaming would defeat the purpose of incremental
+                // token delivery. The stored history uses the cleaned text.
+                let (cleaned, parsed, errors) = parse_tool_calls(&response_text);
+                for err in &errors {
+                    sink.on_warning(&format!("prompt-based tool call parse error: {err}"))?;
+                }
+                (cleaned, parsed)
+            }
+            ToolCallingMode::Auto => {
+                if native_tool_calls.is_empty() {
+                    // Fallback: try parsing <tool_call> tags from text.
+                    let (cleaned, parsed, errors) = parse_tool_calls(&response_text);
+                    for err in &errors {
+                        sink.on_warning(&format!(
+                            "auto-mode fallback tool call parse error: {err}"
+                        ))?;
+                    }
+                    if parsed.is_empty() {
+                        // No tool calls found via either method.
+                        (response_text, Vec::new())
+                    } else {
+                        (cleaned, parsed)
+                    }
+                } else {
+                    // Native tool calls were returned; use them.
+                    // Strip any residual <tool_call> tags that the model may
+                    // have emitted alongside native tool calls.
+                    let (cleaned, _, _) = parse_tool_calls(&response_text);
+                    (cleaned, native_tool_calls)
+                }
+            }
+        };
+
+        Ok((final_text, tool_calls))
     }
 
     /// Execute tool calls in parallel via `JoinSet`, notifying the sink,
