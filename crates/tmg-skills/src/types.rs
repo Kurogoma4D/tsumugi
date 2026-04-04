@@ -1,0 +1,204 @@
+//! Domain types for the skills system.
+//!
+//! Uses newtypes for domain concepts to avoid primitive obsession.
+
+use std::fmt;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// Newtypes
+// ---------------------------------------------------------------------------
+
+/// A unique skill name (e.g. `"code-review"`, `"test-runner"`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SkillName(pub String);
+
+impl SkillName {
+    /// Create a new `SkillName`.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    /// Return the name as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SkillName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// An absolute path to a SKILL.md file.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SkillPath(pub PathBuf);
+
+impl SkillPath {
+    /// Create a new `SkillPath`.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self(path.into())
+    }
+
+    /// Return the inner path reference.
+    pub fn as_path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl fmt::Display for SkillPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.display())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Invocation policy
+// ---------------------------------------------------------------------------
+
+/// Controls when a skill can be invoked by the LLM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InvocationPolicy {
+    /// The LLM may invoke the skill automatically when it determines
+    /// the skill is relevant.
+    #[default]
+    Auto,
+
+    /// The skill can only be invoked explicitly via a `/skill-name`
+    /// slash command. It will not appear in auto-discovery metadata
+    /// sent to the LLM.
+    ExplicitOnly,
+}
+
+// ---------------------------------------------------------------------------
+// Skill source (priority ordering)
+// ---------------------------------------------------------------------------
+
+/// Where a skill was discovered from, in descending priority order.
+///
+/// Skills from higher-priority sources shadow skills with the same name
+/// from lower-priority sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SkillSource {
+    /// `.tsumugi/skills/` in the project root (highest priority).
+    ProjectTsumugi = 0,
+    /// `~/.config/tsumugi/skills/` in the global config directory.
+    GlobalConfig = 1,
+    /// `.claude/skills/` in the project root.
+    ProjectClaude = 2,
+    /// `.agents/skills/` in the project root.
+    ProjectAgents = 3,
+}
+
+impl SkillSource {
+    /// All sources in priority order (highest first).
+    pub const ALL: [Self; 4] = [
+        Self::ProjectTsumugi,
+        Self::GlobalConfig,
+        Self::ProjectClaude,
+        Self::ProjectAgents,
+    ];
+}
+
+impl fmt::Display for SkillSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProjectTsumugi => write!(f, ".tsumugi/skills"),
+            Self::GlobalConfig => write!(f, "~/.config/tsumugi/skills"),
+            Self::ProjectClaude => write!(f, ".claude/skills"),
+            Self::ProjectAgents => write!(f, ".agents/skills"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// YAML frontmatter
+// ---------------------------------------------------------------------------
+
+/// The parsed YAML frontmatter from a SKILL.md file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillFrontmatter {
+    /// The skill's human-readable name.
+    pub name: String,
+
+    /// A short description of what the skill does.
+    pub description: String,
+
+    /// How and when the skill can be invoked.
+    #[serde(default)]
+    pub invocation: InvocationPolicy,
+
+    /// Optional list of tool names this skill is allowed to use.
+    /// When `None`, all tools are available.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+// ---------------------------------------------------------------------------
+// Skill metadata (frontmatter + source info)
+// ---------------------------------------------------------------------------
+
+/// Metadata about a discovered skill (frontmatter + source info).
+///
+/// This is the lightweight representation used during discovery and
+/// for system prompt injection. The full skill body is not loaded
+/// until `load_skill()` is called.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillMeta {
+    /// The skill's unique name (derived from frontmatter or directory name).
+    pub name: SkillName,
+
+    /// The parsed frontmatter.
+    pub frontmatter: SkillFrontmatter,
+
+    /// Where this skill was discovered from.
+    pub source: SkillSource,
+
+    /// The absolute path to the SKILL.md file.
+    pub path: SkillPath,
+}
+
+// ---------------------------------------------------------------------------
+// Full skill content
+// ---------------------------------------------------------------------------
+
+/// The full content of a loaded skill, including the instruction body
+/// and any associated resource files.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillContent {
+    /// The skill metadata.
+    pub meta: SkillMeta,
+
+    /// The instruction body (everything after the frontmatter).
+    pub body: String,
+
+    /// Paths to files in the `scripts/` subdirectory (if any).
+    pub scripts: Vec<PathBuf>,
+
+    /// Paths to files in the `references/` subdirectory (if any).
+    pub references: Vec<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
+// Slash command
+// ---------------------------------------------------------------------------
+
+/// A parsed slash command from user input.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SlashCommand {
+    /// `/skills` — list all installed skills.
+    ListSkills,
+
+    /// `/<skill-name>` with optional arguments — invoke a skill explicitly.
+    InvokeSkill {
+        /// The skill name (without the leading `/`).
+        name: SkillName,
+        /// Optional arguments passed after the skill name.
+        args: Option<String>,
+    },
+}

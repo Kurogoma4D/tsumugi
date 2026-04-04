@@ -1,0 +1,230 @@
+//! SKILL.md frontmatter parsing.
+//!
+//! A SKILL.md file has the format:
+//!
+//! ```text
+//! ---
+//! name: my-skill
+//! description: A short description
+//! invocation: auto
+//! allowed_tools:
+//!   - file_read
+//!   - grep_search
+//! ---
+//!
+//! Instruction body goes here...
+//! ```
+//!
+//! The frontmatter is delimited by `---` lines at the start of the file.
+
+use crate::error::SkillError;
+use crate::types::SkillFrontmatter;
+
+/// The frontmatter delimiter.
+const FRONTMATTER_DELIMITER: &str = "---";
+
+/// Parse a SKILL.md file into its frontmatter and body.
+///
+/// Returns `(frontmatter, body)` where `body` is everything after the
+/// closing `---` delimiter.
+///
+/// # Errors
+///
+/// Returns [`SkillError::InvalidFrontmatter`] if the file does not contain
+/// valid frontmatter delimiters, or [`SkillError::YamlParse`] if the YAML
+/// content cannot be deserialized.
+pub fn parse_skill_md(
+    content: &str,
+    file_path: &str,
+) -> Result<(SkillFrontmatter, String), SkillError> {
+    let trimmed = content.trim_start();
+
+    // The file must start with `---`.
+    let Some(rest) = trimmed.strip_prefix(FRONTMATTER_DELIMITER) else {
+        return Err(SkillError::invalid_frontmatter(
+            file_path,
+            "file does not start with '---'",
+        ));
+    };
+
+    // Find the closing `---`.
+    let Some(end_idx) = find_closing_delimiter(rest) else {
+        return Err(SkillError::invalid_frontmatter(
+            file_path,
+            "closing '---' delimiter not found",
+        ));
+    };
+
+    let yaml_content = &rest[..end_idx];
+    let body_start = end_idx + FRONTMATTER_DELIMITER.len();
+    let body = rest[body_start..]
+        .trim_start_matches('\n')
+        .trim_start_matches('\r');
+
+    let frontmatter: SkillFrontmatter =
+        serde_yaml::from_str(yaml_content).map_err(|e| SkillError::YamlParse {
+            path: file_path.to_owned(),
+            source: e,
+        })?;
+
+    Ok((frontmatter, body.to_owned()))
+}
+
+/// Find the byte offset of the closing `---` delimiter within the text
+/// after the opening delimiter has been stripped.
+///
+/// The closing delimiter must appear at the start of a line.
+fn find_closing_delimiter(text: &str) -> Option<usize> {
+    for (idx, line) in text.lines().enumerate() {
+        // Skip the first "line" which is the remainder of the opening
+        // delimiter line (usually empty or just a newline).
+        if idx == 0 {
+            continue;
+        }
+        if line.trim() == FRONTMATTER_DELIMITER {
+            // Calculate byte offset: we need to find where this line
+            // starts in the original text.
+            let line_start = text
+                .match_indices(line)
+                .find(|(pos, _)| {
+                    // Make sure this is at a line boundary.
+                    *pos == 0 || text.as_bytes().get(pos - 1) == Some(&b'\n')
+                })
+                .map(|(pos, _)| pos);
+
+            // Only match `---` lines that are exactly the delimiter
+            // (not a longer line starting with `---`).
+            if let Some(start) = line_start {
+                if text[start..].starts_with(FRONTMATTER_DELIMITER) {
+                    return Some(start);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Serialize a `SkillFrontmatter` back to YAML string (for roundtrip testing).
+pub fn serialize_frontmatter(frontmatter: &SkillFrontmatter) -> Result<String, serde_yaml::Error> {
+    serde_yaml::to_string(frontmatter)
+}
+
+/// Format a full SKILL.md file from frontmatter and body.
+pub fn format_skill_md(
+    frontmatter: &SkillFrontmatter,
+    body: &str,
+) -> Result<String, serde_yaml::Error> {
+    let yaml = serialize_frontmatter(frontmatter)?;
+    Ok(format!("---\n{yaml}---\n\n{body}"))
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "test assertions")]
+#[expect(clippy::panic, reason = "test assertions")]
+mod tests {
+    use super::*;
+    use crate::types::InvocationPolicy;
+
+    #[test]
+    fn parse_basic_frontmatter() {
+        let content = "\
+---
+name: test-skill
+description: A test skill
+---
+
+This is the body.
+";
+        let (fm, body) = parse_skill_md(content, "test.md").unwrap_or_else(|e| panic!("{e}"));
+
+        assert_eq!(fm.name, "test-skill");
+        assert_eq!(fm.description, "A test skill");
+        assert_eq!(fm.invocation, InvocationPolicy::Auto);
+        assert!(fm.allowed_tools.is_none());
+        assert_eq!(body, "This is the body.\n");
+    }
+
+    #[test]
+    fn parse_full_frontmatter() {
+        let content = "\
+---
+name: code-review
+description: Reviews code for best practices
+invocation: explicit_only
+allowed_tools:
+  - file_read
+  - grep_search
+---
+
+Review the code carefully.
+";
+        let (fm, body) = parse_skill_md(content, "test.md").unwrap_or_else(|e| panic!("{e}"));
+
+        assert_eq!(fm.name, "code-review");
+        assert_eq!(fm.description, "Reviews code for best practices");
+        assert_eq!(fm.invocation, InvocationPolicy::ExplicitOnly);
+        assert_eq!(
+            fm.allowed_tools,
+            Some(vec!["file_read".to_owned(), "grep_search".to_owned()])
+        );
+        assert_eq!(body, "Review the code carefully.\n");
+    }
+
+    #[test]
+    fn parse_missing_opening_delimiter() {
+        let content = "name: test\n---\nbody";
+        let err = parse_skill_md(content, "bad.md").unwrap_err();
+        assert!(err.to_string().contains("does not start with '---'"));
+    }
+
+    #[test]
+    fn parse_missing_closing_delimiter() {
+        let content = "---\nname: test\n";
+        let err = parse_skill_md(content, "bad.md").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("closing '---' delimiter not found")
+        );
+    }
+
+    #[test]
+    fn parse_invalid_yaml() {
+        let content = "---\n[invalid yaml\n---\nbody";
+        let err = parse_skill_md(content, "bad.md").unwrap_err();
+        assert!(err.to_string().contains("yaml parse error"));
+    }
+
+    #[test]
+    fn roundtrip_frontmatter() {
+        let original = SkillFrontmatter {
+            name: "roundtrip-test".to_owned(),
+            description: "Tests roundtrip".to_owned(),
+            invocation: InvocationPolicy::ExplicitOnly,
+            allowed_tools: Some(vec!["file_read".to_owned()]),
+        };
+
+        let yaml = serialize_frontmatter(&original).unwrap_or_else(|e| panic!("{e}"));
+        let parsed: SkillFrontmatter =
+            serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("{e}"));
+
+        assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn format_and_reparse() {
+        let original = SkillFrontmatter {
+            name: "format-test".to_owned(),
+            description: "Tests formatting".to_owned(),
+            invocation: InvocationPolicy::Auto,
+            allowed_tools: None,
+        };
+        let body = "Do the thing.\n";
+
+        let md = format_skill_md(&original, body).unwrap_or_else(|e| panic!("{e}"));
+        let (parsed_fm, parsed_body) =
+            parse_skill_md(&md, "formatted.md").unwrap_or_else(|e| panic!("{e}"));
+
+        assert_eq!(original, parsed_fm);
+        assert_eq!(parsed_body, body);
+    }
+}
