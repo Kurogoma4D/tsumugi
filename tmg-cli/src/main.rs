@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use clap::Parser;
+use tokio::sync::Mutex;
 
 /// tsumugi - a local-LLM-powered coding agent
 #[derive(Parser, Debug)]
@@ -85,7 +88,8 @@ fn run_prompt(endpoint: &str, model: &str, prompt: &str) -> anyhow::Result<()> {
 ///
 /// Launches a ratatui terminal interface with a chat pane, header,
 /// and input area. The TUI handles multi-turn conversations with
-/// streaming LLM responses.
+/// streaming LLM responses. Includes subagent support via
+/// `spawn_agent` tool.
 fn run_tui(endpoint: &str, model: &str) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -106,11 +110,30 @@ fn run_tui(endpoint: &str, model: &str) -> anyhow::Result<()> {
         // Use cwd as project root for now (could be improved with git root detection).
         let project_root = cwd.clone();
 
-        let registry = tmg_tools::default_registry();
+        // Create the subagent manager.
+        let subagent_manager = Arc::new(Mutex::new(tmg_agents::SubagentManager::new(
+            client.clone(),
+            cancel.clone(),
+        )));
+
+        // Create the tool registry with spawn_agent tool.
+        let mut registry = tmg_tools::default_registry();
+        registry.register(tmg_agents::SpawnAgentTool::new(Arc::clone(
+            &subagent_manager,
+        )));
+
         let agent =
             tmg_core::AgentLoop::new(client, registry, cancel.clone(), &project_root, &cwd)?;
 
-        tmg_tui::run(agent, model, cancel, project_root, cwd).await?;
+        tmg_tui::run(
+            agent,
+            model,
+            cancel,
+            project_root,
+            cwd,
+            Some(subagent_manager),
+        )
+        .await?;
 
         Ok::<(), anyhow::Error>(())
     })

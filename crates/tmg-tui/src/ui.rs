@@ -34,11 +34,23 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-/// Draw the header bar: model name and context usage.
+/// Draw the header bar: model name, context usage, and subagent count.
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+    let running_count = app.running_subagent_count();
+
+    let constraints = if running_count > 0 {
+        vec![
+            Constraint::Percentage(35),
+            Constraint::Percentage(35),
+            Constraint::Percentage(30),
+        ]
+    } else {
+        vec![Constraint::Percentage(50), Constraint::Percentage(50)]
+    };
+
     let header_layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints(constraints)
         .split(area);
 
     let model_block = Block::default().borders(Borders::ALL).title(" Model ");
@@ -58,6 +70,18 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     )]))
     .block(context_block);
     frame.render_widget(context_text, header_layout[1]);
+
+    if running_count > 0 {
+        let agents_block = Block::default().borders(Borders::ALL).title(" Agents ");
+        let agents_text = Paragraph::new(Line::from(vec![Span::styled(
+            format!("{running_count} running"),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )]))
+        .block(agents_block);
+        frame.render_widget(agents_text, header_layout[2]);
+    }
 }
 
 /// Draw the main area: chat pane (left) and tool activity pane (right).
@@ -153,8 +177,28 @@ fn draw_chat_pane(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Draw the tool activity pane showing tool call logs.
+/// Draw the tool activity pane showing tool call logs and subagent status.
 fn draw_tool_pane(frame: &mut Frame, app: &App, area: Rect) {
+    let subagent_summaries = app.subagent_summaries();
+    let has_subagents = !subagent_summaries.is_empty();
+
+    if has_subagents {
+        // Split the tool pane vertically: tool activity on top, subagent
+        // status on bottom.
+        let vertical = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(area);
+
+        draw_tool_activity(frame, app, vertical[0]);
+        draw_subagent_pane(frame, subagent_summaries, vertical[1]);
+    } else {
+        draw_tool_activity(frame, app, area);
+    }
+}
+
+/// Draw the tool activity log.
+fn draw_tool_activity(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title(" Tools ");
 
     let activity = app.tool_activity();
@@ -218,6 +262,54 @@ fn draw_tool_pane(frame: &mut Frame, app: &App, area: Rect) {
         .scroll((scroll, 0));
 
     frame.render_widget(tool_log, area);
+}
+
+/// Draw the subagent status pane.
+fn draw_subagent_pane(frame: &mut Frame, summaries: &[tmg_agents::SubagentSummary], area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" Subagents ");
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+
+    for summary in summaries {
+        let status_style = match summary.status.label() {
+            "running" => Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+            "completed" => Style::default().fg(Color::Cyan),
+            "failed" => Style::default().fg(Color::Red),
+            "cancelled" => Style::default().fg(Color::Yellow),
+            _ => Style::default().fg(Color::DarkGray),
+        };
+
+        let task_preview = if summary.task.len() > 40 {
+            format!("{}...", &summary.task[..37])
+        } else {
+            summary.task.clone()
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("[{}:{}] ", summary.id, summary.agent_type),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(summary.status.label(), status_style),
+        ]));
+
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(task_preview, Style::default().fg(Color::DarkGray)),
+        ]));
+
+        lines.push(Line::from(""));
+    }
+
+    let subagent_log = Paragraph::new(Text::from(lines))
+        .block(block)
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(subagent_log, area);
 }
 
 /// Draw the input area at the bottom.

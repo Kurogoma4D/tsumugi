@@ -12,8 +12,11 @@ pub use app::App;
 pub use error::TuiError;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use tmg_agents::SubagentManager;
 use tmg_core::AgentLoop;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 /// Run the TUI application.
@@ -29,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 /// * `cancel` - Cancellation token for graceful shutdown.
 /// * `project_root` - Project root directory for prompt file loading.
 /// * `cwd` - Current working directory for prompt file loading.
+/// * `subagent_manager` - Optional shared subagent manager for status display.
 ///
 /// # Errors
 ///
@@ -39,6 +43,7 @@ pub async fn run(
     cancel: CancellationToken,
     project_root: PathBuf,
     cwd: PathBuf,
+    subagent_manager: Option<Arc<Mutex<SubagentManager>>>,
 ) -> Result<(), TuiError> {
     // Install a panic hook that restores the terminal before printing
     // the panic message.  Without this, a panic during TUI operation
@@ -51,6 +56,10 @@ pub async fn run(
 
     let mut terminal = ratatui::init();
     let mut app = App::new(agent, model_name, project_root, cwd);
+
+    if let Some(manager) = subagent_manager {
+        app.set_subagent_manager(manager);
+    }
 
     let result = event::run_event_loop(&mut terminal, &mut app, cancel).await;
 

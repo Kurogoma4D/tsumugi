@@ -8,9 +8,10 @@ license.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
-tokio = { workspace = true, features = ["signal"] }
+tokio = { workspace = true, features = ["signal", "sync"] }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
+tmg-agents = { workspace = true }
 tmg-core = { workspace = true }
 tmg-llm = { workspace = true }
 tmg-tools = { workspace = true }

@@ -42,6 +42,9 @@ pub async fn run_event_loop(
         // Drain any pending turn messages before drawing.
         app.drain_turn_messages();
 
+        // Refresh subagent summaries for display.
+        app.refresh_subagent_summaries().await;
+
         // Draw the current state.
         terminal.draw(|frame| ui::draw(frame, app))?;
 
