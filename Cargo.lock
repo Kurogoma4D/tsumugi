@@ -1455,6 +1455,7 @@ dependencies = [
  "clap",
  "tmg-core",
  "tmg-llm",
+ "tmg-tools",
  "tmg-tui",
  "tokio",
  "tokio-stream",
@@ -1466,8 +1467,10 @@ name = "tmg-core"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "serde_json",
  "thiserror",
  "tmg-llm",
+ "tmg-tools",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -1504,6 +1507,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tmg-llm",
  "tokio",
 ]
 

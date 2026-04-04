@@ -13,6 +13,7 @@ tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tmg-core = { workspace = true }
 tmg-llm = { workspace = true }
+tmg-tools = { workspace = true }
 tmg-tui = { workspace = true }
 
 [lints]

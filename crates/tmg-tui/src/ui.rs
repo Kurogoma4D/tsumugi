@@ -68,7 +68,7 @@ fn draw_main_area(frame: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     draw_chat_pane(frame, app, horizontal[0]);
-    draw_tool_pane(frame, horizontal[1]);
+    draw_tool_pane(frame, app, horizontal[1]);
 }
 
 /// Draw the chat pane showing conversation entries.
@@ -153,21 +153,71 @@ fn draw_chat_pane(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Draw the tool activity pane (frame only, content in future issues).
-fn draw_tool_pane(frame: &mut Frame, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Tools ")
-        .style(Style::default().fg(Color::DarkGray));
-    let placeholder = Paragraph::new(Text::from(vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "  (no tool activity)",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ]))
-    .block(block);
-    frame.render_widget(placeholder, area);
+/// Draw the tool activity pane showing tool call logs.
+fn draw_tool_pane(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" Tools ");
+
+    let activity = app.tool_activity();
+
+    if activity.is_empty() {
+        let placeholder_block = block.style(Style::default().fg(Color::DarkGray));
+        let placeholder = Paragraph::new(Text::from(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  (no tool activity)",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]))
+        .block(placeholder_block);
+        frame.render_widget(placeholder, area);
+        return;
+    }
+
+    let inner = block.inner(area);
+    let mut lines: Vec<Line<'_>> = Vec::new();
+
+    for entry in activity {
+        let name_style = if entry.is_error {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
+        };
+
+        let summary_style = if entry.is_error {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        lines.push(Line::from(vec![Span::styled(
+            format!("[{}]", entry.tool_name),
+            name_style,
+        )]));
+
+        // Wrap the summary across multiple lines if needed.
+        for line in entry.summary.lines() {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(line, summary_style),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+    }
+
+    // Auto-scroll to bottom to show latest activity.
+    let total_lines = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let visible_height = inner.height;
+    let scroll = total_lines.saturating_sub(visible_height);
+
+    let tool_log = Paragraph::new(Text::from(lines))
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+
+    frame.render_widget(tool_log, area);
 }
 
 /// Draw the input area at the bottom.

@@ -106,7 +106,9 @@ fn run_tui(endpoint: &str, model: &str) -> anyhow::Result<()> {
         // Use cwd as project root for now (could be improved with git root detection).
         let project_root = cwd.clone();
 
-        let agent = tmg_core::AgentLoop::new(client, cancel.clone(), &project_root, &cwd)?;
+        let registry = tmg_tools::default_registry();
+        let agent =
+            tmg_core::AgentLoop::new(client, registry, cancel.clone(), &project_root, &cwd)?;
 
         tmg_tui::run(agent, model, cancel, project_root, cwd).await?;
 

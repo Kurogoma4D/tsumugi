@@ -176,6 +176,29 @@ impl ToolRegistry {
     pub fn tool_names(&self) -> impl Iterator<Item = &str> {
         self.tools.keys().map(String::as_str)
     }
+
+    /// Return tool definitions in the format expected by the LLM chat
+    /// completions API `tools` field.
+    ///
+    /// Each entry wraps a tool's name, description, and parameter schema
+    /// in a [`tmg_llm::ToolDefinition`].
+    pub fn tool_definitions(&self) -> Vec<tmg_llm::ToolDefinition> {
+        let mut defs: Vec<tmg_llm::ToolDefinition> = self
+            .tools
+            .values()
+            .map(|tool| tmg_llm::ToolDefinition {
+                kind: tmg_llm::ToolKind::Function,
+                function: tmg_llm::FunctionDefinition {
+                    name: tool.name().to_owned(),
+                    description: Some(tool.description().to_owned()),
+                    parameters: Some(tool.parameters_schema()),
+                },
+            })
+            .collect();
+        // Sort by name for deterministic ordering.
+        defs.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+        defs
+    }
 }
 
 impl Default for ToolRegistry {
