@@ -1689,12 +1689,14 @@ dependencies = [
  "eventsource-stream",
  "futures-core",
  "pin-project-lite",
+ "rand",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
  "tokio-util",
+ "toml",
 ]
 
 [[package]]
