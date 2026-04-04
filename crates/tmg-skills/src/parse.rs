@@ -57,7 +57,10 @@ pub fn parse_skill_md(
 
     let yaml_content = &rest[..end_idx];
     let body_start = end_idx + FRONTMATTER_DELIMITER.len();
-    let body = rest[body_start..].trim_start_matches(['\n', '\r']);
+    let body = rest
+        .get(body_start..)
+        .unwrap_or("")
+        .trim_start_matches(['\n', '\r']);
 
     let frontmatter: SkillFrontmatter =
         serde_yml::from_str(yaml_content).map_err(|e| SkillError::YamlParse {
@@ -89,26 +92,26 @@ fn find_closing_delimiter(text: &str) -> Option<usize> {
     None
 }
 
-/// Serialize a `SkillFrontmatter` back to YAML string (for roundtrip testing).
-pub fn serialize_frontmatter(frontmatter: &SkillFrontmatter) -> Result<String, serde_yml::Error> {
-    serde_yml::to_string(frontmatter)
-}
-
-/// Format a full SKILL.md file from frontmatter and body.
-pub fn format_skill_md(
-    frontmatter: &SkillFrontmatter,
-    body: &str,
-) -> Result<String, serde_yml::Error> {
-    let yaml = serialize_frontmatter(frontmatter)?;
-    Ok(format!("---\n{yaml}---\n\n{body}"))
-}
-
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test assertions")]
 #[expect(clippy::panic, reason = "test assertions")]
 mod tests {
     use super::*;
     use crate::types::InvocationPolicy;
+
+    /// Serialize a `SkillFrontmatter` back to YAML string (for roundtrip testing).
+    fn serialize_frontmatter(frontmatter: &SkillFrontmatter) -> Result<String, serde_yml::Error> {
+        serde_yml::to_string(frontmatter)
+    }
+
+    /// Format a full SKILL.md file from frontmatter and body.
+    fn format_skill_md(
+        frontmatter: &SkillFrontmatter,
+        body: &str,
+    ) -> Result<String, serde_yml::Error> {
+        let yaml = serialize_frontmatter(frontmatter)?;
+        Ok(format!("---\n{yaml}---\n\n{body}"))
+    }
 
     #[test]
     fn parse_basic_frontmatter() {
@@ -195,6 +198,15 @@ Review the code carefully.
     }
 
     #[test]
+    fn parse_closing_delimiter_on_last_line_without_trailing_newline() {
+        let content = "---\nname: x\ndescription: y\n---";
+        let (fm, body) = parse_skill_md(content, "f.md").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(fm.name, "x");
+        assert_eq!(fm.description, "y");
+        assert_eq!(body, "");
+    }
+
+    #[test]
     fn format_and_reparse() {
         let original = SkillFrontmatter {
             name: "format-test".to_owned(),
@@ -210,5 +222,70 @@ Review the code carefully.
 
         assert_eq!(original, parsed_fm);
         assert_eq!(parsed_body, body);
+    }
+
+    #[expect(clippy::expect_used, reason = "proptest assertions")]
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_invocation_policy() -> impl Strategy<Value = InvocationPolicy> {
+            prop_oneof![
+                Just(InvocationPolicy::Auto),
+                Just(InvocationPolicy::ExplicitOnly),
+            ]
+        }
+
+        /// Generate a non-empty string that does not contain `---` on its own
+        /// line and has no leading/trailing whitespace that would be lost in
+        /// YAML roundtrip.
+        fn arb_yaml_safe_string() -> impl Strategy<Value = String> {
+            "[a-zA-Z0-9][a-zA-Z0-9 _-]{0,30}[a-zA-Z0-9]"
+        }
+
+        fn arb_allowed_tools() -> impl Strategy<Value = Option<Vec<String>>> {
+            prop_oneof![
+                Just(None),
+                proptest::collection::vec("[a-z_]{1,20}", 1..5).prop_map(Some),
+            ]
+        }
+
+        fn arb_frontmatter() -> impl Strategy<Value = SkillFrontmatter> {
+            (
+                arb_yaml_safe_string(),
+                arb_yaml_safe_string(),
+                arb_invocation_policy(),
+                arb_allowed_tools(),
+            )
+                .prop_map(|(name, description, invocation, allowed_tools)| {
+                    SkillFrontmatter {
+                        name,
+                        description,
+                        invocation,
+                        allowed_tools,
+                    }
+                })
+        }
+
+        proptest! {
+            #[test]
+            fn frontmatter_roundtrip(fm in arb_frontmatter()) {
+                let yaml = serialize_frontmatter(&fm).expect("serialize");
+                let parsed: SkillFrontmatter =
+                    serde_yml::from_str(&yaml).expect("deserialize");
+                prop_assert_eq!(&fm, &parsed);
+            }
+
+            #[test]
+            fn format_parse_roundtrip(fm in arb_frontmatter(), body in "[a-zA-Z0-9 .!?\n]{0,100}") {
+                let md = format_skill_md(&fm, &body).expect("format");
+                let (parsed_fm, parsed_body) =
+                    parse_skill_md(&md, "prop.md").expect("parse");
+                prop_assert_eq!(&fm, &parsed_fm);
+                // Body is trimmed of leading newlines by the parser.
+                let expected_body = body.trim_start_matches(['\n', '\r']);
+                prop_assert_eq!(parsed_body, expected_body);
+            }
+        }
     }
 }
