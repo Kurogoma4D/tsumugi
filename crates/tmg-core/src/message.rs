@@ -9,10 +9,10 @@ use tmg_llm::{ChatMessage, Role};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
     /// The author role of this message.
-    pub role: Role,
+    pub(crate) role: Role,
 
     /// The text content of this message.
-    pub content: String,
+    pub(crate) content: String,
 }
 
 impl Message {
@@ -37,6 +37,26 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: content.into(),
+        }
+    }
+
+    /// Return the author role of this message.
+    pub fn role(&self) -> Role {
+        self.role
+    }
+
+    /// Return the text content of this message.
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    /// Create a [`ChatMessage`] by borrowing self, cloning only the content string.
+    pub fn to_chat_message(&self) -> ChatMessage {
+        ChatMessage {
+            role: self.role,
+            content: Some(self.content.clone()),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 

@@ -103,12 +103,7 @@ impl AgentLoop {
         self.history.push(Message::user(user_input));
 
         // Build the messages for the LLM request.
-        let chat_messages: Vec<_> = self
-            .history
-            .iter()
-            .cloned()
-            .map(Message::into_chat_message)
-            .collect();
+        let chat_messages: Vec<_> = self.history.iter().map(Message::to_chat_message).collect();
 
         // Send streaming request.
         let mut stream = self
@@ -117,6 +112,7 @@ impl AgentLoop {
             .await?;
 
         let mut response_text = String::new();
+        let mut done_called = false;
 
         while let Some(event) = stream.next().await {
             match event {
@@ -126,6 +122,7 @@ impl AgentLoop {
                 }
                 Ok(StreamEvent::Done(_)) => {
                     sink.on_done()?;
+                    done_called = true;
                     break;
                 }
                 Ok(StreamEvent::ToolCallComplete(_)) => {
@@ -138,6 +135,11 @@ impl AgentLoop {
                     return Err(CoreError::Llm(e));
                 }
             }
+        }
+
+        // Ensure on_done is called even if the stream ends without a Done event.
+        if !done_called {
+            sink.on_done()?;
         }
 
         // Append assistant response to history.
@@ -156,20 +158,20 @@ mod tests {
     #[test]
     fn message_constructors() {
         let sys = Message::system("hello");
-        assert_eq!(sys.role, tmg_llm::Role::System);
-        assert_eq!(sys.content, "hello");
+        assert_eq!(sys.role(), tmg_llm::Role::System);
+        assert_eq!(sys.content(), "hello");
 
         let usr = Message::user("world");
-        assert_eq!(usr.role, tmg_llm::Role::User);
+        assert_eq!(usr.role(), tmg_llm::Role::User);
 
         let asst = Message::assistant("response");
-        assert_eq!(asst.role, tmg_llm::Role::Assistant);
+        assert_eq!(asst.role(), tmg_llm::Role::Assistant);
     }
 
     #[test]
     fn message_to_chat_message() {
         let msg = Message::user("test");
-        let chat = msg.into_chat_message();
+        let chat = msg.to_chat_message();
         assert_eq!(chat.role, tmg_llm::Role::User);
         assert_eq!(chat.content.as_deref(), Some("test"));
         assert!(chat.tool_calls.is_none());

@@ -62,10 +62,10 @@ fn load_from_directory(dir: &Path, messages: &mut Vec<Message>) -> Result<(), st
                 // File does not exist, skip silently.
             }
             Err(e) => {
-                return Err(std::io::Error::other(format!(
-                    "failed to read {}: {e}",
-                    path.display()
-                )));
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to read {}: {e}", path.display()),
+                ));
             }
         }
     }
