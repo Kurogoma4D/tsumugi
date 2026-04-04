@@ -8,5 +8,5 @@ pub use client::{ChatStream, LlmClient, LlmClientConfig};
 pub use error::LlmError;
 pub use types::{
     ChatMessage, ChatRequest, ChatResponse, Role, StreamEvent, ToolCall, ToolCallAccumulator,
-    ToolDefinition,
+    ToolCallIndexError, ToolDefinition, ToolKind,
 };

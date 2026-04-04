@@ -2,6 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Maximum number of concurrent tool calls allowed in a single response.
+///
+/// This prevents unbounded memory allocation from malformed server responses
+/// with absurdly large tool call indices.
+const MAX_TOOL_CALL_INDEX: usize = 128;
+
 // ---------------------------------------------------------------------------
 // Request types
 // ---------------------------------------------------------------------------
@@ -60,12 +66,21 @@ pub enum Role {
     Tool,
 }
 
+/// The kind of a tool or tool call. Currently only `function` is supported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolKind {
+    /// A callable function.
+    #[default]
+    Function,
+}
+
 /// A tool definition exposed to the model.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolDefinition {
-    /// Always `"function"`.
-    #[serde(rename = "type")]
-    pub kind: String,
+    /// The tool kind (always [`ToolKind::Function`]).
+    #[serde(rename = "type", default)]
+    pub kind: ToolKind,
 
     /// Function metadata.
     pub function: FunctionDefinition,
@@ -144,15 +159,12 @@ pub struct ChunkChoice {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Delta {
     /// The role, if present in this delta.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<Role>,
 
     /// Incremental text content.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
 
     /// Incremental tool call data.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
@@ -163,15 +175,13 @@ pub struct ToolCallDelta {
     pub index: u32,
 
     /// Tool call id (present in the first delta for this call).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
 
     /// Always `"function"` when present.
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "type")]
     pub kind: Option<String>,
 
     /// Incremental function data.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<FunctionCallDelta>,
 }
 
@@ -179,11 +189,9 @@ pub struct ToolCallDelta {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct FunctionCallDelta {
     /// Function name (present in the first delta).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
     /// Incremental arguments JSON string.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<String>,
 }
 
@@ -197,9 +205,9 @@ pub struct ToolCall {
     /// Unique identifier for this tool call.
     pub id: String,
 
-    /// Always `"function"`.
-    #[serde(rename = "type")]
-    pub kind: String,
+    /// The tool kind (always [`ToolKind::Function`]).
+    #[serde(rename = "type", default)]
+    pub kind: ToolKind,
 
     /// The function to call.
     pub function: FunctionCall,
@@ -243,6 +251,14 @@ pub struct ToolCallAccumulator {
     calls: Vec<ToolCallBuilder>,
 }
 
+/// Error returned when a tool call delta has an index exceeding the allowed maximum.
+#[derive(Debug, thiserror::Error)]
+#[error("tool call index {index} exceeds maximum allowed ({MAX_TOOL_CALL_INDEX})")]
+pub struct ToolCallIndexError {
+    /// The offending index value.
+    pub index: u32,
+}
+
 #[derive(Debug, Default)]
 struct ToolCallBuilder {
     id: String,
@@ -261,11 +277,21 @@ impl ToolCallAccumulator {
     /// A tool call is considered complete when a subsequent delta starts a new
     /// call at a higher index, or when the stream signals completion via
     /// [`Self::finish`].
-    pub fn feed(&mut self, deltas: &[ToolCallDelta]) -> Vec<ToolCall> {
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if any delta has an index exceeding [`MAX_TOOL_CALL_INDEX`],
+    /// which guards against unbounded memory allocation from malformed responses.
+    pub fn feed(&mut self, deltas: &[ToolCallDelta]) -> Result<Vec<ToolCall>, ToolCallIndexError> {
         let mut completed = Vec::new();
 
         for delta in deltas {
             let idx = delta.index as usize;
+
+            // Reject absurdly large indices to prevent OOM.
+            if idx > MAX_TOOL_CALL_INDEX {
+                return Err(ToolCallIndexError { index: delta.index });
+            }
 
             // Ensure we have enough builder slots.
             while self.calls.len() <= idx {
@@ -296,7 +322,7 @@ impl ToolCallAccumulator {
                     let builder = std::mem::take(&mut self.calls[idx]);
                     completed.push(ToolCall {
                         id: builder.id,
-                        kind: "function".to_owned(),
+                        kind: ToolKind::Function,
                         function: FunctionCall {
                             name: builder.name,
                             arguments: builder.arguments,
@@ -306,7 +332,7 @@ impl ToolCallAccumulator {
             }
         }
 
-        completed
+        Ok(completed)
     }
 
     /// Drain all remaining in-progress tool calls as complete.
@@ -316,7 +342,7 @@ impl ToolCallAccumulator {
             .filter(|b| !b.id.is_empty())
             .map(|b| ToolCall {
                 id: b.id,
-                kind: "function".to_owned(),
+                kind: ToolKind::Function,
                 function: FunctionCall {
                     name: b.name,
                     arguments: b.arguments,
@@ -431,7 +457,7 @@ mod tests {
                 arguments: Some("{\"path\":".into()),
             }),
         }];
-        let completed = acc.feed(&d1);
+        let completed = acc.feed(&d1).expect("feed d1");
         assert!(completed.is_empty());
 
         // Second delta: more args
@@ -444,13 +470,14 @@ mod tests {
                 arguments: Some("\"/tmp/f\"}".into()),
             }),
         }];
-        let completed = acc.feed(&d2);
+        let completed = acc.feed(&d2).expect("feed d2");
         assert!(completed.is_empty());
 
         // Finish
         let completed = acc.finish();
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].id, "call_1");
+        assert_eq!(completed[0].kind, ToolKind::Function);
         assert_eq!(completed[0].function.name, "read_file");
         assert_eq!(completed[0].function.arguments, "{\"path\":\"/tmp/f\"}");
     }
@@ -468,18 +495,21 @@ mod tests {
                 name: Some("foo".into()),
                 arguments: Some("{}".into()),
             }),
-        }]);
+        }])
+        .expect("feed first");
 
         // Second tool call starts - first should be completed
-        let completed = acc.feed(&[ToolCallDelta {
-            index: 1,
-            id: Some("call_b".into()),
-            kind: Some("function".into()),
-            function: Some(FunctionCallDelta {
-                name: Some("bar".into()),
-                arguments: Some("{\"x\":1}".into()),
-            }),
-        }]);
+        let completed = acc
+            .feed(&[ToolCallDelta {
+                index: 1,
+                id: Some("call_b".into()),
+                kind: Some("function".into()),
+                function: Some(FunctionCallDelta {
+                    name: Some("bar".into()),
+                    arguments: Some("{\"x\":1}".into()),
+                }),
+            }])
+            .expect("feed second");
 
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].id, "call_a");
@@ -489,6 +519,23 @@ mod tests {
         let completed = acc.finish();
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].id, "call_b");
+    }
+
+    #[test]
+    fn accumulator_rejects_excessive_index() {
+        let mut acc = ToolCallAccumulator::new();
+
+        let result = acc.feed(&[ToolCallDelta {
+            index: u32::MAX,
+            id: Some("call_bad".into()),
+            kind: Some("function".into()),
+            function: Some(FunctionCallDelta {
+                name: Some("exploit".into()),
+                arguments: Some("{}".into()),
+            }),
+        }]);
+
+        assert!(result.is_err());
     }
 
     #[test]

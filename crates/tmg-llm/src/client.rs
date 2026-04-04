@@ -6,9 +6,9 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use eventsource_stream::Eventsource;
-use futures_core::Stream;
+use futures_core::{Future, Stream};
 use reqwest::Client;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use crate::error::LlmError;
 use crate::types::{
@@ -180,10 +180,12 @@ impl LlmClient {
         let byte_stream = response.bytes_stream();
         let event_stream = byte_stream.eventsource();
 
+        let cancel_fut = cancel.cancelled_owned();
+
         Ok(ChatStream {
             inner: Box::pin(event_stream),
             accumulator: ToolCallAccumulator::new(),
-            cancel,
+            cancel_fut: Box::pin(cancel_fut),
             finished: false,
             pending: VecDeque::new(),
         })
@@ -206,7 +208,10 @@ pub struct ChatStream {
         >,
     >,
     accumulator: ToolCallAccumulator,
-    cancel: CancellationToken,
+    /// Cancellation future that resolves when the token is cancelled.
+    /// Polling this alongside the inner stream ensures cancellation wakes
+    /// the task even when the inner stream is blocked on I/O.
+    cancel_fut: Pin<Box<WaitForCancellationFutureOwned>>,
     finished: bool,
     /// Buffered events to yield before polling the inner stream again.
     pending: VecDeque<Result<StreamEvent, LlmError>>,
@@ -233,13 +238,15 @@ impl Stream for ChatStream {
             return Poll::Ready(None);
         }
 
-        // Check cancellation.
-        if self.cancel.is_cancelled() {
-            self.finished = true;
-            return Poll::Ready(Some(Err(LlmError::Cancelled)));
-        }
-
         loop {
+            // Poll the cancellation future first. If it is ready, the token
+            // has been cancelled and we should terminate immediately. This
+            // ensures the task is woken even when the inner stream is blocked.
+            if self.cancel_fut.as_mut().poll(cx).is_ready() {
+                self.finished = true;
+                return Poll::Ready(Some(Err(LlmError::Cancelled)));
+            }
+
             match self.inner.as_mut().poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => {
@@ -309,7 +316,14 @@ impl ChatStream {
         for choice in &chunk.choices {
             // Handle tool call deltas.
             if let Some(tc_deltas) = &choice.delta.tool_calls {
-                let completed = self.accumulator.feed(tc_deltas);
+                let completed = match self.accumulator.feed(tc_deltas) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.pending
+                            .push_back(Err(LlmError::InvalidResponse(e.to_string())));
+                        return;
+                    }
+                };
                 for tc in completed {
                     self.pending
                         .push_back(Ok(StreamEvent::ToolCallComplete(tc)));
