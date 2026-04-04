@@ -33,6 +33,14 @@ pub enum LlmError {
     /// An HTTP-level error from reqwest that doesn't fit other variants.
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
+
+    /// The connection pool has no endpoints configured.
+    #[error("connection pool has no endpoints configured")]
+    PoolEmpty,
+
+    /// All endpoints in the pool are down (health checks failed).
+    #[error("all endpoints in the pool are unreachable")]
+    AllEndpointsDown,
 }
 
 impl LlmError {
