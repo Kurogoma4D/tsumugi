@@ -40,6 +40,30 @@ pub struct PoolConfig {
     pub strategy: LoadBalanceStrategy,
 }
 
+/// Errors from [`PoolConfig::validate`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PoolConfigError {
+    /// The endpoints list is empty.
+    #[error("endpoints list must not be empty")]
+    EmptyEndpoints,
+
+    /// An endpoint string is empty or whitespace-only.
+    #[error("endpoint at index {index} is empty")]
+    EmptyEndpointString {
+        /// Zero-based index of the offending entry.
+        index: usize,
+    },
+
+    /// An endpoint string is not a valid URL.
+    #[error("endpoint at index {index} is not a valid URL: {url:?}")]
+    MalformedUrl {
+        /// Zero-based index of the offending entry.
+        index: usize,
+        /// The invalid URL string.
+        url: String,
+    },
+}
+
 impl PoolConfig {
     /// Create a pool config with a single endpoint (no actual pooling).
     pub fn single(endpoint: impl Into<String>) -> Self {
@@ -47,6 +71,38 @@ impl PoolConfig {
             endpoints: vec![endpoint.into()],
             strategy: LoadBalanceStrategy::RoundRobin,
         }
+    }
+
+    /// Validate the pool configuration.
+    ///
+    /// Checks for:
+    /// - Empty endpoints list
+    /// - Empty or whitespace-only endpoint strings
+    /// - Malformed URLs (must start with `http://` or `https://`)
+    ///
+    /// # Errors
+    ///
+    /// Returns the first validation error found.
+    pub fn validate(&self) -> Result<(), PoolConfigError> {
+        if self.endpoints.is_empty() {
+            return Err(PoolConfigError::EmptyEndpoints);
+        }
+
+        for (index, url) in self.endpoints.iter().enumerate() {
+            let trimmed = url.trim();
+            if trimmed.is_empty() {
+                return Err(PoolConfigError::EmptyEndpointString { index });
+            }
+
+            if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+                return Err(PoolConfigError::MalformedUrl {
+                    index,
+                    url: url.clone(),
+                });
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -96,5 +152,50 @@ mod tests {
         let config = PoolConfig::single("http://localhost:8080");
         assert_eq!(config.endpoints.len(), 1);
         assert_eq!(config.endpoints[0], "http://localhost:8080");
+    }
+
+    #[test]
+    fn validate_ok() {
+        let config = PoolConfig {
+            endpoints: vec![
+                "http://localhost:8081".to_owned(),
+                "https://example.com".to_owned(),
+            ],
+            strategy: LoadBalanceStrategy::RoundRobin,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_empty_endpoints() {
+        let config = PoolConfig {
+            endpoints: vec![],
+            strategy: LoadBalanceStrategy::RoundRobin,
+        };
+        assert_eq!(config.validate(), Err(PoolConfigError::EmptyEndpoints));
+    }
+
+    #[test]
+    fn validate_empty_string() {
+        let config = PoolConfig {
+            endpoints: vec!["http://ok".to_owned(), "  ".to_owned()],
+            strategy: LoadBalanceStrategy::RoundRobin,
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(PoolConfigError::EmptyEndpointString { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn validate_malformed_url() {
+        let config = PoolConfig {
+            endpoints: vec!["not-a-url".to_owned()],
+            strategy: LoadBalanceStrategy::RoundRobin,
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(PoolConfigError::MalformedUrl { index: 0, .. })
+        ));
     }
 }

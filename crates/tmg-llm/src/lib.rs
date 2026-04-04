@@ -9,7 +9,7 @@ pub mod types;
 pub use client::{ChatStream, LlmClient, LlmClientConfig};
 pub use error::LlmError;
 pub use pool::{EndpointHealth, LlmPool};
-pub use pool_config::{LoadBalanceStrategy, PoolConfig};
+pub use pool_config::{LoadBalanceStrategy, PoolConfig, PoolConfigError};
 pub use types::{
     ChatMessage, ChatRequest, ChatResponse, FunctionCall, FunctionDefinition, Role, StreamEvent,
     ToolCall, ToolCallAccumulator, ToolCallIndexError, ToolDefinition, ToolKind,
