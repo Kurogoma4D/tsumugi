@@ -10,6 +10,9 @@ use crate::types::{Tool, ToolResult};
 /// Maximum number of matching lines to return.
 const MAX_MATCHES: usize = 500;
 
+/// Maximum directory recursion depth to prevent infinite loops from symlinks.
+const MAX_DEPTH: usize = 32;
+
 /// Search files for a regex pattern.
 pub struct GrepSearchTool;
 
@@ -98,7 +101,7 @@ fn search_files(
     if root.is_file() {
         search_single_file(root, regex, &mut matches, &mut truncated);
     } else if root.is_dir() {
-        walk_and_search(root, regex, include, &mut matches, &mut truncated)?;
+        walk_and_search(root, regex, include, &mut matches, &mut truncated, 0)?;
     } else {
         return Err(ToolError::io(
             format!("'{}' is not a file or directory", root.display()),
@@ -125,8 +128,9 @@ fn walk_and_search(
     include: Option<&str>,
     matches: &mut Vec<String>,
     truncated: &mut bool,
+    depth: usize,
 ) -> Result<(), ToolError> {
-    if *truncated {
+    if *truncated || depth > MAX_DEPTH {
         return Ok(());
     }
 
@@ -141,32 +145,36 @@ fn walk_and_search(
         }
     };
 
-    let mut entries: Vec<PathBuf> = Vec::new();
+    let mut entries: Vec<std::fs::DirEntry> = Vec::new();
     for entry in read_dir {
         let Ok(entry) = entry else { continue };
-        entries.push(entry.path());
+        entries.push(entry);
     }
-    entries.sort();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
 
     for entry in &entries {
         if *truncated {
             break;
         }
 
-        let name = entry
-            .file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
 
         // Skip hidden files/directories.
         if name.starts_with('.') {
             continue;
         }
 
-        if entry.is_dir() {
-            walk_and_search(entry, regex, include, matches, truncated)?;
-        } else if entry.is_file() && matches_include_filter(&name, include) {
-            search_single_file(entry, regex, matches, truncated);
+        // Use entry.file_type() which does not follow symlinks, preventing
+        // infinite loops caused by symlink cycles.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+
+        if file_type.is_dir() {
+            walk_and_search(&entry.path(), regex, include, matches, truncated, depth + 1)?;
+        } else if file_type.is_file() && matches_include_filter(&name, include) {
+            search_single_file(&entry.path(), regex, matches, truncated);
         }
     }
 
@@ -217,6 +225,10 @@ fn simple_glob_match(pattern: &str, text: &str) -> bool {
     } else {
         text.len() - last.len()
     };
+
+    if pos > end {
+        return false;
+    }
 
     // Middle parts must appear in order.
     for part in &parts[1..parts.len() - 1] {
@@ -354,5 +366,7 @@ mod tests {
         assert!(simple_glob_match("*", "anything"));
         assert!(simple_glob_match("exact", "exact"));
         assert!(!simple_glob_match("exact", "other"));
+        // Bounds check: long pattern match against short string.
+        assert!(!simple_glob_match("*longmatch", "short"));
     }
 }

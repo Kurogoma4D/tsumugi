@@ -6,8 +6,10 @@ use crate::error::ToolError;
 
 /// Validate that `path` does not contain path traversal components (e.g. `..`).
 ///
-/// Returns the canonicalized path on success. Rejects paths containing `..`
-/// components, which could be used to escape a sandboxed directory.
+/// Returns the path as-is on success. This function rejects paths containing
+/// `..` components (which could be used to escape a sandboxed directory) but
+/// does **not** canonicalize or resolve symlinks. Symlink resolution is
+/// delegated to the sandbox layer.
 pub fn validate_path(path: impl AsRef<Path>) -> Result<PathBuf, ToolError> {
     let path = path.as_ref();
 

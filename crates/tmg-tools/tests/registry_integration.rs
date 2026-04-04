@@ -100,7 +100,11 @@ async fn dispatch_grep_search() {
     let dir = std::env::temp_dir().join("tmg_tools_integration_grep");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("test.rs"), "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+    std::fs::write(
+        dir.join("test.rs"),
+        "fn main() {\n    println!(\"hello\");\n}\n",
+    )
+    .unwrap();
 
     let result = registry
         .execute(

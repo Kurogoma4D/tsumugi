@@ -33,6 +33,7 @@ pub enum ToolError {
         /// Description of what the tool was doing when the error occurred.
         context: String,
         /// The underlying I/O error.
+        #[source]
         source: std::io::Error,
     },
 
@@ -57,6 +58,7 @@ pub enum ToolError {
         /// Description of what was being serialized.
         context: String,
         /// The underlying `serde_json` error.
+        #[source]
         source: serde_json::Error,
     },
 }

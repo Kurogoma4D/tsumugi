@@ -67,6 +67,12 @@ impl FileReadTool {
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| usize::try_from(n).ok());
 
+        if start_line == Some(0) {
+            return Err(ToolError::invalid_params(
+                "start_line is 1-based and must be >= 1",
+            ));
+        }
+
         let end_line = params
             .get("end_line")
             .and_then(serde_json::Value::as_u64)
@@ -172,6 +178,28 @@ mod tests {
         let tool = FileReadTool;
         let result = tool.execute(serde_json::json!({})).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_start_line_zero_rejected() {
+        let dir = std::env::temp_dir().join("tmg_tools_test_file_read_zero");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("test.txt");
+        std::fs::write(&file, "line1\nline2\n").ok();
+
+        let tool = FileReadTool;
+        let result = tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "start_line": 0
+            }))
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("1-based"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

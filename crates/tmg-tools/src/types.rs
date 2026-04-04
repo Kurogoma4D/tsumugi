@@ -54,6 +54,9 @@ impl ToolResult {
 }
 
 /// Find the largest byte index <= `index` that is a char boundary.
+///
+/// This is a polyfill for [`str::floor_char_boundary`] which is stable since
+/// Rust 1.91.0. Replace with the std method once MSRV is raised.
 fn floor_char_boundary(s: &str, index: usize) -> usize {
     if index >= s.len() {
         return s.len();
@@ -66,6 +69,9 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
 }
 
 /// Find the smallest byte index >= `index` that is a char boundary.
+///
+/// This is a polyfill for [`str::ceil_char_boundary`] which is stable since
+/// Rust 1.91.0. Replace with the std method once MSRV is raised.
 fn ceil_char_boundary(s: &str, index: usize) -> usize {
     if index >= s.len() {
         return s.len();

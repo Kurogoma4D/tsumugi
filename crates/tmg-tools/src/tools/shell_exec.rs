@@ -65,7 +65,7 @@ impl ShellExecTool {
 
         let timeout = Duration::from_secs(timeout_secs);
 
-        let mut child = tokio::process::Command::new("sh")
+        let child = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(command)
             .stdout(std::process::Stdio::piped())
@@ -74,25 +74,13 @@ impl ShellExecTool {
             .spawn()
             .map_err(|e| ToolError::io("spawning shell command", e))?;
 
-        // Take stdout/stderr handles before waiting, so we can still kill on timeout.
-        let stdout_handle = child.stdout.take();
-        let stderr_handle = child.stderr.take();
-
-        let wait_result = tokio::time::timeout(timeout, child.wait()).await;
+        let wait_result = tokio::time::timeout(timeout, child.wait_with_output()).await;
 
         match wait_result {
-            Ok(Ok(status)) => {
-                let stdout = if let Some(handle) = stdout_handle {
-                    read_pipe(handle).await
-                } else {
-                    String::new()
-                };
-                let stderr = if let Some(handle) = stderr_handle {
-                    read_pipe(handle).await
-                } else {
-                    String::new()
-                };
-                let exit_code = status.code().unwrap_or(-1);
+            Ok(Ok(output)) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                let exit_code = output.status.code().unwrap_or(-1);
 
                 let mut text = String::new();
                 let _ = writeln!(text, "Exit code: {exit_code}");
@@ -104,7 +92,7 @@ impl ShellExecTool {
                     let _ = write!(text, "\n--- stderr ---\n{stderr}");
                 }
 
-                if status.success() {
+                if output.status.success() {
                     Ok(ToolResult::success(text))
                 } else {
                     Ok(ToolResult::error(text))
@@ -112,25 +100,14 @@ impl ShellExecTool {
             }
             Ok(Err(e)) => Err(ToolError::io("waiting for command", e)),
             Err(_) => {
-                // Timeout exceeded: kill the process.
-                // `kill_on_drop(true)` ensures cleanup when `child` is dropped.
-                let _ = child.kill().await;
+                // Timeout exceeded. The child process was consumed by
+                // `wait_with_output`, which handles cleanup internally.
                 Err(ToolError::Timeout {
                     seconds: timeout_secs,
                 })
             }
         }
     }
-}
-
-/// Read all bytes from a pipe handle into a string.
-async fn read_pipe(handle: impl tokio::io::AsyncRead + Unpin) -> String {
-    use tokio::io::AsyncReadExt;
-    let mut buf = Vec::new();
-    let mut reader = handle;
-    // Ignore read errors; return whatever was read.
-    let _ = reader.read_to_end(&mut buf).await;
-    String::from_utf8_lossy(&buf).into_owned()
 }
 
 #[expect(clippy::unwrap_used, reason = "test assertions")]
