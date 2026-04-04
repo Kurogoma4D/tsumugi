@@ -3,13 +3,78 @@ use clap::Parser;
 /// tsumugi - a local-LLM-powered coding agent
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
-struct Cli {}
+struct Cli {
+    /// Send a one-shot prompt to the LLM server and stream the response to stdout.
+    #[arg(long)]
+    prompt: Option<String>,
 
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "main will propagate errors once features are implemented"
-)]
+    /// LLM server endpoint URL.
+    #[arg(long, default_value = "http://localhost:8080")]
+    endpoint: String,
+
+    /// Model name to use.
+    #[arg(long, default_value = "default")]
+    model: String,
+}
+
 fn main() -> anyhow::Result<()> {
-    let _cli = Cli::parse();
+    let cli = Cli::parse();
+
+    if let Some(prompt) = cli.prompt {
+        run_prompt(&cli.endpoint, &cli.model, &prompt)?;
+    }
+
     Ok(())
+}
+
+/// Run a one-shot streaming prompt against the LLM server.
+///
+/// This function is the integration check for issue #2: it sends a prompt
+/// to the llama-server and streams the response token-by-token to stdout.
+#[expect(
+    clippy::print_stdout,
+    reason = "integration check: intentional stdout streaming output"
+)]
+fn run_prompt(endpoint: &str, model: &str, prompt: &str) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use tokio_stream::StreamExt as _;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let config = tmg_llm::LlmClientConfig::new(endpoint, model);
+        let client = tmg_llm::LlmClient::new(config)?;
+
+        let messages = vec![tmg_llm::ChatMessage {
+            role: tmg_llm::Role::User,
+            content: Some(prompt.to_owned()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut stream = client.chat_streaming(messages, vec![], cancel).await?;
+
+        while let Some(event) = stream.next().await {
+            match event? {
+                tmg_llm::StreamEvent::ContentDelta(text) => {
+                    print!("{text}");
+                    std::io::stdout().flush()?;
+                }
+                tmg_llm::StreamEvent::ToolCallComplete(tc) => {
+                    println!(
+                        "\n[tool_call] {}({})",
+                        tc.function.name, tc.function.arguments
+                    );
+                }
+                tmg_llm::StreamEvent::Done(reason) => {
+                    println!();
+                    if let Some(r) = reason {
+                        println!("[done: {r}]");
+                    }
+                }
+            }
+        }
+
+        Ok::<(), anyhow::Error>(())
+    })
 }
