@@ -85,10 +85,60 @@ impl LlmClient {
         Ok(Self { http, config })
     }
 
+    /// Return the base URL of the endpoint (used for constructing API URLs).
+    pub fn endpoint(&self) -> &str {
+        &self.config.endpoint
+    }
+
     /// The chat completions endpoint URL.
     fn completions_url(&self) -> String {
         let base = self.config.endpoint.trim_end_matches('/');
         format!("{base}/v1/chat/completions")
+    }
+
+    /// The tokenize endpoint URL (llama-server specific).
+    fn tokenize_url(&self) -> String {
+        let base = self.config.endpoint.trim_end_matches('/');
+        format!("{base}/tokenize")
+    }
+
+    /// Tokenize a string and return the token count.
+    ///
+    /// Uses llama-server's `POST /tokenize` endpoint for accurate
+    /// token counting. This is more accurate than heuristic estimation
+    /// because it uses the actual model's tokenizer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError`] on connection failure, timeout, or invalid response.
+    pub async fn tokenize(&self, content: &str) -> Result<usize, LlmError> {
+        let body = serde_json::json!({
+            "content": content,
+        });
+
+        let response = self
+            .http
+            .post(self.tokenize_url())
+            .json(&body)
+            .send()
+            .await
+            .map_err(classify_reqwest_error)?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(LlmError::ServerError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let resp: crate::types::TokenizeResponse = response
+            .json()
+            .await
+            .map_err(|e| LlmError::InvalidResponse(e.to_string()))?;
+
+        Ok(resp.tokens.len())
     }
 
     /// Send a non-streaming chat completion request.

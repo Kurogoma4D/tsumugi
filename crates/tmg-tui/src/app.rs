@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tmg_agents::{AgentType, CustomAgentDef, SubagentManager, SubagentSummary, truncate_str};
-use tmg_core::{AgentLoop, CoreError, StreamSink};
+use tmg_core::{AgentLoop, CoreError, StreamSink, format_context_usage};
 use tmg_llm::Role;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -53,12 +53,14 @@ pub enum TurnMessage {
         is_error: bool,
     },
     /// The turn completed successfully. Contains the `AgentLoop` back
-    /// and the turn count for context display.
+    /// and context usage information.
     Done {
         /// The agent loop returned after the turn completes.
         agent: AgentLoop,
-        /// Number of user turns so far (for context usage display).
-        user_turns: usize,
+        /// Current token count in the context.
+        token_count: usize,
+        /// Maximum context tokens configured.
+        max_tokens: usize,
     },
     /// The turn failed with an error. Contains the `AgentLoop` back.
     Error {
@@ -136,11 +138,16 @@ pub struct App {
 
     /// Custom agent definitions for display in `/agents` list.
     custom_agents: Vec<CustomAgentDef>,
+
+    /// Whether a `/compact` command is pending execution.
+    pending_compact: bool,
 }
 
 impl App {
     /// Create a new `App` with the given agent loop and model name.
     pub fn new(agent: AgentLoop, model_name: &str, project_root: PathBuf, cwd: PathBuf) -> Self {
+        let max_tokens = agent.context_config().max_context_tokens;
+        let context_usage = format_context_usage(0, max_tokens);
         Self {
             agent: Some(agent),
             chat_entries: Vec::new(),
@@ -151,7 +158,7 @@ impl App {
             should_exit: false,
             streaming: false,
             model_name: model_name.to_owned(),
-            context_usage: "0 / ? tokens".to_owned(),
+            context_usage,
             project_root,
             cwd,
             error_message: None,
@@ -159,6 +166,7 @@ impl App {
             subagent_manager: None,
             subagent_summaries: Vec::new(),
             custom_agents: Vec::new(),
+            pending_compact: false,
         }
     }
 
@@ -362,6 +370,19 @@ impl App {
         Ok(Some(text))
     }
 
+    /// Whether the `/compact` command needs to run asynchronously.
+    ///
+    /// Set to `true` when the user types `/compact` and cleared after
+    /// the background task picks it up.
+    pub fn needs_compact(&self) -> bool {
+        self.pending_compact
+    }
+
+    /// Clear the pending compact flag.
+    pub fn clear_pending_compact(&mut self) {
+        self.pending_compact = false;
+    }
+
     /// Handle a slash command. Returns `Ok(())` if handled.
     fn handle_slash_command(&mut self, cmd: &str) -> Result<(), CoreError> {
         match cmd.trim() {
@@ -374,6 +395,17 @@ impl App {
                 self.chat_scroll = 0;
                 if let Some(agent) = &mut self.agent {
                     agent.clear_history(&self.project_root, &self.cwd)?;
+                }
+            }
+            "compact" => {
+                if self.agent.is_some() {
+                    self.pending_compact = true;
+                    self.chat_entries.push(ChatEntry {
+                        role: Role::System,
+                        text: "Compressing context...".to_owned(),
+                    });
+                } else {
+                    self.error_message = Some("Cannot compact while a turn is running".to_owned());
                 }
             }
             "agents" => {
@@ -477,14 +509,17 @@ impl App {
 
             match result {
                 Ok(()) => {
-                    let user_turns = agent
-                        .history()
-                        .iter()
-                        .filter(|m| m.role() == Role::User)
-                        .count();
+                    let token_count = agent.token_count();
+                    let max_tokens = agent.context_config().max_context_tokens;
                     // Ignore send errors -- the receiver may have been
                     // dropped if the app is shutting down.
-                    let _ = tx.send(TurnMessage::Done { agent, user_turns }).await;
+                    let _ = tx
+                        .send(TurnMessage::Done {
+                            agent,
+                            token_count,
+                            max_tokens,
+                        })
+                        .await;
                 }
                 Err(CoreError::Cancelled) => {
                     let _ = tx
@@ -556,11 +591,15 @@ impl App {
                     });
                     changed = true;
                 }
-                Ok(TurnMessage::Done { agent, user_turns }) => {
+                Ok(TurnMessage::Done {
+                    agent,
+                    token_count,
+                    max_tokens,
+                }) => {
                     self.agent = Some(agent);
                     self.streaming = false;
                     self.turn_handle = None;
-                    self.context_usage = format!("{user_turns} turns");
+                    self.context_usage = format_context_usage(token_count, max_tokens);
                     self.set_chat_scroll(0);
                     return true;
                 }
@@ -607,6 +646,24 @@ impl App {
         if let Some(handle) = &self.turn_handle {
             handle.turn_cancel.cancel();
         }
+    }
+
+    /// Return a mutable reference to the agent loop, if available.
+    pub fn agent_mut(&mut self) -> Option<&mut AgentLoop> {
+        self.agent.as_mut()
+    }
+
+    /// Update the context usage display string.
+    pub fn update_context_usage(&mut self, usage: String) {
+        self.context_usage = usage;
+    }
+
+    /// Push a system-role message to the chat display.
+    pub fn push_system_message(&mut self, text: String) {
+        self.chat_entries.push(ChatEntry {
+            role: Role::System,
+            text,
+        });
     }
 
     /// Set an error message to display in the TUI.

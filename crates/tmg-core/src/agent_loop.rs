@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tmg_llm::{LlmClient, StreamEvent, ToolCall, ToolDefinition};
 use tmg_tools::ToolRegistry;
 
+use crate::context::{ContextCompressor, ContextConfig, TokenCounter, truncate_tool_result};
 use crate::error::CoreError;
 use crate::message::Message;
 use crate::prompt;
@@ -75,6 +76,12 @@ pub trait StreamSink {
 /// using a [`JoinSet`]. The loop continues sending tool results back
 /// to the LLM until it produces a final text-only response (or the
 /// maximum round count is reached).
+/// Number of recent messages to preserve during compression.
+///
+/// These messages are never summarized to ensure the model has
+/// immediate context for the current task.
+const PRESERVE_RECENT_MESSAGES: usize = 6;
+
 pub struct AgentLoop {
     /// The LLM client used to send requests.
     client: LlmClient,
@@ -90,6 +97,15 @@ pub struct AgentLoop {
 
     /// Cancellation token for graceful shutdown.
     cancel: CancellationToken,
+
+    /// Context window configuration.
+    context_config: ContextConfig,
+
+    /// Async token counter for tracking context usage.
+    token_counter: TokenCounter,
+
+    /// Context compressor for automatic and manual compression.
+    compressor: ContextCompressor,
 }
 
 impl AgentLoop {
@@ -109,6 +125,29 @@ impl AgentLoop {
         project_root: &Path,
         cwd: &Path,
     ) -> Result<Self, CoreError> {
+        Self::with_context_config(
+            client,
+            registry,
+            cancel,
+            project_root,
+            cwd,
+            ContextConfig::default(),
+        )
+    }
+
+    /// Create a new agent loop with tool support and custom context config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Io`] if a prompt file exists but cannot be read.
+    pub fn with_context_config(
+        client: LlmClient,
+        registry: ToolRegistry,
+        cancel: CancellationToken,
+        project_root: &Path,
+        cwd: &Path,
+        context_config: ContextConfig,
+    ) -> Result<Self, CoreError> {
         let mut history = vec![Message::system(DEFAULT_SYSTEM_PROMPT)];
 
         // Load prompt files and inject as initial messages.
@@ -117,6 +156,8 @@ impl AgentLoop {
 
         let tool_defs = registry.tool_definitions();
         let registry = Arc::new(registry);
+        let token_counter = TokenCounter::new(client.clone());
+        let compressor = ContextCompressor::new(client.clone());
 
         Ok(Self {
             client,
@@ -124,6 +165,9 @@ impl AgentLoop {
             tool_defs,
             history,
             cancel,
+            context_config,
+            token_counter,
+            compressor,
         })
     }
 
@@ -154,6 +198,55 @@ impl AgentLoop {
         let prompt_messages = prompt::load_prompt_files(project_root, cwd)?;
         history.extend(prompt_messages);
         self.history = history;
+        Ok(())
+    }
+
+    /// Return the context configuration.
+    pub fn context_config(&self) -> &ContextConfig {
+        &self.context_config
+    }
+
+    /// Return the current cached token count.
+    pub fn token_count(&self) -> usize {
+        self.token_counter.cached_count()
+    }
+
+    /// Request an asynchronous token count update for the current history.
+    pub async fn update_token_count(&self) {
+        self.token_counter.request_update(&self.history).await;
+    }
+
+    /// Manually compress the context (used by `/compact` command).
+    ///
+    /// # Cancel safety
+    ///
+    /// If the [`CancellationToken`] is cancelled during compression,
+    /// the history remains unchanged and [`CoreError::Cancelled`] is
+    /// returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError`] on LLM communication failure or cancellation.
+    pub async fn compact(&mut self) -> Result<(), CoreError> {
+        let new_history = self
+            .compressor
+            .compress(&self.history, self.cancel.clone(), PRESERVE_RECENT_MESSAGES)
+            .await?;
+        self.history = new_history;
+        // Update token count after compression.
+        self.token_counter.request_update(&self.history).await;
+        Ok(())
+    }
+
+    /// Check if context compression should be auto-triggered and
+    /// compress if needed. Called after each turn completes.
+    async fn maybe_auto_compress(&mut self) -> Result<(), CoreError> {
+        let current_tokens = self.token_counter.cached_count();
+        let trigger = self.context_config.compression_trigger();
+
+        if current_tokens > trigger && trigger > 0 {
+            self.compact().await?;
+        }
         Ok(())
     }
 
@@ -195,6 +288,13 @@ impl AgentLoop {
                 if !response_text.is_empty() {
                     self.history.push(Message::assistant(response_text));
                 }
+
+                // Update token count and check for auto-compression.
+                self.token_counter.request_update(&self.history).await;
+                // Ignore compression errors -- a failed compression should
+                // not prevent the turn from completing successfully.
+                let _ = self.maybe_auto_compress().await;
+
                 return Ok(());
             }
 
@@ -215,6 +315,9 @@ impl AgentLoop {
             "[Agent loop terminated: maximum tool-call rounds reached]".to_owned(),
         ));
         sink.on_done()?;
+
+        // Update token count even on max-rounds termination.
+        self.token_counter.request_update(&self.history).await;
 
         Ok(())
     }
@@ -343,10 +446,11 @@ impl AgentLoop {
                 .unwrap_or(usize::MAX)
         });
 
-        // Append tool-result messages to history.
+        // Append tool-result messages to history, truncating if needed.
+        let max_tool_tokens = self.context_config.max_tool_result_tokens;
         for (call_id, _name, tool_result) in results {
-            self.history
-                .push(Message::tool_result(call_id, tool_result.output));
+            let output = truncate_tool_result(&tool_result.output, max_tool_tokens);
+            self.history.push(Message::tool_result(call_id, output));
         }
 
         Ok(())

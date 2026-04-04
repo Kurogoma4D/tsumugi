@@ -6,6 +6,8 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::DefaultTerminal;
 use tokio_util::sync::CancellationToken;
 
+use tmg_core::format_context_usage;
+
 use crate::app::App;
 use crate::error::TuiError;
 use crate::ui;
@@ -52,6 +54,12 @@ pub async fn run_event_loop(
     loop {
         // Drain any pending turn messages before drawing.
         app.drain_turn_messages();
+
+        // Handle pending /compact command asynchronously.
+        if app.needs_compact() {
+            app.clear_pending_compact();
+            run_compact(app, &cancel).await;
+        }
 
         // Refresh subagent summaries at a throttled rate (once per second)
         // to avoid excessive lock contention with the manager mutex.
@@ -195,4 +203,32 @@ fn submit_and_start_turn(app: &mut App, cancel: &CancellationToken) {
     };
 
     app.start_turn(user_input, cancel);
+}
+
+/// Run the `/compact` command: compresses context in the background.
+///
+/// Takes temporary ownership of the agent, runs compression, and
+/// updates the context usage display.
+async fn run_compact(app: &mut App, cancel: &CancellationToken) {
+    // Borrow the agent mutably for the compact operation.
+    // We need to take it temporarily if we want to spawn, but since
+    // compact is quick relative to a full turn and CancellationToken
+    // handles interruption, we can run it inline.
+    if let Some(agent) = app.agent_mut() {
+        agent.set_cancel_token(cancel.child_token());
+        match agent.compact().await {
+            Ok(()) => {
+                let token_count = agent.token_count();
+                let max_tokens = agent.context_config().max_context_tokens;
+                app.update_context_usage(format_context_usage(token_count, max_tokens));
+                app.push_system_message("Context compressed successfully.".to_owned());
+            }
+            Err(tmg_core::CoreError::Cancelled) => {
+                app.set_error("Context compression cancelled.".to_owned());
+            }
+            Err(e) => {
+                app.set_error(format!("Context compression failed: {e}"));
+            }
+        }
+    }
 }
