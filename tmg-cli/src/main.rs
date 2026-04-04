@@ -33,11 +33,15 @@ struct Cli {
     #[arg(long, default_value = "4096")]
     max_tool_result_tokens: usize,
 
-    /// Tool calling mode: "native", "prompt\_based", or "auto".
+    /// Tool calling mode: "native", "prompt_based", or "auto".
     ///
     /// - native: use OpenAI-compatible function calling API
-    /// - prompt\_based: inject tool descriptions in system prompt
-    /// - auto (default): try native first, fall back to prompt\_based parsing
+    /// - prompt_based: inject tool descriptions in system prompt
+    /// - auto (default): try native first, fall back to prompt_based parsing
+    #[expect(
+        clippy::doc_markdown,
+        reason = "clap renders doc comments as --help text; backticks would show literally"
+    )]
     #[arg(long, default_value = "auto")]
     tool_calling: tmg_core::ToolCallingMode,
 }

@@ -175,6 +175,10 @@ fn parse_single_tool_call(json_str: &str, index: u32) -> Result<ToolCall, ParseE
 
     let arguments = match obj.get("arguments") {
         Some(serde_json::Value::Object(args)) => {
+            // Safety: `serde_json::to_string` on a `Map<String, Value>` cannot
+            // fail because the value was already successfully deserialized from
+            // valid JSON — it contains no non-string map keys or other
+            // constructs that would cause serialization to error.
             serde_json::to_string(args).unwrap_or_else(|_| "{}".to_owned())
         }
         Some(serde_json::Value::Null) | None => "{}".to_owned(),

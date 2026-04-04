@@ -98,7 +98,9 @@ pub struct AgentLoop {
     registry: Arc<ToolRegistry>,
 
     /// Pre-computed tool definitions for the `tools` field in requests.
-    tool_defs: Vec<ToolDefinition>,
+    /// Wrapped in `Arc` to avoid deep-cloning every round when passed to
+    /// the streaming request in `Native` / `Auto` modes.
+    tool_defs: Arc<Vec<ToolDefinition>>,
 
     /// Conversation history (system prompt + user/assistant/tool messages).
     history: Vec<Message>,
@@ -161,17 +163,9 @@ impl AgentLoop {
         context_config: ContextConfig,
         tool_calling_mode: ToolCallingMode,
     ) -> Result<Self, CoreError> {
-        let tool_defs = registry.tool_definitions();
+        let tool_defs = Arc::new(registry.tool_definitions());
 
-        // Build the system prompt; in prompt_based or auto mode, append the
-        // tool calling convention so the model knows how to emit <tool_call>.
-        let system_prompt = match tool_calling_mode {
-            ToolCallingMode::Native => DEFAULT_SYSTEM_PROMPT.to_owned(),
-            ToolCallingMode::PromptBased | ToolCallingMode::Auto => {
-                let suffix = build_tool_calling_prompt(&tool_defs);
-                format!("{DEFAULT_SYSTEM_PROMPT}{suffix}")
-            }
-        };
+        let system_prompt = Self::build_system_prompt(tool_calling_mode, &tool_defs);
 
         let mut history = vec![Message::system(system_prompt)];
 
@@ -194,6 +188,23 @@ impl AgentLoop {
             compressor,
             tool_calling_mode,
         })
+    }
+
+    /// Build the system prompt string based on the tool calling mode.
+    ///
+    /// In `PromptBased` or `Auto` mode, appends the tool calling convention
+    /// so the model knows how to emit `<tool_call>` tags.
+    fn build_system_prompt(
+        tool_calling_mode: ToolCallingMode,
+        tool_defs: &[ToolDefinition],
+    ) -> String {
+        match tool_calling_mode {
+            ToolCallingMode::Native => DEFAULT_SYSTEM_PROMPT.to_owned(),
+            ToolCallingMode::PromptBased | ToolCallingMode::Auto => {
+                let suffix = build_tool_calling_prompt(tool_defs);
+                format!("{DEFAULT_SYSTEM_PROMPT}{suffix}")
+            }
+        }
     }
 
     /// Replace the cancellation token used for future turns.
@@ -219,13 +230,7 @@ impl AgentLoop {
     ///
     /// Returns [`CoreError::Io`] if a prompt file exists but cannot be read.
     pub fn clear_history(&mut self, project_root: &Path, cwd: &Path) -> Result<(), CoreError> {
-        let system_prompt = match self.tool_calling_mode {
-            ToolCallingMode::Native => DEFAULT_SYSTEM_PROMPT.to_owned(),
-            ToolCallingMode::PromptBased | ToolCallingMode::Auto => {
-                let suffix = build_tool_calling_prompt(&self.tool_defs);
-                format!("{DEFAULT_SYSTEM_PROMPT}{suffix}")
-            }
-        };
+        let system_prompt = Self::build_system_prompt(self.tool_calling_mode, &self.tool_defs);
         let mut history = vec![Message::system(system_prompt)];
         let prompt_messages = prompt::load_prompt_files(project_root, cwd)?;
         history.extend(prompt_messages);
@@ -380,7 +385,7 @@ impl AgentLoop {
         // the model learns tools from the system prompt instead.
         let request_tools = match self.tool_calling_mode {
             ToolCallingMode::PromptBased => vec![],
-            ToolCallingMode::Native | ToolCallingMode::Auto => self.tool_defs.clone(),
+            ToolCallingMode::Native | ToolCallingMode::Auto => self.tool_defs.to_vec(),
         };
 
         let mut stream = self
@@ -418,6 +423,11 @@ impl AgentLoop {
         let (final_text, tool_calls) = match self.tool_calling_mode {
             ToolCallingMode::Native => (response_text, native_tool_calls),
             ToolCallingMode::PromptBased => {
+                // NOTE: During streaming, raw `<tool_call>` tags are delivered
+                // to the sink before we can parse and strip them here. This is
+                // expected behavior — buffering the entire response to strip
+                // tags before streaming would defeat the purpose of incremental
+                // token delivery. The stored history uses the cleaned text.
                 let (cleaned, parsed, errors) = parse_tool_calls(&response_text);
                 for err in &errors {
                     sink.on_warning(&format!("prompt-based tool call parse error: {err}"))?;
@@ -441,7 +451,10 @@ impl AgentLoop {
                     }
                 } else {
                     // Native tool calls were returned; use them.
-                    (response_text, native_tool_calls)
+                    // Strip any residual <tool_call> tags that the model may
+                    // have emitted alongside native tool calls.
+                    let (cleaned, _, _) = parse_tool_calls(&response_text);
+                    (cleaned, native_tool_calls)
                 }
             }
         };
