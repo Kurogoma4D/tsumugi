@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
+use unicode_width::UnicodeWidthStr;
 
 use tmg_agents::truncate_str;
 
@@ -139,8 +140,15 @@ fn draw_chat_pane(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(""));
     }
 
-    // Show streaming indicator.
-    if app.is_streaming() {
+    // Show streaming/thinking indicator.
+    if app.is_thinking() {
+        lines.push(Line::from(Span::styled(
+            "thinking...",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::DIM | Modifier::ITALIC),
+        )));
+    } else if app.is_streaming() {
         lines.push(Line::from(Span::styled(
             "...",
             Style::default()
@@ -149,23 +157,34 @@ fn draw_chat_pane(frame: &mut Frame, app: &App, area: Rect) {
         )));
     }
 
-    // Saturate to u16::MAX if line count exceeds display capacity.
-    let total_lines = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     let visible_height = inner.height;
+    let wrap_width = inner.width;
 
-    // Auto-scroll to bottom when new content arrives.
-    let scroll = if total_lines > visible_height {
-        total_lines
-            .saturating_sub(visible_height)
-            .saturating_sub(app.chat_scroll())
-    } else {
-        0
+    // Calculate the total number of display lines accounting for wrapping.
+    // Each logical line wraps to ceil(display_width / wrap_width) lines,
+    // with empty lines counting as 1.
+    let total_lines = {
+        let mut count: u16 = 0;
+        for line in &lines {
+            let w: u16 = u16::try_from(line.width()).unwrap_or(u16::MAX);
+            if w == 0 || wrap_width == 0 {
+                count = count.saturating_add(1);
+            } else {
+                count = count.saturating_add((w.saturating_add(wrap_width - 1)) / wrap_width);
+            }
+        }
+        count
     };
 
     let chat = Paragraph::new(Text::from(lines))
         .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+        .wrap(Wrap { trim: false });
+
+    // Auto-scroll to bottom when new content arrives.
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    let scroll = max_scroll.saturating_sub(app.chat_scroll());
+
+    let chat = chat.scroll((scroll, 0));
 
     frame.render_widget(chat, area);
 
@@ -318,7 +337,7 @@ fn draw_subagent_pane(frame: &mut Frame, summaries: &[tmg_agents::SubagentSummar
 fn draw_input_area(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Input (Ctrl+Enter to send) ");
+        .title(" Input (Enter: send, Shift/Alt+Enter: newline) ");
 
     let input_text = if app.input().is_empty() && !app.is_streaming() {
         Text::from(Span::styled(
@@ -344,8 +363,8 @@ fn draw_input_area(frame: &mut Frame, app: &App, area: Rect) {
         let cursor_line =
             u16::try_from(text_before_cursor.matches('\n').count()).unwrap_or(u16::MAX);
         let last_newline_pos = text_before_cursor.rfind('\n').map_or(0, |p| p + 1);
-        let cursor_col = u16::try_from(text_before_cursor[last_newline_pos..].chars().count())
-            .unwrap_or(u16::MAX);
+        let cursor_col =
+            u16::try_from(text_before_cursor[last_newline_pos..].width()).unwrap_or(u16::MAX);
 
         frame.set_cursor_position((inner.x + cursor_col, inner.y + cursor_line));
     }

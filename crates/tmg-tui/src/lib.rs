@@ -14,6 +14,11 @@ pub use error::TuiError;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
+use crossterm::execute;
 use tmg_agents::{CustomAgentDef, SubagentManager};
 use tmg_core::AgentLoop;
 use tokio::sync::Mutex;
@@ -52,11 +57,27 @@ pub async fn run(
     // leaves the terminal in raw mode, making the shell unusable.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
         ratatui::restore();
         original_hook(info);
     }));
 
     let mut terminal = ratatui::init();
+
+    // Enable mouse capture for scroll wheel support.
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+
+    // Enable the Kitty keyboard protocol so that modifier keys
+    // (e.g. Shift+Enter) are reported distinctly from plain keys.
+    // Not all terminals support this; if the push fails we proceed
+    // without it -- the fallback keybinding will apply.
+    let kbd_enhanced = execute!(
+        std::io::stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+    )
+    .is_ok();
+
     let mut app = App::new(agent, model_name, project_root, cwd);
 
     if let Some(manager) = subagent_manager {
@@ -68,6 +89,11 @@ pub async fn run(
     }
 
     let result = event::run_event_loop(&mut terminal, &mut app, cancel).await;
+
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    if kbd_enhanced {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
 
     ratatui::restore();
 

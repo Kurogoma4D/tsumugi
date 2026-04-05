@@ -144,6 +144,9 @@ fn run_prompt(endpoint: &str, model: &str, prompt: &str) -> anyhow::Result<()> {
 
         while let Some(event) = stream.next().await {
             match event? {
+                tmg_llm::StreamEvent::ThinkingDelta(_) => {
+                    // Thinking tokens are not displayed in one-shot mode.
+                }
                 tmg_llm::StreamEvent::ContentDelta(text) => {
                     print!("{text}");
                     std::io::stdout().flush()?;

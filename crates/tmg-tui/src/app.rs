@@ -34,6 +34,8 @@ pub struct ToolActivityEntry {
 
 /// Messages sent from the background turn task to the event loop.
 pub enum TurnMessage {
+    /// An incremental thinking/reasoning token from the LLM stream.
+    Thinking(String),
     /// An incremental token from the LLM stream.
     Token(String),
     /// A tool call is being dispatched.
@@ -159,6 +161,9 @@ pub struct App {
 
     /// Whether a `/compact` command is pending execution.
     pending_compact: bool,
+
+    /// Whether the model is currently in the thinking/reasoning phase.
+    thinking: bool,
 }
 
 impl App {
@@ -185,6 +190,7 @@ impl App {
             subagent_summaries: Vec::new(),
             custom_agents: Vec::new(),
             pending_compact: false,
+            thinking: false,
         }
     }
 
@@ -211,6 +217,11 @@ impl App {
     /// Whether the agent is currently streaming a response.
     pub fn is_streaming(&self) -> bool {
         self.streaming
+    }
+
+    /// Whether the model is currently in the thinking/reasoning phase.
+    pub fn is_thinking(&self) -> bool {
+        self.thinking
     }
 
     /// Return the model name for display.
@@ -644,7 +655,14 @@ impl App {
 
         loop {
             match handle.rx.try_recv() {
+                Ok(TurnMessage::Thinking(_)) => {
+                    self.thinking = true;
+                    changed = true;
+                }
                 Ok(TurnMessage::Token(token)) => {
+                    if self.thinking {
+                        self.thinking = false;
+                    }
                     if let Some(last) = self.chat_entries.last_mut() {
                         last.text.push_str(&token);
                     }
@@ -680,6 +698,7 @@ impl App {
                 }) => {
                     self.agent = Some(agent);
                     self.streaming = false;
+                    self.thinking = false;
                     self.turn_handle = None;
                     self.context_usage = format_context_usage(token_count, max_tokens);
                     self.set_chat_scroll(0);
@@ -692,6 +711,7 @@ impl App {
                 }) => {
                     self.agent = Some(agent);
                     self.streaming = false;
+                    self.thinking = false;
                     self.turn_handle = None;
                     self.error_message = Some(message);
                     if cancelled {
@@ -819,6 +839,12 @@ struct ChannelStreamSink {
 }
 
 impl StreamSink for ChannelStreamSink {
+    fn on_thinking(&mut self, token: &str) -> Result<(), CoreError> {
+        self.tx
+            .try_send(TurnMessage::Thinking(token.to_owned()))
+            .map_err(|_| CoreError::Cancelled)
+    }
+
     fn on_token(&mut self, token: &str) -> Result<(), CoreError> {
         self.tx
             .try_send(TurnMessage::Token(token.to_owned()))

@@ -17,8 +17,8 @@ use tmg_llm::LlmClient;
 use crate::error::CoreError;
 use crate::message::Message;
 
-/// Default maximum context tokens (matches common llama.cpp defaults).
-const DEFAULT_MAX_CONTEXT_TOKENS: usize = 8192;
+/// Default maximum context tokens.
+const DEFAULT_MAX_CONTEXT_TOKENS: usize = 16384;
 
 /// Default compression threshold as a fraction of max context.
 const DEFAULT_COMPRESSION_THRESHOLD: f64 = 0.8;

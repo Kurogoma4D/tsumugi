@@ -380,6 +380,14 @@ impl ChatStream {
                 }
             }
 
+            // Handle reasoning/thinking content delta.
+            if let Some(reasoning) = &choice.delta.reasoning_content {
+                if !reasoning.is_empty() {
+                    self.pending
+                        .push_back(Ok(StreamEvent::ThinkingDelta(reasoning.clone())));
+                }
+            }
+
             // Handle content delta.
             if let Some(content) = &choice.delta.content {
                 if !content.is_empty() {
