@@ -163,6 +163,9 @@ fn draw_chat_pane(frame: &mut Frame, app: &App, area: Rect) {
     // Calculate the total number of display lines accounting for wrapping.
     // Each logical line wraps to ceil(display_width / wrap_width) lines,
     // with empty lines counting as 1.
+    // NOTE: This is an approximation. ratatui wraps on word boundaries,
+    // not at exact character-width boundaries, so the actual rendered
+    // line count may differ slightly for wordy content.
     let total_lines = {
         let mut count: u16 = 0;
         for line in &lines {
@@ -181,8 +184,10 @@ fn draw_chat_pane(frame: &mut Frame, app: &App, area: Rect) {
         .wrap(Wrap { trim: false });
 
     // Auto-scroll to bottom when new content arrives.
+    // Clamp chat_scroll to max_scroll so the offset cannot drift
+    // unboundedly when the user scrolls up many times.
     let max_scroll = total_lines.saturating_sub(visible_height);
-    let scroll = max_scroll.saturating_sub(app.chat_scroll());
+    let scroll = max_scroll.saturating_sub(app.chat_scroll().min(max_scroll));
 
     let chat = chat.scroll((scroll, 0));
 

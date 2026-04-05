@@ -52,17 +52,6 @@ pub async fn run(
     subagent_manager: Option<Arc<Mutex<SubagentManager>>>,
     custom_agents: Vec<CustomAgentDef>,
 ) -> Result<(), TuiError> {
-    // Install a panic hook that restores the terminal before printing
-    // the panic message.  Without this, a panic during TUI operation
-    // leaves the terminal in raw mode, making the shell unusable.
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(std::io::stdout(), DisableMouseCapture);
-        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
-        ratatui::restore();
-        original_hook(info);
-    }));
-
     let mut terminal = ratatui::init();
 
     // Enable mouse capture for scroll wheel support.
@@ -77,6 +66,21 @@ pub async fn run(
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
     )
     .is_ok();
+
+    // Install a panic hook that restores the terminal before printing
+    // the panic message.  Without this, a panic during TUI operation
+    // leaves the terminal in raw mode, making the shell unusable.
+    // Set the hook after enabling mouse/keyboard enhancements so we
+    // can capture `kbd_enhanced` and conditionally clean up.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        if kbd_enhanced {
+            let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+        }
+        ratatui::restore();
+        original_hook(info);
+    }));
 
     let mut app = App::new(agent, model_name, project_root, cwd);
 
