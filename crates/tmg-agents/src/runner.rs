@@ -217,6 +217,9 @@ impl SubagentRunner {
                         break;
                     };
                     match event {
+                        Ok(StreamEvent::ThinkingDelta(_)) => {
+                            // Subagent thinking tokens are discarded.
+                        }
                         Ok(StreamEvent::ContentDelta(token)) => {
                             response_text.push_str(&token);
                         }

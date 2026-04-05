@@ -43,6 +43,11 @@ const MAX_TOOL_ROUNDS: usize = 20;
 /// appropriate output (stdout, TUI widget, etc.). Returning an error
 /// aborts the current turn.
 pub trait StreamSink {
+    /// Called for each incremental thinking/reasoning token from the LLM.
+    fn on_thinking(&mut self, _token: &str) -> Result<(), CoreError> {
+        Ok(())
+    }
+
     /// Called for each incremental text token from the LLM.
     fn on_token(&mut self, token: &str) -> Result<(), CoreError>;
 
@@ -398,6 +403,9 @@ impl AgentLoop {
 
         while let Some(event) = stream.next().await {
             match event {
+                Ok(StreamEvent::ThinkingDelta(token)) => {
+                    sink.on_thinking(&token)?;
+                }
                 Ok(StreamEvent::ContentDelta(token)) => {
                     response_text.push_str(&token);
                     sink.on_token(&token)?;

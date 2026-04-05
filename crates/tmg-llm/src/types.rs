@@ -164,6 +164,9 @@ pub struct Delta {
     /// Incremental text content.
     pub content: Option<String>,
 
+    /// Incremental reasoning/thinking content (e.g. from DeepSeek-style models).
+    pub reasoning_content: Option<String>,
+
     /// Incremental tool call data.
     pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
@@ -230,6 +233,9 @@ pub struct FunctionCall {
 /// High-level events emitted by the streaming client.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
+    /// An incremental reasoning/thinking token.
+    ThinkingDelta(String),
+
     /// An incremental text token.
     ContentDelta(String),
 

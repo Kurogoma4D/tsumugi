@@ -2,7 +2,9 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use ratatui::DefaultTerminal;
 use tokio_util::sync::CancellationToken;
 
@@ -118,22 +120,52 @@ async fn poll_event() -> Result<Option<Event>, std::io::Error> {
 
 /// Handle a single terminal event.
 fn handle_event(app: &mut App, event: &Event, cancel: &CancellationToken) {
-    // Terminal resize and other events are handled automatically by
-    // ratatui on the next draw call.
-    if let Event::Key(key_event) = event {
-        handle_key(app, *key_event, cancel);
+    match event {
+        Event::Key(key_event) => handle_key(app, *key_event, cancel),
+        Event::Mouse(mouse_event) => handle_mouse(app, *mouse_event),
+        // Terminal resize and other events are handled automatically by
+        // ratatui on the next draw call.
+        _ => {}
+    }
+}
+
+/// Number of lines to scroll per mouse wheel tick.
+const MOUSE_SCROLL_LINES: u16 = 3;
+
+/// Handle a mouse event.
+fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => app.scroll_up(MOUSE_SCROLL_LINES),
+        MouseEventKind::ScrollDown => app.scroll_down(MOUSE_SCROLL_LINES),
+        _ => {}
     }
 }
 
 /// Handle a key event.
 fn handle_key(app: &mut App, key: KeyEvent, cancel: &CancellationToken) {
+    // Only process key-press events. With the Kitty keyboard protocol
+    // enabled, Release and Repeat events are also reported; ignoring
+    // them prevents double-firing and interference with IME composition.
+    if key.kind != KeyEventKind::Press {
+        return;
+    }
+
     // Clear error on any keypress.
     app.clear_error();
 
-    // While streaming, only Ctrl+C cancels the current turn.
+    // While streaming, allow Ctrl+C to cancel and PageUp/PageDown to scroll.
     if app.is_streaming() {
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            app.cancel_turn();
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.cancel_turn();
+            }
+            KeyCode::PageUp => {
+                app.scroll_up(10);
+            }
+            KeyCode::PageDown => {
+                app.scroll_down(10);
+            }
+            _ => {}
         }
         return;
     }
@@ -144,13 +176,16 @@ fn handle_key(app: &mut App, key: KeyEvent, cancel: &CancellationToken) {
             cancel.cancel();
             app.request_exit();
         }
-        // Ctrl+Enter: submit input and start turn.
-        (KeyCode::Enter, m) if m.contains(KeyModifiers::CONTROL) => {
-            submit_and_start_turn(app, cancel);
-        }
-        // Enter alone: insert newline.
-        (KeyCode::Enter, _) => {
+        // Shift+Enter or Alt+Enter: insert newline.
+        // (Alt+Enter is the fallback for terminals without Kitty keyboard protocol.)
+        (KeyCode::Enter, m)
+            if m.contains(KeyModifiers::SHIFT) || m.contains(KeyModifiers::ALT) =>
+        {
             app.insert_newline();
+        }
+        // Enter alone: submit input and start turn.
+        (KeyCode::Enter, _) => {
+            submit_and_start_turn(app, cancel);
         }
         // Backspace: delete char before cursor.
         (KeyCode::Backspace, _) => {
