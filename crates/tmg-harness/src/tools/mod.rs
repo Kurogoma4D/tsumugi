@@ -25,6 +25,7 @@
 mod feature_list_mark_passing;
 mod feature_list_read;
 mod progress_append;
+mod run_tool_provider;
 mod session_bootstrap;
 mod session_summary_save;
 
@@ -36,6 +37,7 @@ use tokio::sync::Mutex;
 pub use feature_list_mark_passing::FeatureListMarkPassingTool;
 pub use feature_list_read::FeatureListReadTool;
 pub use progress_append::ProgressAppendTool;
+pub use run_tool_provider::RunRunnerToolProvider;
 pub use session_bootstrap::{
     BootstrapPayload, InitScriptStatus, SessionBootstrapTool, SmokeTestResult,
 };
