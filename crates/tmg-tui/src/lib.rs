@@ -39,10 +39,15 @@ use tokio_util::sync::CancellationToken;
 /// * `cwd` - Current working directory for prompt file loading.
 /// * `subagent_manager` - Optional shared subagent manager for status display.
 /// * `custom_agents` - Custom agent definitions for `/agents` list display.
+/// * `event_log` - Optional path to write structured event log (JSON Lines).
 ///
 /// # Errors
 ///
 /// Returns `TuiError` on terminal I/O failure or agent errors.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "entry point collecting all setup parameters; a config struct would add indirection without clarity"
+)]
 pub async fn run(
     agent: AgentLoop,
     model_name: &str,
@@ -51,6 +56,7 @@ pub async fn run(
     cwd: PathBuf,
     subagent_manager: Option<Arc<Mutex<SubagentManager>>>,
     custom_agents: Vec<CustomAgentDef>,
+    event_log: Option<PathBuf>,
 ) -> Result<(), TuiError> {
     let mut terminal = ratatui::init();
 
@@ -82,7 +88,7 @@ pub async fn run(
         original_hook(info);
     }));
 
-    let mut app = App::new(agent, model_name, project_root, cwd);
+    let mut app = App::new(agent, model_name, project_root, cwd, event_log);
 
     if let Some(manager) = subagent_manager {
         app.set_subagent_manager(manager);
