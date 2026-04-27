@@ -1,11 +1,10 @@
 //! `write_file` step handler.
 //!
 //! Resolves the path/content templates, performs traversal-rejection
-//! via `tmg_tools` style validation (we hand-implement the same `..`
-//! check here so this crate doesn't depend on the *internal* `path_util`
-//! module of `tmg-tools`), and writes the file under the workspace.
+//! via the shared [`super::path_util::validate_path`] helper, and
+//! writes the file under the workspace.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 
 use serde_json::json;
 
@@ -14,24 +13,7 @@ use tmg_sandbox::SandboxContext;
 use crate::def::StepResult;
 use crate::error::{Result, WorkflowError};
 use crate::expr;
-
-/// Validate that `path` does not contain `..` (traversal) components.
-///
-/// Mirrors `tmg_tools::path_util::validate_path` but is reproduced
-/// here because that module is private to `tmg-tools`. Re-exporting it
-/// would widen `tmg-tools`'s public API for a single helper; the
-/// duplication is intentional and tested below.
-fn validate_path(path: &Path) -> Result<()> {
-    for component in path.components() {
-        if matches!(component, Component::ParentDir) {
-            return Err(WorkflowError::InvalidPath {
-                path: path.display().to_string(),
-                reason: "contains '..' (traversal not allowed)".to_owned(),
-            });
-        }
-    }
-    Ok(())
-}
+use crate::steps::path_util::validate_path;
 
 /// Execute a `write_file` step.
 pub(crate) async fn execute(
@@ -80,23 +62,5 @@ pub(crate) async fn execute(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rejects_parent_dir() {
-        let result = validate_path(Path::new("../outside.txt"));
-        assert!(matches!(result, Err(WorkflowError::InvalidPath { .. })));
-    }
-
-    #[test]
-    fn allows_nested_path() {
-        assert!(validate_path(Path::new("src/lib.rs")).is_ok());
-    }
-
-    #[test]
-    fn allows_absolute_path() {
-        assert!(validate_path(Path::new("/tmp/x.txt")).is_ok());
-    }
-}
+// Path-validation tests live in `super::path_util::tests` now that the
+// helper is shared with the agent step's `inject_files` handling.

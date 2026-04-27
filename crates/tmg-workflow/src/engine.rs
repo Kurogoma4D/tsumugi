@@ -164,7 +164,7 @@ impl WorkflowEngine {
                 } => {
                     steps::agent::execute(steps::agent::AgentStepArgs {
                         subagent_manager: &self.subagent_manager,
-                        workspace: self.sandbox.workspace(),
+                        sandbox: &self.sandbox,
                         step_id: &step_id,
                         subagent_name: subagent,
                         prompt_template: prompt,
@@ -188,14 +188,6 @@ impl WorkflowEngine {
                         &ctx,
                     )
                     .await
-                    // Tag the error with the step id for nicer messages.
-                    .map_err(|e| match e {
-                        WorkflowError::StepFailed { message, .. } => WorkflowError::StepFailed {
-                            step_id: step_id.clone(),
-                            message,
-                        },
-                        other => other,
-                    })
                 }
                 StepDef::WriteFile {
                     id: _,
@@ -203,6 +195,24 @@ impl WorkflowEngine {
                     content,
                 } => steps::write_file::execute(&self.sandbox, path, content, &ctx).await,
             };
+
+            // Re-tag every error returned by a step handler with the
+            // current `step_id` so the returned `WorkflowError` and
+            // the `StepFailed` progress event always agree on which
+            // step failed. Previously only `StepFailed` was re-tagged
+            // for shell steps; sandbox / IO / write-file errors leaked
+            // through without an id, diverging from the progress
+            // event. The wrap is uniform across step types.
+            let exec_result = exec_result.map_err(|e| match e {
+                WorkflowError::StepFailed { message, .. } => WorkflowError::StepFailed {
+                    step_id: step_id.clone(),
+                    message,
+                },
+                other => WorkflowError::StepFailed {
+                    step_id: step_id.clone(),
+                    message: other.to_string(),
+                },
+            });
 
             match exec_result {
                 Ok(result) => {

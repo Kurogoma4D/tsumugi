@@ -8,6 +8,7 @@ use crate::def::{StepResult, WorkflowOutputs};
 
 /// Progress event emitted by the workflow engine.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum WorkflowProgress {
     /// A step has started executing.
     StepStarted {

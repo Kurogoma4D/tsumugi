@@ -113,6 +113,22 @@ async fn scan_directory(dir: &Path, by_id: &mut BTreeMap<String, WorkflowMeta>) 
             ));
         }
 
+        // Apply the same id-shape check that `parse_workflow_str` enforces
+        // (snake_case-ish: `^[a-z][a-z0-9_]*$`). Listing surfaces that pass
+        // here are runnable; entries with bad ids would otherwise show up
+        // in `tmg workflow list` (#41) but fail when the user tries to
+        // run them. Skip with a warning so a single broken file doesn't
+        // poison the whole discovery list.
+        if !is_valid_id(&head.id) {
+            tracing::warn!(
+                path = %path.display(),
+                id = %head.id,
+                "workflow has invalid id ('{}'); skipping (must match ^[a-z][a-z0-9_]*$)",
+                head.id,
+            );
+            continue;
+        }
+
         if !by_id.contains_key(&head.id) {
             by_id.insert(
                 head.id.clone(),
@@ -124,6 +140,21 @@ async fn scan_directory(dir: &Path, by_id: &mut BTreeMap<String, WorkflowMeta>) 
             );
         }
     }
+}
+
+/// Local copy of `parse::is_valid_id`. The parser holds the canonical
+/// definition; duplicating it here (rather than re-exporting) keeps the
+/// crate's public surface clean — `parse::is_valid_id` is a private
+/// helper, not part of the `tmg-workflow` API.
+fn is_valid_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 fn is_yaml_file(path: &Path) -> bool {
@@ -215,5 +246,23 @@ mod tests {
         let workflows = discover_workflows(tmp.path(), &cfg).await.unwrap();
         assert_eq!(workflows.len(), 1);
         assert_eq!(workflows[0].id, "yml_wf");
+    }
+
+    /// A workflow file whose `id` doesn't match the snake_case-ish
+    /// pattern is silently skipped (with a `tracing::warn!`) so the
+    /// `tmg workflow list` view (#41) doesn't surface unrunnable
+    /// entries. Valid neighbours are still discovered.
+    #[tokio::test]
+    async fn discover_skips_invalid_id_with_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".tsumugi").join("workflows");
+        // Bad id: starts with a digit → would fail `parse_workflow_str`.
+        write_workflow(&dir, "bad.yaml", "1bad-id", "invalid id shape");
+        // Good neighbour: should still appear.
+        write_workflow(&dir, "ok.yaml", "ok", "valid id");
+        let cfg = WorkflowConfig::default();
+        let workflows = discover_workflows(tmp.path(), &cfg).await.unwrap();
+        assert_eq!(workflows.len(), 1);
+        assert_eq!(workflows[0].id, "ok");
     }
 }

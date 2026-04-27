@@ -150,28 +150,41 @@ impl PartialWorkflowConfig {
     }
 
     fn into_final(self) -> Result<tmg_workflow::WorkflowConfig, ConfigError> {
+        // Construct, then delegate range checks to the canonical
+        // `WorkflowConfig::validate()` so the rules are defined in a
+        // single place. Any validation failure is mapped to a
+        // structured `ConfigError::InvalidValue` for the CLI's error
+        // reporting.
         let timeout_secs = self.default_shell_timeout.unwrap_or(30);
-        if timeout_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "workflow.default_shell_timeout".to_owned(),
-                value: "0".to_owned(),
-                reason: "must be a positive integer (>= 1)".to_owned(),
-            });
-        }
         let max_parallel = self.max_parallel_agents.unwrap_or(2);
-        if max_parallel == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "workflow.max_parallel_agents".to_owned(),
-                value: "0".to_owned(),
-                reason: "must be a positive integer (>= 1)".to_owned(),
-            });
-        }
-        Ok(tmg_workflow::WorkflowConfig {
+        let cfg = tmg_workflow::WorkflowConfig {
             discovery_paths: self.discovery_paths,
             default_shell_timeout: Duration::from_secs(timeout_secs),
             default_agent_model: self.default_agent_model.unwrap_or_default(),
             max_parallel_agents: max_parallel,
-        })
+        };
+        cfg.validate().map_err(|e| {
+            // The validate() error pinpoints the offending knob in
+            // its message; surface that wrapped as InvalidValue so
+            // the CLI reports it like other config issues.
+            let (field, value) = if e.to_string().contains("default_shell_timeout") {
+                (
+                    "workflow.default_shell_timeout".to_owned(),
+                    timeout_secs.to_string(),
+                )
+            } else {
+                (
+                    "workflow.max_parallel_agents".to_owned(),
+                    max_parallel.to_string(),
+                )
+            };
+            ConfigError::InvalidValue {
+                field,
+                value,
+                reason: "must be a positive integer (>= 1)".to_owned(),
+            }
+        })?;
+        Ok(cfg)
     }
 }
 

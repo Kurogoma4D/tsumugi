@@ -5,5 +5,6 @@
 //! and return a [`crate::def::StepResult`].
 
 pub(crate) mod agent;
+pub(crate) mod path_util;
 pub(crate) mod shell;
 pub(crate) mod write_file;

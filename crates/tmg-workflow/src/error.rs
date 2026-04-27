@@ -5,6 +5,7 @@ use std::path::PathBuf;
 /// Errors that can occur during workflow loading, expression evaluation,
 /// or step execution.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum WorkflowError {
     /// I/O error while reading workflow files.
     #[error("{context}: {source}")]

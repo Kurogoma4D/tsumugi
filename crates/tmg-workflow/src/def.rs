@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 /// stabilise its surface ahead of the executor work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum WorkflowMode {
     /// Synchronous, run-to-completion workflow.
     #[default]
@@ -48,6 +49,7 @@ pub struct InputDef {
 ///
 /// Only `Agent`, `Shell`, and `WriteFile` are supported in this iteration.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum StepDef {
     /// Spawn a fresh subagent conversation.
     Agent {

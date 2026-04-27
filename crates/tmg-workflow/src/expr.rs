@@ -5,14 +5,18 @@
 //! ```text
 //! expr        := or_expr
 //! or_expr     := and_expr ( "||" and_expr )*
-//! and_expr    := not_expr ( "&&" not_expr )*
-//! not_expr    := "!" not_expr | comparison
-//! comparison  := primary ( ("==" | "!=" | "<" | ">" | "<=" | ">=") primary )?
+//! and_expr    := comparison ( "&&" comparison )*
+//! comparison  := unary ( ("==" | "!=" | "<" | ">" | "<=" | ">=") unary )?
+//! unary       := "!" unary | primary
 //! primary     := literal | path | "(" expr ")"
 //! literal     := integer | string | bool | "null"
 //! path        := identifier ( "." identifier | "[" key "]" )*
 //! key         := string | identifier
 //! ```
+//!
+//! `!` is a unary prefix that binds tighter than `==`/`!=`/etc., so
+//! `!a == b` parses as `(!a) == b`. Use `!(a == b)` to negate the
+//! whole comparison.
 //!
 //! Three top-level entry points:
 //!
@@ -22,18 +26,33 @@
 //! - [`eval_value`] — parses a single expression and returns the raw
 //!   `serde_json::Value`.
 //!
-//! Type-coercion rules (intentionally conservative, documented for
-//! deterministic behaviour):
+//! ## Type coercion
 //!
-//! - Equality (`==` / `!=`) compares JSON values structurally. There is
-//!   no implicit string-to-int coercion: `1 == "1"` is `false`.
-//! - Order comparisons (`<`, `<=`, `>`, `>=`) require both operands to
-//!   be numbers; comparing a string with a number raises an error.
-//! - Truthiness (used by `!`, `&&`, `||`, and `eval_bool`) follows JSON
-//!   conventions: `false`, `null`, `0`, `""`, `[]`, `{}` are falsy;
-//!   everything else is truthy.
-//! - Identifier chains return `null` for missing scope keys with a
-//!   clear error message ("unknown identifier 'foo' in 'inputs'").
+//! Intentionally conservative; documented here so workflow authors get
+//! deterministic behaviour:
+//!
+//! - **Equality (`==` / `!=`)** compares JSON values structurally. There
+//!   is no implicit string-to-int coercion: `1 == "1"` is `false`.
+//! - **Order comparisons (`<`, `<=`, `>`, `>=`)** require both operands
+//!   to be numbers; comparing a string with a number raises an error.
+//! - **Truthiness** (used by `!`, `&&`, `||`, and `eval_bool`) follows
+//!   JSON conventions: `false`, `null`, `0`, `""`, `[]`, `{}` are
+//!   falsy; everything else is truthy.
+//! - **`!` precedence**: `!` binds tighter than comparison, so
+//!   `!a == b` parses as `(!a) == b`. Use `!(a == b)` for the
+//!   comparison-then-negate form.
+//! - **`&&` / `||` always return `Value::Bool`** — this differs from
+//!   JS/Python, which return the chosen *operand* value. We coerce the
+//!   result to `Bool(truthy(...))` for both operators, so chaining
+//!   like `${{ inputs.name || "default" }}` does **not** fall through
+//!   to the right-hand string. Use a `${{ when: ... }}` or an explicit
+//!   conditional in the workflow instead.
+//!
+//!   Example: `"x" || "y"` evaluates to `Bool(true)`, not the string
+//!   `"y"`; `1 && 2` evaluates to `Bool(true)`, not `Bool(false)`
+//!   (both operands are truthy) and not `2`.
+//! - **Identifier chains** return a clear error message for missing
+//!   scope keys ("unknown identifier 'foo' in 'inputs'").
 
 use std::collections::BTreeMap;
 
@@ -41,6 +60,29 @@ use serde_json::Value;
 
 use crate::def::StepResult;
 use crate::error::{Result, WorkflowError};
+
+/// Compute a 1-based `(line, col)` for a byte offset into `src`.
+///
+/// Lines are split on `\n`; columns are 1-based char counts within the
+/// current line. The returned `col` is char-based, not byte-based, so
+/// multi-byte characters do not skew the column. Used by error
+/// reporters in this module to emit `at line {l}, col {c} (byte {p})`
+/// messages alongside the byte offset.
+fn line_col(src: &str, pos: usize) -> (usize, usize) {
+    // Clamp pos so a buggy caller can't panic the slicing below.
+    let pos = pos.min(src.len());
+    let prefix = &src[..pos];
+    let mut line = 1usize;
+    let mut last_newline = 0usize;
+    for (idx, b) in prefix.bytes().enumerate() {
+        if b == b'\n' {
+            line += 1;
+            last_newline = idx + 1;
+        }
+    }
+    let col = src[last_newline..pos].chars().count() + 1;
+    (line, col)
+}
 
 /// The four scopes available to expressions.
 pub struct ExprContext<'a> {
@@ -87,8 +129,9 @@ pub fn eval_string(template: &str, ctx: &ExprContext) -> Result<String> {
             // Find the matching `}}`.
             let start = i + 3;
             let Some(end_offset) = find_close(&bytes[start..]) else {
+                let (line, col) = line_col(template, i);
                 return Err(WorkflowError::expression(format!(
-                    "unclosed '${{{{' in template starting at byte {i}"
+                    "unclosed '${{{{' in template starting at line {line}, col {col} (byte {i})"
                 )));
             };
             let end = start + end_offset;
@@ -99,14 +142,11 @@ pub fn eval_string(template: &str, ctx: &ExprContext) -> Result<String> {
             out.push_str(&render_value(&value));
             i = end + 2; // skip past `}}`
         } else {
-            // Append a single byte. We rely on the source being valid
-            // UTF-8 and step over multi-byte characters byte-wise — the
-            // re-assembly into `String` is character-correct because
-            // we only branch on the ASCII bytes `${{`.
-            // SAFETY: we are pushing valid UTF-8 bytes from a known
-            // valid `&str`; using the char form keeps `out` valid UTF-8.
-            //
-            // We use `char` decoding to avoid unsafe.
+            // Append a single character. We branch on raw ASCII bytes
+            // (`${{`) for speed, then fall through to UTF-8 char
+            // decoding here so that multi-byte characters are appended
+            // atomically. Using `chars().next()` keeps `out` valid
+            // UTF-8 without needing `unsafe` byte-level pushing.
             if let Some(ch) = template[i..].chars().next() {
                 out.push(ch);
                 i += ch.len_utf8();
@@ -120,6 +160,14 @@ pub fn eval_string(template: &str, ctx: &ExprContext) -> Result<String> {
 
 /// Find the byte offset of the matching `}}` close in `tail`, ignoring
 /// `}}` inside string literals.
+///
+/// Inside a string literal a backslash (`\\`) escapes the next byte —
+/// in particular `\"` does *not* close a `"`-delimited string, and
+/// `\'` does not close a `'`-delimited one. Without this, the
+/// expression `${{ "a\"b" }}` would be reported as unclosed because
+/// the scanner would see the embedded `\"` as a string close, treat
+/// the rest as out-of-string code, and never find a `}}` while still
+/// inside the (re-entered) string.
 fn find_close(tail: &[u8]) -> Option<usize> {
     let mut i = 0;
     let mut in_string: Option<u8> = None; // delimiter byte if inside a string
@@ -127,10 +175,18 @@ fn find_close(tail: &[u8]) -> Option<usize> {
         let b = tail[i];
         match in_string {
             Some(delim) => {
-                if b == delim {
+                if b == b'\\' {
+                    // Skip the escape byte plus the next byte. If the
+                    // backslash is the last byte, advance once and let
+                    // the loop terminate naturally (the string is
+                    // unterminated; the parser will report it later).
+                    i += 2;
+                } else if b == delim {
                     in_string = None;
+                    i += 1;
+                } else {
+                    i += 1;
                 }
-                i += 1;
             }
             None => {
                 if b == b'"' || b == b'\'' {
@@ -174,10 +230,11 @@ pub fn eval_value(expr: &str, ctx: &ExprContext) -> Result<Value> {
     let value = parser.parse_or()?;
     parser.skip_ws();
     if !parser.is_eof() {
+        let (line, col) = line_col(expr, parser.pos);
         return Err(WorkflowError::expression(format!(
-            "unexpected trailing characters at byte {}: '{}'",
-            parser.pos,
-            parser.tail()
+            "unexpected trailing characters at line {line}, col {col} (byte {pos}): '{tail}'",
+            pos = parser.pos,
+            tail = parser.tail(),
         )));
     }
     evaluate(value, ctx)
@@ -289,13 +346,13 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
-    /// `and_expr := not_expr ( "&&" not_expr )*`
+    /// `and_expr := comparison ( "&&" comparison )*`
     fn parse_and(&mut self) -> Result<Node> {
-        let mut left = self.parse_not()?;
+        let mut left = self.parse_comparison()?;
         loop {
             self.skip_ws();
             if self.eat("&&") {
-                let right = self.parse_not()?;
+                let right = self.parse_comparison()?;
                 left = Node::BinOp(Op::And, Box::new(left), Box::new(right));
             } else {
                 break;
@@ -304,21 +361,31 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
-    /// `not_expr := "!" not_expr | comparison`
-    fn parse_not(&mut self) -> Result<Node> {
+    /// `unary := "!" unary | primary`
+    ///
+    /// `!` binds tighter than comparison, so `!a == b` parses as
+    /// `(!a) == b`. This is the canonical unary-vs-binary precedence:
+    /// the unary prefix is consumed by `parse_unary`, and the binary
+    /// comparison operators are consumed at the next level up
+    /// (`parse_comparison`), which calls `parse_unary` for both
+    /// operands. Use `!(a == b)` explicitly to negate the whole
+    /// comparison.
+    ///
+    /// Stacked unary (`!!a`) is supported via the recursive call.
+    fn parse_unary(&mut self) -> Result<Node> {
         self.skip_ws();
         // Be careful: `!=` starts with `!` too.
         if self.tail().starts_with('!') && !self.tail().starts_with("!=") {
             self.pos += 1;
-            let inner = self.parse_not()?;
+            let inner = self.parse_unary()?;
             return Ok(Node::Not(Box::new(inner)));
         }
-        self.parse_comparison()
+        self.parse_primary()
     }
 
-    /// `comparison := primary ( ( "==" | "!=" | "<=" | ">=" | "<" | ">" ) primary )?`
+    /// `comparison := unary ( ( "==" | "!=" | "<=" | ">=" | "<" | ">" ) unary )?`
     fn parse_comparison(&mut self) -> Result<Node> {
-        let left = self.parse_primary()?;
+        let left = self.parse_unary()?;
         self.skip_ws();
         let op = if self.eat("==") {
             Op::Eq
@@ -335,7 +402,7 @@ impl<'a> Parser<'a> {
         } else {
             return Ok(left);
         };
-        let right = self.parse_primary()?;
+        let right = self.parse_unary()?;
         Ok(Node::BinOp(op, Box::new(left), Box::new(right)))
     }
 
@@ -381,9 +448,10 @@ impl<'a> Parser<'a> {
             return Ok(Node::Path(segs));
         }
 
+        let (line, col) = line_col(self.src, self.pos);
         Err(WorkflowError::expression(format!(
-            "unexpected character '{c}' at byte {}",
-            self.pos
+            "unexpected character '{c}' at line {line}, col {col} (byte {pos})",
+            pos = self.pos,
         )))
     }
 
@@ -412,8 +480,9 @@ impl<'a> Parser<'a> {
         }
         let raw = &self.src[start..self.pos];
         if raw == "-" {
+            let (line, col) = line_col(self.src, start);
             return Err(WorkflowError::expression(format!(
-                "expected number after '-' at byte {start}"
+                "expected number after '-' at line {line}, col {col} (byte {start})"
             )));
         }
         // Try integer first, then float.
@@ -807,6 +876,57 @@ mod tests {
         assert!(!eval_bool("!1", &ctx).unwrap());
     }
 
+    /// `!` binds tighter than comparison: `!1 == 0` parses as
+    /// `(!1) == 0`. With no implicit number/bool coercion, `!1` is
+    /// `false` and `false == 0` is `false`.
+    #[test]
+    fn not_binds_tighter_than_comparison_literal_form() {
+        let (i, s, c, e) = ctx_with_inputs(Value::Null);
+        let ctx = make_ctx(&i, &s, &c, &e);
+        // (!1) == 0 -> false == 0 -> false (no coercion)
+        assert!(!eval_bool("!1 == 0", &ctx).unwrap());
+    }
+
+    /// `!a == b` parses as `(!a) == b`. With `a=true, b=false`:
+    /// `(!true) == false` -> `false == false` -> `true`.
+    #[test]
+    fn not_binds_tighter_than_comparison_via_inputs() {
+        let inputs = json!({"a": true, "b": false});
+        let s = BTreeMap::new();
+        let c = Value::Null;
+        let e = BTreeMap::new();
+        let ctx = make_ctx(&inputs, &s, &c, &e);
+        assert!(eval_bool("!inputs.a == inputs.b", &ctx).unwrap());
+    }
+
+    /// Distinguishing case where the two parses would actually
+    /// disagree. With `a=0, b=false`:
+    ///   - correct `(!a) == b` -> `(!0) == false` -> `true == false`
+    ///     -> `false` (no Number/Bool coercion).
+    ///   - buggy   `!(a == b)` -> `!(0 == false)` -> `!false` -> `true`.
+    #[test]
+    fn not_precedence_disambiguating_case() {
+        let inputs = json!({"a": 0, "b": false});
+        let s = BTreeMap::new();
+        let c = Value::Null;
+        let e = BTreeMap::new();
+        let ctx = make_ctx(&inputs, &s, &c, &e);
+        assert!(!eval_bool("!inputs.a == inputs.b", &ctx).unwrap());
+    }
+
+    /// Explicit `!(a == b)` still works: parens override the unary
+    /// prefix and let `!` apply to the whole comparison's truthiness.
+    #[test]
+    fn not_with_parens_negates_whole_comparison() {
+        let inputs = json!({"a": true, "b": false});
+        let s = BTreeMap::new();
+        let c = Value::Null;
+        let e = BTreeMap::new();
+        let ctx = make_ctx(&inputs, &s, &c, &e);
+        // !(a == b) -> !(true == false) -> !false -> true
+        assert!(eval_bool("!(inputs.a == inputs.b)", &ctx).unwrap());
+    }
+
     #[test]
     fn inputs_path_resolution() {
         let inputs = json!({
@@ -954,6 +1074,23 @@ mod tests {
         assert!(err.to_string().contains("unclosed"));
     }
 
+    /// `find_close` must skip `\"` inside a `"`-delimited string
+    /// literal, otherwise the embedded escape would be mistaken for a
+    /// string close and the `}}` after the literal would never be
+    /// found.
+    #[test]
+    fn template_with_escaped_quote_in_string_literal() {
+        let inputs = Value::Null;
+        let s = BTreeMap::new();
+        let c = Value::Null;
+        let e = BTreeMap::new();
+        let ctx = make_ctx(&inputs, &s, &c, &e);
+        // Source: `${{ "a\"b" }}` -> the parsed string literal is
+        // `a"b`, rendered bare into the output.
+        let out = eval_string(r#"${{ "a\"b" }}"#, &ctx).unwrap();
+        assert_eq!(out, "a\"b");
+    }
+
     #[test]
     fn truthiness_rules() {
         let (i, s, c, e) = ctx_with_inputs(json!({"empty_str": "", "zero": 0, "arr": []}));
@@ -978,5 +1115,28 @@ mod tests {
         let (i, s, c, e) = ctx_with_inputs(Value::Null);
         let ctx = make_ctx(&i, &s, &c, &e);
         assert!(eval_bool("(1 == 1) && (2 < 3)", &ctx).unwrap());
+    }
+
+    /// Errors include 1-based line/col alongside the byte offset, so
+    /// users can locate the offending character in multi-line YAML
+    /// without counting bytes.
+    #[test]
+    fn error_messages_include_line_col() {
+        let (i, s, c, e) = ctx_with_inputs(Value::Null);
+        let ctx = make_ctx(&i, &s, &c, &e);
+        let err = eval_value("@", &ctx).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("line 1"), "{msg}");
+        assert!(msg.contains("col 1"), "{msg}");
+        assert!(msg.contains("byte 0"), "{msg}");
+    }
+
+    #[test]
+    fn line_col_helper_handles_multiline() {
+        // Three lines, byte indices: a=0, b=1, \n=2, c=3, d=4, \n=5,
+        // e=6, f=7, g=8. So pos 7 -> 'f', which sits at line 3 col 2.
+        let src = "ab\ncd\nefg";
+        let (line, col) = line_col(src, 7);
+        assert_eq!((line, col), (3, 2));
     }
 }

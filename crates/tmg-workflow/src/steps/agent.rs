@@ -16,23 +16,25 @@
 //! proper per-spawn override.
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
 use tmg_agents::{AgentKind, AgentType, SubagentConfig, SubagentManager};
+use tmg_sandbox::SandboxContext;
 
 use crate::def::StepResult;
 use crate::error::{Result, WorkflowError};
 use crate::expr;
+use crate::steps::path_util::validate_path;
 
 /// Inputs for [`execute`], grouped to satisfy clippy's
 /// `too_many_arguments` lint and to make the engine's call site
 /// self-documenting.
 pub(crate) struct AgentStepArgs<'a> {
     pub subagent_manager: &'a Arc<Mutex<SubagentManager>>,
-    pub workspace: &'a Path,
+    pub sandbox: &'a SandboxContext,
     pub step_id: &'a str,
     pub subagent_name: &'a str,
     pub prompt_template: &'a str,
@@ -45,7 +47,7 @@ pub(crate) struct AgentStepArgs<'a> {
 pub(crate) async fn execute(args: AgentStepArgs<'_>) -> Result<StepResult> {
     let AgentStepArgs {
         subagent_manager,
-        workspace,
+        sandbox,
         step_id,
         subagent_name,
         prompt_template,
@@ -60,10 +62,26 @@ pub(crate) async fn execute(args: AgentStepArgs<'_>) -> Result<StepResult> {
     // rather than prepend so the user-supplied prompt remains the
     // primary instruction; the file block's heading makes the
     // distinction unambiguous to the model.
+    //
+    // Each entry is run through `expr::eval_string` so templates work
+    // consistently with `prompt`/`command`/`path`/`content`. The
+    // resolved relative path is then traversal-checked
+    // ([`validate_path`]) and run through the sandbox access check
+    // before being read — the sandbox boundary applies to reads, not
+    // just writes, so a `.tsumugi` config-only sandbox cannot be
+    // tricked into exfiltrating arbitrary files via `inject_files`.
     if !inject_files.is_empty() {
         let mut block = String::from("\n\n# Injected context\n");
-        for rel in inject_files {
-            let path = workspace.join(rel);
+        for rel_template in inject_files {
+            let rel = expr::eval_string(rel_template, ctx)?;
+            let rel_path = PathBuf::from(&rel);
+            validate_path(&rel_path)?;
+            let path = if rel_path.is_absolute() {
+                rel_path.clone()
+            } else {
+                sandbox.workspace().join(&rel_path)
+            };
+            sandbox.check_path_access(&path)?;
             let content = tokio::fs::read_to_string(&path).await.map_err(|e| {
                 WorkflowError::io(format!("reading inject_file {}", path.display()), e)
             })?;

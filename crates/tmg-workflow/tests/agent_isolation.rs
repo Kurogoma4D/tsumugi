@@ -1,9 +1,16 @@
 //! Integration test for the agent step's context-isolation invariant
 //! (SPEC §8.7).
 //!
-//! We cannot easily intercept the conversation history of a spawned
-//! subagent without forking `tmg_agents`, so this test exercises the
-//! invariant *structurally*:
+//! Two complementary tests live in this directory:
+//!
+//! - this file: structural smoke test that exercises the engine →
+//!   manager → runner wiring against an unreachable LLM endpoint.
+//! - `agent_two_step_isolation.rs`: behavioural test against an
+//!   in-process mock SSE server that captures the chat-completions
+//!   payloads and asserts the second step's `messages` array contains
+//!   exactly one user-role turn.
+//!
+//! Together they check that:
 //!
 //! 1. Each agent step calls `SubagentManager::spawn_with_notify`,
 //!    which internally constructs a fresh `SubagentRunner` (see
@@ -12,12 +19,13 @@
 //!    for the agent kind — there is no API surface that shares
 //!    history across spawns. The freshness invariant is therefore
 //!    guaranteed by construction.
-//! 2. We verify the engine actually goes through this code path by
-//!    running an agent step against an unreachable LLM endpoint and
-//!    confirming the failure surfaces as
-//!    `WorkflowError::Agent(AgentError::Llm(...))`. This exercises the
-//!    full wiring (engine → manager → runner) and catches regressions
-//!    that would otherwise smuggle history across spawns.
+//! 2. The engine actually goes through this code path. A failing
+//!    agent step against an unreachable endpoint surfaces as
+//!    `WorkflowError::StepFailed { step_id: "a", .. }` (the engine
+//!    re-tags every step-handler error with the current `step_id` so
+//!    the returned error and the `StepFailed` progress event agree).
+//!    The error message keeps the original `agent error: ...` /
+//!    `llm error: ...` chain for diagnostics.
 
 #![expect(clippy::unwrap_used, reason = "test assertions")]
 #![expect(clippy::panic, reason = "test assertions")]
@@ -64,9 +72,11 @@ async fn agent_step_routes_through_subagent_manager() {
         serde_json::Value::Null,
     );
 
-    // Single agent step against an unreachable endpoint. The error
-    // must surface as a `WorkflowError::Agent` (not `Sandbox`, not
-    // `Expression`), demonstrating the engine-to-manager wiring.
+    // Single agent step against an unreachable endpoint. The engine
+    // re-tags step-handler errors with the current `step_id`, so the
+    // failure must surface as `StepFailed { step_id: "a", .. }` with
+    // an "agent error: ..." / "llm error: ..." message threaded
+    // through, demonstrating the engine → manager wiring.
     let yaml = r#"
 id: agent_smoke
 steps:
@@ -82,11 +92,21 @@ steps:
     let Err(err) = result else {
         panic!("expected error when LLM endpoint is unreachable");
     };
-    // The exact LLM error variant depends on platform networking, but
-    // it must be propagated via the agent path.
+    // The engine re-tags every step-handler error with the current
+    // step id, so the surfaced error is `StepFailed { step_id: "a",
+    // .. }`. The original cause (an `AgentError::Llm`) is preserved
+    // in the message string.
+    let WorkflowError::StepFailed {
+        ref step_id,
+        ref message,
+    } = err
+    else {
+        panic!("expected WorkflowError::StepFailed, got {err:?}");
+    };
+    assert_eq!(step_id, "a");
     assert!(
-        matches!(err, WorkflowError::Agent(_)),
-        "expected WorkflowError::Agent, got {err:?}"
+        message.contains("agent error") || message.contains("llm error"),
+        "expected agent/llm cause in message, got: {message}"
     );
 }
 
