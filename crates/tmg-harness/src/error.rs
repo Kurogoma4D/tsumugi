@@ -119,6 +119,17 @@ pub enum HarnessError {
         /// The id that was looked up.
         feature_id: String,
     },
+
+    /// A session-end operation was invoked while no session was active.
+    ///
+    /// Currently raised by
+    /// [`RunRunner::end_session_with_rotation`](crate::runner::RunRunner::end_session_with_rotation)
+    /// to refuse rotating an empty runner: rotating without an
+    /// active session would create a `session_count` hole (the
+    /// successor would be persisted with no predecessor on disk),
+    /// so we bail out and leave the runner untouched.
+    #[error("end_session_with_rotation called without an active session")]
+    NoActiveSession,
 }
 
 impl HarnessError {

@@ -39,7 +39,8 @@ pub mod tools;
 
 pub use artifacts::{
     Feature, FeatureList, Features, FeaturesSummary, FeaturesSummaryEntry, InitScript,
-    InitScriptError, InitScriptOutput, ProgressLog, SessionLog, SessionLogEntry,
+    InitScriptError, InitScriptOutput, ProgressLog, SUMMARY_AGGREGATE_FILENAME, SessionLog,
+    SessionLogEntry, SessionSummaryAggregate, SessionSummaryEntry,
 };
 pub use error::HarnessError;
 pub use escalation::{
@@ -47,7 +48,11 @@ pub use escalation::{
     EscalationEvaluator, EscalationSignal, EscalatorLauncher, SubagentEscalatorLauncher,
 };
 pub use run::{Run, RunId, RunScope, RunStatus, RunSummary};
-pub use runner::{DEFAULT_BOOTSTRAP_MAX_TOKENS, RunProgressEvent, RunProgressReceiver, RunRunner};
+pub use runner::{
+    DEFAULT_BOOTSTRAP_MAX_TOKENS, DEFAULT_CONTEXT_FORCE_ROTATE_THRESHOLD,
+    DEFAULT_SESSION_LOG_COMPRESS_AFTER, DEFAULT_SESSION_TIMEOUT, RunProgressEvent,
+    RunProgressReceiver, RunRunner,
+};
 pub use session::{Session, SessionEndTrigger, SessionHandle};
 pub use sink::HarnessStreamSink;
 pub use state::{SessionState, TurnSummary};

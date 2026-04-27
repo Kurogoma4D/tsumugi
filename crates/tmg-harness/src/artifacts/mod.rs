@@ -22,4 +22,7 @@ pub mod session_log;
 pub use features::{Feature, FeatureList, Features, FeaturesSummary, FeaturesSummaryEntry};
 pub use init_script::{InitScript, InitScriptError, InitScriptOutput};
 pub use progress::ProgressLog;
-pub use session_log::{SessionLog, SessionLogEntry};
+pub use session_log::{
+    SUMMARY_AGGREGATE_FILENAME, SessionLog, SessionLogEntry, SessionSummaryAggregate,
+    SessionSummaryEntry,
+};

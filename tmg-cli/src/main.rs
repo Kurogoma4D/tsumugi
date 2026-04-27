@@ -279,12 +279,52 @@ fn run_tui(
         let mut runner = RunRunner::new(run, Arc::clone(&store));
         runner.set_bootstrap_max_tokens(harness_config.bootstrap_max_tokens);
         runner.set_default_session_timeout(harness_config.default_session_timeout);
+        runner.set_session_log_compress_after(harness_config.session_log_compress_after);
+        // The runner stores the threshold as `f32` (matching the
+        // SessionState observers); narrow once at the boundary.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "threshold is in (0.0, 1.0]; precision loss bounded by f32 epsilon, acceptable for a coarse threshold check."
+        )]
+        runner.set_context_force_rotate_threshold(
+            harness_config.context_force_rotate_threshold as f32,
+        );
         // One-time warning when the user's `[sandbox] mode` is stricter
         // than the harnessed `init.sh` execution path honours; see
         // `harness_init::warn_if_sandbox_mode_mismatch` for details.
         if matches!(runner.scope(), tmg_harness::RunScope::Harnessed { .. }) {
             harness_init::warn_if_sandbox_mode_mismatch(sandbox_config);
         }
+
+        // Per-session timeout channel: the watchdog feeds
+        // `SessionEndTrigger::Timeout` here. Live rotation hand-off
+        // is wired in #46; until then we spawn a loud-fallback
+        // consumer that emits a `tracing::warn!` whenever the
+        // deadline elapses so operators can see the timeout fired
+        // even though the rotation is not yet executed.
+        let (timeout_tx, mut timeout_rx) =
+            tokio::sync::mpsc::channel::<tmg_harness::SessionEndTrigger>(4);
+        // Register the (sender, duration) pair so EVERY future
+        // `begin_session` (including the implicit one inside
+        // `end_session_with_rotation`) re-arms the watchdog. Without
+        // this, sessions after the first rotation would have no
+        // wall-clock protection.
+        let session_timeout = runner.default_session_timeout();
+        if matches!(runner.scope(), tmg_harness::RunScope::Harnessed { .. }) {
+            runner.set_session_timeout_config(Some((timeout_tx, session_timeout)));
+        }
+        // Loud-fallback consumer: drain the receiver and warn on
+        // every Timeout trigger. Replace this spawn with the real
+        // rotation hand-off once #46 lands.
+        tokio::spawn(async move {
+            while let Some(trigger) = timeout_rx.recv().await {
+                tracing::warn!(
+                    ?trigger,
+                    "session timeout fired but live hand-off is not yet wired (issue #46)",
+                );
+            }
+        });
+
         let session_handle = runner
             .begin_session()
             .context("beginning harness session")?;
@@ -550,9 +590,47 @@ fn install_turn_observer(
                 user_message,
             };
 
-            // Step 3: feed the summary into the runner.
+            // Step 3: feed the summary into the runner and check
+            // whether the SPEC §2.3 force-rotate threshold has been
+            // exceeded. The actual `clear_history` / `begin_session`
+            // sequence is owned by the higher-level TUI loop because
+            // it requires mutable access to the live `AgentLoop`; we
+            // only flip the rotation flag here so the consumer can
+            // observe it on the next iteration.
             let mut guard = runner.lock().await;
             guard.after_turn(&harness_summary, max_context_tokens);
+
+            let usage = if max_context_tokens == 0 {
+                0.0
+            } else {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "usage is clamped to [0.0, 1.0] before consumption"
+                )]
+                let raw = tokens_used as f64 / max_context_tokens as f64;
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "ratio clamped to [0.0, 1.0] which fits in f32"
+                )]
+                {
+                    raw.clamp(0.0, 1.0) as f32
+                }
+            };
+            // Side-effect first: stamp the active session's
+            // `context_usage_peak`. Then the pure check decides
+            // whether to fire the rotation banner.
+            guard.record_context_usage(usage);
+            if guard.should_force_rotate(usage) {
+                // Emit the SessionEnded event channel-side so a
+                // downstream consumer wakes; the live rotation
+                // (clear_history + begin_session) is wired by the
+                // CLI / TUI follow-up (#46) which owns the agent.
+                tracing::warn!(
+                    usage,
+                    "context usage exceeded force-rotate threshold; \
+                     rotation must be driven by the TUI consumer",
+                );
+            }
         });
     });
     agent.set_turn_observer(Some(observer));
