@@ -11,6 +11,7 @@
 //! 5. Built-in defaults
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tmg_llm::ToolCallingMode;
@@ -112,6 +113,78 @@ impl PartialSkillsConfig {
             compat_claude: self.compat_claude.unwrap_or(true),
             compat_agent_skills: self.compat_agent_skills.unwrap_or(true),
         }
+    }
+}
+
+/// Partial workflow config used for deserialization from TOML.
+///
+/// Mirrors [`tmg_workflow::WorkflowConfig`] but stores the timeout as
+/// an optional string so partial layers don't bake in a default they
+/// can never opt out of. Unknown fields are rejected to surface typos
+/// in `tsumugi.toml` early.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialWorkflowConfig {
+    #[serde(default)]
+    pub discovery_paths: Vec<PathBuf>,
+    pub default_shell_timeout: Option<u64>,
+    pub default_agent_model: Option<String>,
+    pub max_parallel_agents: Option<u32>,
+}
+
+impl PartialWorkflowConfig {
+    fn merge_from(&mut self, other: &Self) {
+        if !other.discovery_paths.is_empty() {
+            self.discovery_paths.clone_from(&other.discovery_paths);
+        }
+        if other.default_shell_timeout.is_some() {
+            self.default_shell_timeout = other.default_shell_timeout;
+        }
+        if other.default_agent_model.is_some() {
+            self.default_agent_model
+                .clone_from(&other.default_agent_model);
+        }
+        if other.max_parallel_agents.is_some() {
+            self.max_parallel_agents = other.max_parallel_agents;
+        }
+    }
+
+    fn into_final(self) -> Result<tmg_workflow::WorkflowConfig, ConfigError> {
+        // Construct, then delegate range checks to the canonical
+        // `WorkflowConfig::validate()` so the rules are defined in a
+        // single place. Any validation failure is mapped to a
+        // structured `ConfigError::InvalidValue` for the CLI's error
+        // reporting.
+        let timeout_secs = self.default_shell_timeout.unwrap_or(30);
+        let max_parallel = self.max_parallel_agents.unwrap_or(2);
+        let cfg = tmg_workflow::WorkflowConfig {
+            discovery_paths: self.discovery_paths,
+            default_shell_timeout: Duration::from_secs(timeout_secs),
+            default_agent_model: self.default_agent_model.unwrap_or_default(),
+            max_parallel_agents: max_parallel,
+        };
+        cfg.validate().map_err(|e| {
+            // The validate() error pinpoints the offending knob in
+            // its message; surface that wrapped as InvalidValue so
+            // the CLI reports it like other config issues.
+            let (field, value) = if e.to_string().contains("default_shell_timeout") {
+                (
+                    "workflow.default_shell_timeout".to_owned(),
+                    timeout_secs.to_string(),
+                )
+            } else {
+                (
+                    "workflow.max_parallel_agents".to_owned(),
+                    max_parallel.to_string(),
+                )
+            };
+            ConfigError::InvalidValue {
+                field,
+                value,
+                reason: "must be a positive integer (>= 1)".to_owned(),
+            }
+        })?;
+        Ok(cfg)
     }
 }
 
@@ -474,6 +547,8 @@ struct PartialTsumugiConfig {
     pub skills: PartialSkillsConfig,
     #[serde(default)]
     pub harness: PartialHarnessConfig,
+    #[serde(default)]
+    pub workflow: PartialWorkflowConfig,
 }
 
 impl PartialTsumugiConfig {
@@ -485,6 +560,7 @@ impl PartialTsumugiConfig {
         self.tui.merge_from(&other.tui);
         self.skills.merge_from(&other.skills);
         self.harness.merge_from(&other.harness);
+        self.workflow.merge_from(&other.workflow);
     }
 
     /// Apply environment variable overrides (`TMG_*` prefix).
@@ -715,6 +791,39 @@ impl PartialTsumugiConfig {
             })?;
             self.harness.escalation.repetition_file_edit_threshold = Some(n);
         }
+        if let Some(v) = env_fn("TMG_WORKFLOW_DEFAULT_SHELL_TIMEOUT") {
+            let n = v.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
+                field: "TMG_WORKFLOW_DEFAULT_SHELL_TIMEOUT".to_owned(),
+                value: v.clone(),
+                reason: "must be a non-negative integer".to_owned(),
+            })?;
+            if n == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "TMG_WORKFLOW_DEFAULT_SHELL_TIMEOUT".to_owned(),
+                    value: v,
+                    reason: "must be a positive integer (>= 1)".to_owned(),
+                });
+            }
+            self.workflow.default_shell_timeout = Some(n);
+        }
+        if let Some(v) = env_fn("TMG_WORKFLOW_DEFAULT_AGENT_MODEL") {
+            self.workflow.default_agent_model = Some(v);
+        }
+        if let Some(v) = env_fn("TMG_WORKFLOW_MAX_PARALLEL_AGENTS") {
+            let n = v.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
+                field: "TMG_WORKFLOW_MAX_PARALLEL_AGENTS".to_owned(),
+                value: v.clone(),
+                reason: "must be a non-negative integer".to_owned(),
+            })?;
+            if n == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "TMG_WORKFLOW_MAX_PARALLEL_AGENTS".to_owned(),
+                    value: v,
+                    reason: "must be a positive integer (>= 1)".to_owned(),
+                });
+            }
+            self.workflow.max_parallel_agents = Some(n);
+        }
         Ok(())
     }
 
@@ -726,6 +835,7 @@ impl PartialTsumugiConfig {
             tui: self.tui,
             skills: self.skills.into_final(),
             harness: self.harness.into_final()?,
+            workflow: self.workflow.into_final()?,
         })
     }
 }
@@ -1010,6 +1120,10 @@ pub struct TsumugiConfig {
     /// Harness settings (run persistence and resume policy).
     #[serde(default)]
     pub harness: HarnessConfig,
+
+    /// Workflow runtime settings (SPEC §8 / issue #39).
+    #[serde(default)]
+    pub workflow: tmg_workflow::WorkflowConfig,
 }
 
 // ---------------------------------------------------------------------------

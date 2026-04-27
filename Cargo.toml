@@ -9,6 +9,7 @@ members = [
     "crates/tmg-sandbox",
     "crates/tmg-tui",
     "crates/tmg-harness",
+    "crates/tmg-workflow",
     "tmg-cli",
 ]
 
@@ -88,6 +89,7 @@ tmg-agents = { path = "crates/tmg-agents" }
 tmg-sandbox = { path = "crates/tmg-sandbox" }
 tmg-tui = { path = "crates/tmg-tui" }
 tmg-harness = { path = "crates/tmg-harness" }
+tmg-workflow = { path = "crates/tmg-workflow" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
