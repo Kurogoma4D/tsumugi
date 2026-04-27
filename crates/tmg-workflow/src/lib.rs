@@ -32,6 +32,7 @@ pub mod long_running;
 pub mod parse;
 pub mod progress;
 pub(crate) mod steps;
+pub mod templates;
 pub mod tools;
 
 pub use config::WorkflowConfig;

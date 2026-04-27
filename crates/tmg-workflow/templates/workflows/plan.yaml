@@ -1,0 +1,53 @@
+id: plan
+description: "Explore the codebase, draft a plan, and audit it in a loop"
+mode: normal
+
+inputs:
+  requirements:
+    type: string
+    required: true
+    description: "What the user wants to plan"
+  max_audit_iterations:
+    type: integer
+    default: 3
+    description: "Cap on plan-audit revisions"
+
+steps:
+  - id: explore
+    type: agent
+    subagent: explore
+    prompt: |
+      Survey the codebase relevant to the following requirement and
+      summarise the salient files / modules / public types in a brief
+      structured report.
+
+      Requirement: ${{ inputs.requirements }}
+
+  - id: draft
+    type: agent
+    subagent: plan
+    prompt: |
+      Draft an implementation plan based on this exploration.
+
+      Requirement: ${{ inputs.requirements }}
+
+      Exploration report:
+      ${{ steps.explore.output }}
+
+  - id: audit_loop
+    type: loop
+    max_iterations: 3
+    until: "steps.draft.output != ''"
+    steps:
+      - id: audit
+        type: agent
+        subagent: plan
+        prompt: |
+          Audit the following plan for completeness and correctness.
+          If issues remain, list them; if it is good, reply "OK".
+
+          Plan:
+          ${{ steps.draft.output }}
+
+outputs:
+  plan: "${{ steps.draft.output }}"

@@ -1,0 +1,43 @@
+id: review
+description: "Review-then-fix loop (SPEC §8.4 review_loop pattern)"
+mode: normal
+
+inputs:
+  target:
+    type: string
+    required: true
+    description: "What to review (path, feature id, or PR description)"
+  max_iterations:
+    type: integer
+    default: 3
+
+steps:
+  - id: verify
+    type: shell
+    command: "cargo test --workspace"
+    timeout: "10m"
+
+  - id: fix_errors
+    type: agent
+    subagent: worker
+    prompt: |
+      The verification step produced this output. If exit_code is
+      non-zero, fix the failures; otherwise reply "OK" and make no
+      changes.
+
+      Target: ${{ inputs.target }}
+      stdout:
+      ${{ steps.verify.stdout }}
+      stderr:
+      ${{ steps.verify.stderr }}
+
+  - id: review_loop
+    type: loop
+    max_iterations: 3
+    until: "steps.verify.exit_code == 0"
+    steps:
+      - ref: verify
+      - ref: fix_errors
+
+outputs:
+  passed: "${{ steps.verify.exit_code }}"

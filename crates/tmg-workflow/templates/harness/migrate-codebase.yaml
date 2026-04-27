@@ -1,0 +1,61 @@
+id: migrate_codebase
+description: "Migrate a codebase file-by-file driven by features.json"
+mode: long_running
+
+inputs:
+  migration_description:
+    type: string
+    required: true
+    description: "What to migrate (e.g. 'Vue 2 -> Vue 3')"
+
+init:
+  artifacts:
+    progress_file: ".tsumugi/runs/RUNID/progress.md"
+    features_file: ".tsumugi/runs/RUNID/features.json"
+  steps:
+    - id: enumerate_targets
+      type: agent
+      subagent: initializer
+      prompt: |
+        Walk the codebase and produce features.json where each feature
+        is one file (or one module) to migrate.  Acceptance criteria
+        per feature: the file builds and tests pass.
+
+        Migration: ${{ inputs.migration_description }}
+
+iterate:
+  bootstrap:
+    - run: "git status --porcelain"
+    - read: "${{ artifacts.progress_file }}"
+  steps:
+    - id: migrate_one
+      type: agent
+      subagent: worker
+      prompt: |
+        Pick the next failing feature (one file or module) and migrate
+        it.  Keep the diff small so the verify step can localise
+        regressions.
+
+        Migration: ${{ inputs.migration_description }}
+
+        Bootstrap context:
+        ${{ inputs.bootstrap_context }}
+
+    - id: verify
+      type: shell
+      command: "cargo test --workspace"
+      timeout: "15m"
+
+    - id: qa
+      type: agent
+      subagent: qa
+      prompt: |
+        Inspect features.json: mark the just-migrated file as passing
+        if its tests are green.
+
+        Verify output:
+        ${{ steps.verify.stdout }}
+
+  until: "artifact.features.all_passing"
+  max_sessions: 50
+  session_timeout: "30m"
