@@ -14,7 +14,9 @@ use tokio_util::sync::CancellationToken;
 
 use tmg_llm::LlmClient;
 
-use crate::builtins::registry_for_agent_kind;
+use crate::builtins::{
+    RunToolProvider, registry_for_agent_kind, registry_for_agent_kind_with_run_provider,
+};
 use crate::config::{AgentKind, SubagentConfig};
 use crate::error::AgentError;
 use crate::runner::SubagentRunner;
@@ -86,6 +88,17 @@ pub struct SubagentManager {
 
     /// Counter for generating unique subagent IDs.
     next_id: u64,
+
+    /// Optional source of Run-aware tools (e.g. `progress_append`,
+    /// `feature_list_*`).
+    ///
+    /// When set, harnessed-run subagents (`Initializer`, `Tester`,
+    /// `Qa`) get a registry that includes the Run-aware tools they
+    /// declare in [`AgentType::allowed_tools`](crate::config::AgentType::allowed_tools).
+    /// When unset, those names are silently dropped — the subagent
+    /// runs without those tools, which is the intended degraded
+    /// behaviour for Run-less code paths.
+    run_tool_provider: Option<Arc<dyn RunToolProvider>>,
 }
 
 impl SubagentManager {
@@ -107,7 +120,24 @@ impl SubagentManager {
             join_set: JoinSet::new(),
             instances: Arc::new(Mutex::new(BTreeMap::new())),
             next_id: 1,
+            run_tool_provider: None,
         }
+    }
+
+    /// Install (or replace) the [`RunToolProvider`] used for spawning
+    /// subagents that need Run-aware tools.
+    ///
+    /// Pass `None` to clear a previously-installed provider (e.g. when
+    /// the active run is finalised). Subsequent spawns will skip
+    /// Run-aware tool names just as if no provider had ever been set.
+    pub fn set_run_tool_provider(&mut self, provider: Option<Arc<dyn RunToolProvider>>) {
+        self.run_tool_provider = provider;
+    }
+
+    /// Borrow the currently-installed [`RunToolProvider`], if any.
+    #[must_use]
+    pub fn run_tool_provider(&self) -> Option<&Arc<dyn RunToolProvider>> {
+        self.run_tool_provider.as_ref()
     }
 
     /// Spawn a subagent and return its ID immediately.
@@ -186,9 +216,18 @@ impl SubagentManager {
         let task = config.task.clone();
         let cancel = self.parent_cancel.child_token();
         let instances = Arc::clone(&self.instances);
+        let run_tool_provider = self.run_tool_provider.clone();
 
         self.join_set.spawn(async move {
-            let registry = registry_for_agent_kind(&agent_kind);
+            // Build the subagent's tool registry. With a
+            // `RunToolProvider` installed, harnessed agents get
+            // Run-aware tools (`progress_append`, `feature_list_*`)
+            // registered as well; without one, those names are
+            // silently dropped.
+            let registry = match &run_tool_provider {
+                Some(provider) => registry_for_agent_kind_with_run_provider(&agent_kind, provider),
+                None => registry_for_agent_kind(&agent_kind),
+            };
             let mut runner = SubagentRunner::new(client, registry, &agent_kind, cancel);
 
             let result = runner.run(&task).await;

@@ -4,7 +4,8 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use clap::Parser;
 use tmg_harness::{
-    RunRunner, RunStore, RunSummary, SessionBootstrapTool, SessionEndTrigger, register_run_tools,
+    RunRunner, RunRunnerToolProvider, RunStore, RunSummary, SessionBootstrapTool,
+    SessionEndTrigger, register_run_tools,
 };
 use tmg_llm::ToolCallingMode;
 use tokio::sync::Mutex;
@@ -304,6 +305,19 @@ fn run_tui(
             endpoint,
             model,
         )));
+
+        // Wire the active `RunRunner` into the subagent manager so
+        // harnessed-run subagents (initializer / tester / qa) get
+        // their Run-aware tools (`progress_append`, `feature_list_*`)
+        // registered when they spawn. The provider's scope flag
+        // mirrors `register_run_tools` so the main agent and any
+        // subagent see the same scope-gated tool set.
+        let run_tool_provider: Arc<dyn tmg_agents::RunToolProvider> =
+            Arc::new(RunRunnerToolProvider::new(Arc::clone(&runner)).await);
+        subagent_manager
+            .lock()
+            .await
+            .set_run_tool_provider(Some(Arc::clone(&run_tool_provider)));
 
         // Create the tool registry: built-ins, then spawn_agent, then
         // the Run-scoped harness tools. `register_run_tools` is the

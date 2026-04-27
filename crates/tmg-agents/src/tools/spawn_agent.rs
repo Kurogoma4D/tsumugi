@@ -2,7 +2,8 @@
 //!
 //! Parameters:
 //! - `agent_type` (string, required): one of the built-in types
-//!   (`"explore"`, `"worker"`, `"plan"`) or the name of a custom agent
+//!   (`"explore"`, `"worker"`, `"plan"`, `"initializer"`, `"tester"`,
+//!   `"qa"`) or the name of a custom agent
 //! - `task` (string, required): the task description for the subagent
 //! - `background` (boolean, optional, default: `false`): whether to run
 //!   in the background
@@ -102,7 +103,10 @@ impl Tool for SpawnAgentTool {
         "Spawn a subagent to perform a task. Built-in types: \
          'explore' (read-only codebase exploration), \
          'worker' (full tool access), \
-         'plan' (read-only planning). \
+         'plan' (read-only planning), \
+         'initializer' (project bootstrap: features.json/init.sh/progress.md + initial commit), \
+         'tester' (smoke-test runner via shell_exec), \
+         'qa' (read-only acceptance-criteria QA; only agent that can mark features passing). \
          Custom agents defined in .tsumugi/agents/ are also available. \
          Set background=true to run asynchronously."
     }

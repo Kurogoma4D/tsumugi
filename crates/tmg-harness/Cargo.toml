@@ -16,6 +16,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 # Workspace crates
+tmg-agents = { workspace = true }
 tmg-core = { workspace = true }
 tmg-sandbox = { workspace = true }
 tmg-tools = { workspace = true }

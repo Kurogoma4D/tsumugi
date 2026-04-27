@@ -50,6 +50,6 @@ pub use store::{
 };
 pub use tools::{
     BootstrapPayload, FeatureListMarkPassingTool, FeatureListReadTool, InitScriptStatus,
-    ProgressAppendTool, SessionBootstrapTool, SessionSummarySaveTool, SmokeTestResult,
-    register_run_tools,
+    ProgressAppendTool, RunRunnerToolProvider, SessionBootstrapTool, SessionSummarySaveTool,
+    SmokeTestResult, register_run_tools,
 };
