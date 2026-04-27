@@ -20,8 +20,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
 use crate::error::HarnessError;
-use crate::session::Session;
+use crate::session::{Session, SessionEndTrigger};
 
 /// Persistent store for `session_NNN.json` records under one run.
 ///
@@ -131,6 +134,12 @@ impl SessionLog {
     /// from the highest index downwards.
     ///
     /// Returns `Ok(None)` when no session has set a hint yet.
+    ///
+    /// The scan also consults the compacted summary aggregate written
+    /// by [`compress_old_sessions`](Self::compress_old_sessions): when
+    /// the live `session_NNN.json` files do not carry a hint (e.g. all
+    /// recent sessions ended without explicitly setting one), the
+    /// aggregate is parsed and its newest non-empty hint is returned.
     pub fn last_hint(&self) -> Result<Option<String>, HarnessError> {
         let mut entries = self.list()?;
         entries.sort_by_key(|e| std::cmp::Reverse(e.index));
@@ -142,12 +151,231 @@ impl SessionLog {
                 return Ok(Some(hint));
             }
         }
+
+        // Fall back to the compacted aggregate: walk its entries
+        // newest-first so the most recent persisted hint wins.
+        let aggregate_path = self.summary_aggregate_path();
+        if !aggregate_path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read_to_string(&aggregate_path)
+            .map_err(|e| HarnessError::io(&aggregate_path, e))?;
+        let aggregate: SessionSummaryAggregate = serde_json::from_str(&raw)
+            .map_err(|e| HarnessError::session_deserialize(&aggregate_path, e))?;
+        for entry in aggregate.entries.iter().rev() {
+            if let Some(hint) = entry.next_session_hint.as_ref()
+                && !hint.trim().is_empty()
+            {
+                return Ok(Some(hint.clone()));
+            }
+        }
         Ok(None)
+    }
+
+    /// Compute the path of the compacted summary aggregate file.
+    ///
+    /// The filename is the constant
+    /// [`SUMMARY_AGGREGATE_FILENAME`](self::SUMMARY_AGGREGATE_FILENAME)
+    /// (`session_summaries.json`); the choice of a single fixed name
+    /// keeps merging across multiple compaction passes simple — every
+    /// new pass merges into the same file rather than producing one
+    /// `session_001-019.summary.json` per compaction.
+    #[must_use]
+    pub fn summary_aggregate_path(&self) -> PathBuf {
+        self.dir.join(SUMMARY_AGGREGATE_FILENAME)
+    }
+
+    /// Compact every session older than the most recent `keep_recent`
+    /// into a single [`SessionSummaryAggregate`] JSON file at
+    /// [`Self::summary_aggregate_path`], then delete the originals.
+    ///
+    /// **Mechanical-only:** this is purely text manipulation; no LLM
+    /// is consulted. Each compacted entry inherits the source
+    /// session's `summary`, `session_number`, `started_at`,
+    /// `ended_at`, `trigger`, and `next_session_hint` verbatim. SPEC
+    /// §9.11 leaves richer aggregations to a future issue.
+    ///
+    /// **Atomicity:** the aggregate is written via a `*.tmp` + rename
+    /// before any of the source `session_NNN.json` files are removed.
+    /// If the rename succeeds but a subsequent unlink fails, the
+    /// aggregate is consistent and the leftover live files merely
+    /// duplicate data; a re-run of `compress_old_sessions` cleans
+    /// them up.
+    ///
+    /// **Idempotency:** repeated calls re-merge the live files into
+    /// the existing aggregate; entries already in the aggregate are
+    /// preserved (we union by `session_number`, with the live file
+    /// winning on a duplicate so a hand-edited
+    /// `session_NNN.json` overrides a stale aggregate entry).
+    ///
+    /// `keep_recent == 0` compacts every available session.
+    /// `keep_recent` greater than the available session count is a
+    /// no-op.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarnessError::Io`] for read/write failures of the source or
+    ///   aggregate files.
+    /// - [`HarnessError::SessionDeserialize`] when a live
+    ///   `session_NNN.json` cannot be parsed.
+    /// - [`HarnessError::SessionSerialize`] when the aggregate cannot
+    ///   be serialized.
+    pub fn compress_old_sessions(&self, keep_recent: usize) -> Result<(), HarnessError> {
+        let entries = self.list()?;
+        if entries.len() <= keep_recent {
+            return Ok(());
+        }
+        let cutoff = entries.len() - keep_recent;
+        let to_compact: Vec<&SessionLogEntry> = entries.iter().take(cutoff).collect();
+        if to_compact.is_empty() {
+            return Ok(());
+        }
+
+        // Load existing aggregate if present so a subsequent compaction
+        // pass merges into it rather than overwriting earlier entries.
+        let aggregate_path = self.summary_aggregate_path();
+        let mut aggregate = if aggregate_path.exists() {
+            let raw = fs::read_to_string(&aggregate_path)
+                .map_err(|e| HarnessError::io(&aggregate_path, e))?;
+            serde_json::from_str::<SessionSummaryAggregate>(&raw)
+                .map_err(|e| HarnessError::session_deserialize(&aggregate_path, e))?
+        } else {
+            SessionSummaryAggregate::default()
+        };
+
+        // Build the new entries first so an early failure leaves both
+        // the live files and the aggregate untouched.
+        let mut new_entries = Vec::with_capacity(to_compact.len());
+        for entry in &to_compact {
+            let session = self.load(entry.index)?.ok_or_else(|| HarnessError::Io {
+                path: entry.path.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "session listed by SessionLog::list disappeared before load",
+                ),
+            })?;
+            new_entries.push(SessionSummaryEntry::from_session(&session));
+        }
+
+        // Merge: live entries overwrite any pre-existing aggregate
+        // entry for the same `session_number`, then we sort.
+        for incoming in new_entries {
+            if let Some(slot) = aggregate
+                .entries
+                .iter_mut()
+                .find(|e| e.session_number == incoming.session_number)
+            {
+                *slot = incoming;
+            } else {
+                aggregate.entries.push(incoming);
+            }
+        }
+        aggregate.entries.sort_by_key(|e| e.session_number);
+
+        // Atomic write of the aggregate BEFORE deleting any source.
+        fs::create_dir_all(&self.dir).map_err(|e| HarnessError::io(&self.dir, e))?;
+        let tmp_path = aggregate_path.with_extension("json.tmp");
+        let serialized = serde_json::to_string_pretty(&aggregate)
+            .map_err(|e| HarnessError::session_serialize(&aggregate_path, e))?;
+        if let Err(e) = fs::write(&tmp_path, serialized) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(HarnessError::io(&tmp_path, e));
+        }
+        if let Err(e) = fs::rename(&tmp_path, &aggregate_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(HarnessError::io(&aggregate_path, e));
+        }
+
+        // Now safe to delete originals.
+        for entry in &to_compact {
+            if let Err(e) = fs::remove_file(&entry.path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    file = %entry.path.display(),
+                    %e,
+                    "failed to remove compacted session file; aggregate is durable",
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// On-disk filename for the compacted summary aggregate produced by
+/// [`SessionLog::compress_old_sessions`].
+pub const SUMMARY_AGGREGATE_FILENAME: &str = "session_summaries.json";
+
+/// Aggregate file written by
+/// [`SessionLog::compress_old_sessions`].
+///
+/// Each entry preserves the source session's identity
+/// (`session_number`, `started_at`, `ended_at`, `trigger`) plus the
+/// LLM-or-fallback `summary` text and the optional
+/// `next_session_hint`. The aggregate is a flat array sorted by
+/// `session_number` ascending.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionSummaryAggregate {
+    /// Compacted session entries, sorted by `session_number`
+    /// ascending.
+    #[serde(default)]
+    pub entries: Vec<SessionSummaryEntry>,
+}
+
+/// One compacted session entry inside a
+/// [`SessionSummaryAggregate`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionSummaryEntry {
+    /// Session sequence number within the parent run.
+    pub session_number: u32,
+
+    /// When the session started.
+    pub started_at: DateTime<Utc>,
+
+    /// When the session ended, if it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+
+    /// Why the session ended, if known.
+    #[serde(default, rename = "trigger", skip_serializing_if = "Option::is_none")]
+    pub end_trigger: Option<SessionEndTrigger>,
+
+    /// Free-form summary (`Session::summary`).
+    #[serde(default)]
+    pub summary: String,
+
+    /// Optional hint that the next session's bootstrap can consume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_session_hint: Option<String>,
+}
+
+impl SessionSummaryEntry {
+    /// Build an entry from a [`Session`], copying the SPEC §9.11
+    /// fields verbatim.
+    #[must_use]
+    pub fn from_session(session: &Session) -> Self {
+        Self {
+            session_number: session.index,
+            started_at: session.started_at,
+            ended_at: session.ended_at,
+            end_trigger: session.end_trigger.clone(),
+            summary: session.summary.clone(),
+            next_session_hint: session.next_session_hint.clone(),
+        }
     }
 }
 
 /// Parse `session_NNN.json` -> `Some(NNN)`, otherwise `None`.
+///
+/// The compacted `session_summaries.json` aggregate produced by
+/// [`SessionLog::compress_old_sessions`] does not match this shape and
+/// is filtered out implicitly: its stem
+/// (`session_summaries`) does not start with `session_<digits>`.
 fn parse_session_filename(name: &str) -> Option<u32> {
+    if name == SUMMARY_AGGREGATE_FILENAME {
+        return None;
+    }
     let stem = name.strip_suffix(".json")?;
     let num = stem.strip_prefix("session_")?;
     num.parse::<u32>().ok()
@@ -253,5 +481,151 @@ mod tests {
         let (_tmp, log) = tmp_log();
         let hint = log.last_hint().unwrap_or_else(|e| panic!("{e}"));
         assert!(hint.is_none());
+    }
+
+    /// Acceptance: 25 sessions with `keep_recent = 20` aggregates
+    /// sessions 1..=5 into the summary file and leaves 6..=25 as
+    /// individual JSONs.
+    #[test]
+    fn compress_old_sessions_aggregates_oldest_keeps_recent() {
+        let (_tmp, log) = tmp_log();
+        for i in 1..=25_u32 {
+            let mut s = Session::begin(i);
+            s.summary = format!("summary {i}");
+            s.next_session_hint = Some(format!("hint {i}"));
+            s.end(SessionEndTrigger::Completed);
+            log.save(&s).unwrap_or_else(|e| panic!("{e}"));
+        }
+
+        log.compress_old_sessions(20)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        // Live files: 6..=25 remain.
+        let listed = log.list().unwrap_or_else(|e| panic!("{e}"));
+        let live_indices: Vec<u32> = listed.iter().map(|e| e.index).collect();
+        assert_eq!(live_indices, (6..=25).collect::<Vec<_>>());
+
+        // Sessions 1..=5 must be gone from disk.
+        for i in 1..=5_u32 {
+            assert!(
+                !log.session_path(i).exists(),
+                "session {i} should be compacted: {}",
+                log.session_path(i).display(),
+            );
+        }
+
+        // Aggregate file exists and carries the expected entries.
+        let aggregate_path = log.summary_aggregate_path();
+        assert!(aggregate_path.exists());
+        let raw = fs::read_to_string(&aggregate_path).unwrap_or_else(|e| panic!("{e}"));
+        let aggregate: SessionSummaryAggregate =
+            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{e}"));
+        let aggregate_indices: Vec<u32> =
+            aggregate.entries.iter().map(|e| e.session_number).collect();
+        assert_eq!(aggregate_indices, vec![1, 2, 3, 4, 5]);
+        assert_eq!(aggregate.entries[0].summary, "summary 1");
+        assert_eq!(aggregate.entries[4].summary, "summary 5");
+        assert_eq!(
+            aggregate.entries[2].next_session_hint.as_deref(),
+            Some("hint 3"),
+        );
+    }
+
+    /// Compacting fewer-than-`keep_recent` sessions is a no-op.
+    #[test]
+    fn compress_old_sessions_no_op_when_below_keep_recent() {
+        let (_tmp, log) = tmp_log();
+        for i in 1..=5_u32 {
+            let mut s = Session::begin(i);
+            s.end(SessionEndTrigger::Completed);
+            log.save(&s).unwrap_or_else(|e| panic!("{e}"));
+        }
+        log.compress_old_sessions(20)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let listed = log.list().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(listed.len(), 5);
+        assert!(!log.summary_aggregate_path().exists());
+    }
+
+    /// Repeated compaction passes merge new entries into the existing
+    /// aggregate rather than overwriting it.
+    #[test]
+    fn compress_old_sessions_merges_into_existing_aggregate() {
+        let (_tmp, log) = tmp_log();
+        for i in 1..=10_u32 {
+            let mut s = Session::begin(i);
+            s.summary = format!("first {i}");
+            s.end(SessionEndTrigger::Completed);
+            log.save(&s).unwrap_or_else(|e| panic!("{e}"));
+        }
+        // First pass: keep 5 recent -> 1..=5 compacted.
+        log.compress_old_sessions(5)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        // Add more sessions and run another pass. Now we keep_recent=3
+        // out of the 5 surviving, so 6, 7 also get compacted.
+        for i in 11..=15_u32 {
+            let mut s = Session::begin(i);
+            s.summary = format!("second {i}");
+            s.end(SessionEndTrigger::Completed);
+            log.save(&s).unwrap_or_else(|e| panic!("{e}"));
+        }
+        // Now 10 live files (6..=15). keep_recent=3 -> 7 oldest get
+        // compacted, leaving 13..=15.
+        log.compress_old_sessions(3)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let listed = log.list().unwrap_or_else(|e| panic!("{e}"));
+        let live_indices: Vec<u32> = listed.iter().map(|e| e.index).collect();
+        assert_eq!(live_indices, vec![13, 14, 15]);
+
+        let raw =
+            fs::read_to_string(log.summary_aggregate_path()).unwrap_or_else(|e| panic!("{e}"));
+        let aggregate: SessionSummaryAggregate =
+            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{e}"));
+        let agg_indices: Vec<u32> = aggregate.entries.iter().map(|e| e.session_number).collect();
+        assert_eq!(agg_indices, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    }
+
+    /// `last_hint` falls back to the compacted aggregate when no live
+    /// session carries a hint.
+    #[test]
+    fn last_hint_falls_back_to_aggregate() {
+        let (_tmp, log) = tmp_log();
+
+        // Three sessions, only the oldest carries a hint.
+        let mut s1 = Session::begin(1);
+        s1.next_session_hint = Some("aggregate hint".to_owned());
+        s1.end(SessionEndTrigger::Completed);
+        log.save(&s1).unwrap_or_else(|e| panic!("{e}"));
+        for i in 2..=3_u32 {
+            let mut s = Session::begin(i);
+            s.end(SessionEndTrigger::Completed);
+            log.save(&s).unwrap_or_else(|e| panic!("{e}"));
+        }
+
+        // Compact the oldest into the aggregate.
+        log.compress_old_sessions(2)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        // No live session has a hint; the aggregate still does.
+        let hint = log.last_hint().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(hint.as_deref(), Some("aggregate hint"));
+    }
+
+    /// `compress_old_sessions(0)` compacts every session.
+    #[test]
+    fn compress_old_sessions_zero_keep_recent_compacts_all() {
+        let (_tmp, log) = tmp_log();
+        for i in 1..=4_u32 {
+            let mut s = Session::begin(i);
+            s.end(SessionEndTrigger::Completed);
+            log.save(&s).unwrap_or_else(|e| panic!("{e}"));
+        }
+        log.compress_old_sessions(0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let listed = log.list().unwrap_or_else(|e| panic!("{e}"));
+        assert!(listed.is_empty());
+        assert!(log.summary_aggregate_path().exists());
     }
 }

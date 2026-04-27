@@ -279,6 +279,16 @@ fn run_tui(
         let mut runner = RunRunner::new(run, Arc::clone(&store));
         runner.set_bootstrap_max_tokens(harness_config.bootstrap_max_tokens);
         runner.set_default_session_timeout(harness_config.default_session_timeout);
+        runner.set_session_log_compress_after(harness_config.session_log_compress_after);
+        // The runner stores the threshold as `f32` (matching the
+        // SessionState observers); narrow once at the boundary.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "threshold validated to be in (0.0, 1.0] which is exactly representable in f32"
+        )]
+        runner.set_context_force_rotate_threshold(
+            harness_config.context_force_rotate_threshold as f32,
+        );
         // One-time warning when the user's `[sandbox] mode` is stricter
         // than the harnessed `init.sh` execution path honours; see
         // `harness_init::warn_if_sandbox_mode_mismatch` for details.
@@ -289,6 +299,22 @@ fn run_tui(
             .begin_session()
             .context("beginning harness session")?;
         let run_summary: RunSummary = runner.summary();
+
+        // Per-session timeout channel: the watchdog feeds
+        // `SessionEndTrigger::Timeout` here; the dedicated rx is held
+        // by the TUI consumer in a future iteration (#46). For now we
+        // keep the rx alive so the channel does not close immediately
+        // and a `tracing::warn!` from the watchdog can still record
+        // the deadline; live rotation hand-off is wired in #46.
+        let (timeout_tx, _timeout_rx) =
+            tokio::sync::mpsc::channel::<tmg_harness::SessionEndTrigger>(4);
+        // Arm the watchdog only for harnessed runs; ad-hoc TUI
+        // sessions inherit no wall-clock deadline (the user can
+        // close the TUI whenever).
+        let session_timeout = runner.default_session_timeout();
+        if matches!(runner.scope(), tmg_harness::RunScope::Harnessed { .. }) {
+            runner.arm_session_timeout_watchdog(session_timeout, timeout_tx);
+        }
 
         // Wrap the runner in Arc<Mutex<...>> so the Run-scoped tools and
         // the bootstrap path share one source of truth for the active
@@ -550,9 +576,47 @@ fn install_turn_observer(
                 user_message,
             };
 
-            // Step 3: feed the summary into the runner.
+            // Step 3: feed the summary into the runner and check
+            // whether the SPEC §2.3 force-rotate threshold has been
+            // exceeded. The actual `clear_history` / `begin_session`
+            // sequence is owned by the higher-level TUI loop because
+            // it requires mutable access to the live `AgentLoop`; we
+            // only flip the rotation flag here so the consumer can
+            // observe it on the next iteration.
             let mut guard = runner.lock().await;
             guard.after_turn(&harness_summary, max_context_tokens);
+
+            let usage = if max_context_tokens == 0 {
+                0.0
+            } else {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "usage is clamped to [0.0, 1.0] before consumption"
+                )]
+                let raw = tokens_used as f64 / max_context_tokens as f64;
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "ratio clamped to [0.0, 1.0] which fits in f32"
+                )]
+                {
+                    raw.clamp(0.0, 1.0) as f32
+                }
+            };
+            match guard.maybe_force_rotate(usage) {
+                Ok(true) => {
+                    // Emit the SessionEnded event channel-side so a
+                    // downstream consumer wakes; the live rotation
+                    // (clear_history + begin_session) is wired by the
+                    // CLI / TUI follow-up (#46) which owns the agent.
+                    tracing::warn!(
+                        usage,
+                        "context usage exceeded force-rotate threshold; \
+                         rotation must be driven by the TUI consumer",
+                    );
+                }
+                Ok(false) => {}
+                Err(err) => tracing::warn!(?err, "maybe_force_rotate failed"),
+            }
         });
     });
     agent.set_turn_observer(Some(observer));

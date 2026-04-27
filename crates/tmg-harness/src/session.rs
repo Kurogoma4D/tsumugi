@@ -108,7 +108,19 @@ impl Session {
     }
 }
 
-/// Why a session ended. SPEC §9.5.
+/// Why a session ended. SPEC §9.4 / §9.5.
+///
+/// Issue #38 grew the enum with the four "session-boundary"
+/// causes prescribed by SPEC §9.4 ([`UserExit`](Self::UserExit),
+/// [`ContextRotation`](Self::ContextRotation),
+/// [`Timeout`](Self::Timeout),
+/// [`UserNewSession`](Self::UserNewSession)). The original
+/// [`Completed`](Self::Completed) / [`UserCancelled`](Self::UserCancelled)
+/// / [`Rotated`](Self::Rotated) / [`Errored`](Self::Errored) variants
+/// are preserved for backwards-compatibility with on-disk
+/// `session_NNN.json` files written by earlier versions and for
+/// callers that still want a richer trigger payload (e.g.
+/// [`Errored`](Self::Errored) carries a message).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEndTrigger {
@@ -117,6 +129,12 @@ pub enum SessionEndTrigger {
     /// Cancelled by the user (e.g. Ctrl-C).
     UserCancelled,
     /// The harness rotated to a new session (e.g. context exhaustion).
+    ///
+    /// Carries a free-form reason. Prefer the
+    /// [`ContextRotation`](Self::ContextRotation) variant for the
+    /// canonical SPEC §9.4 force-rotate path; this richer variant is
+    /// kept for cases where the caller wants to attribute the rotation
+    /// to a specific subsystem (e.g. `"manual /compact"`).
     Rotated {
         /// Reason for rotation, surfaced to the operator.
         reason: String,
@@ -126,6 +144,25 @@ pub enum SessionEndTrigger {
         /// Error message.
         message: String,
     },
+    /// SPEC §9.4 case 1: the user ended the run (closed the CLI / TUI
+    /// without resuming). Distinct from
+    /// [`UserCancelled`](Self::UserCancelled) in that the run is not
+    /// expected to spawn a successor session.
+    UserExit,
+    /// SPEC §9.4 case 2: the harness's force-rotate fired because
+    /// `context_usage` exceeded
+    /// [`HarnessConfig::context_force_rotate_threshold`](crate::runner::DEFAULT_CONTEXT_FORCE_ROTATE_THRESHOLD).
+    /// The runner immediately begins a new session after persisting
+    /// the old one.
+    ContextRotation,
+    /// SPEC §9.4 case 3: the per-session wall-clock budget configured
+    /// via [`HarnessConfig::default_session_timeout`] elapsed without
+    /// the session completing. Fired by the watchdog spawned in
+    /// [`RunRunner::begin_session`](crate::runner::RunRunner::begin_session).
+    Timeout,
+    /// SPEC §9.4 case 4: the user explicitly rolled to a new session
+    /// (e.g. via the `/run new-session` command).
+    UserNewSession,
 }
 
 /// Opaque handle returned by `RunRunner::begin_session` and consumed by

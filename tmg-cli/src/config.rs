@@ -144,6 +144,15 @@ struct PartialHarnessConfig {
     /// [`load_config`] runs rather than only when the harness tries to
     /// schedule a session.
     pub default_session_timeout: Option<String>,
+    /// Maximum number of recent live `session_NNN.json` files
+    /// preserved before
+    /// [`SessionLog::compress_old_sessions`](tmg_harness::SessionLog::compress_old_sessions)
+    /// aggregates older entries. Must be `>= 1` after merging.
+    pub session_log_compress_after: Option<usize>,
+    /// Context-usage threshold above which
+    /// [`RunRunner::maybe_force_rotate`](tmg_harness::RunRunner::maybe_force_rotate)
+    /// reports `true` (SPEC §2.3). Must be in `(0.0, 1.0]`.
+    pub context_force_rotate_threshold: Option<f64>,
     /// `[harness.escalator]` overrides for the scope-escalation
     /// subagent (SPEC §10.1 / §9.10 / issue #36).
     #[serde(default)]
@@ -331,6 +340,12 @@ impl PartialHarnessConfig {
             self.default_session_timeout
                 .clone_from(&other.default_session_timeout);
         }
+        if other.session_log_compress_after.is_some() {
+            self.session_log_compress_after = other.session_log_compress_after;
+        }
+        if other.context_force_rotate_threshold.is_some() {
+            self.context_force_rotate_threshold = other.context_force_rotate_threshold;
+        }
         self.escalator.merge_from(&other.escalator);
         self.escalation.merge_from(&other.escalation);
     }
@@ -382,6 +397,31 @@ impl PartialHarnessConfig {
             });
         }
 
+        let session_log_compress_after = self
+            .session_log_compress_after
+            .unwrap_or_else(default_session_log_compress_after);
+        if session_log_compress_after == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "harness.session_log_compress_after".to_owned(),
+                value: session_log_compress_after.to_string(),
+                reason: "must be a positive integer (>= 1)".to_owned(),
+            });
+        }
+
+        let context_force_rotate_threshold = self
+            .context_force_rotate_threshold
+            .unwrap_or_else(default_context_force_rotate_threshold);
+        if !context_force_rotate_threshold.is_finite()
+            || context_force_rotate_threshold <= 0.0
+            || context_force_rotate_threshold > 1.0
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "harness.context_force_rotate_threshold".to_owned(),
+                value: context_force_rotate_threshold.to_string(),
+                reason: "must be in the range (0.0, 1.0]".to_owned(),
+            });
+        }
+
         let escalation = self.escalation.into_final()?;
 
         Ok(HarnessConfig {
@@ -395,6 +435,8 @@ impl PartialHarnessConfig {
             smoke_test_every_n_sessions,
             default_max_sessions,
             default_session_timeout,
+            session_log_compress_after,
+            context_force_rotate_threshold,
             escalator: self.escalator.into_final(),
             escalation,
         })
@@ -577,6 +619,36 @@ impl PartialTsumugiConfig {
                 });
             }
             self.harness.default_session_timeout = Some(v);
+        }
+        if let Some(v) = env_fn("TMG_HARNESS_SESSION_LOG_COMPRESS_AFTER") {
+            let n = v.parse::<usize>().map_err(|_| ConfigError::InvalidValue {
+                field: "TMG_HARNESS_SESSION_LOG_COMPRESS_AFTER".to_owned(),
+                value: v.clone(),
+                reason: "must be a non-negative integer".to_owned(),
+            })?;
+            if n == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "TMG_HARNESS_SESSION_LOG_COMPRESS_AFTER".to_owned(),
+                    value: v,
+                    reason: "must be a positive integer (>= 1)".to_owned(),
+                });
+            }
+            self.harness.session_log_compress_after = Some(n);
+        }
+        if let Some(v) = env_fn("TMG_HARNESS_CONTEXT_FORCE_ROTATE_THRESHOLD") {
+            let n = v.parse::<f64>().map_err(|_| ConfigError::InvalidValue {
+                field: "TMG_HARNESS_CONTEXT_FORCE_ROTATE_THRESHOLD".to_owned(),
+                value: v.clone(),
+                reason: "must be a floating-point number".to_owned(),
+            })?;
+            if !n.is_finite() || n <= 0.0 || n > 1.0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "TMG_HARNESS_CONTEXT_FORCE_ROTATE_THRESHOLD".to_owned(),
+                    value: v,
+                    reason: "must be in the range (0.0, 1.0]".to_owned(),
+                });
+            }
+            self.harness.context_force_rotate_threshold = Some(n);
         }
         if let Some(v) = env_fn("TMG_HARNESS_ESCALATOR_ENDPOINT") {
             self.harness.escalator.endpoint = Some(v);
@@ -822,6 +894,18 @@ pub struct HarnessConfig {
     #[serde(with = "humantime_serde")]
     pub default_session_timeout: std::time::Duration,
 
+    /// Maximum number of recent live `session_NNN.json` files preserved
+    /// before
+    /// [`SessionLog::compress_old_sessions`](tmg_harness::SessionLog::compress_old_sessions)
+    /// aggregates older entries into `session_summaries.json`.
+    pub session_log_compress_after: usize,
+
+    /// Context-usage threshold above which
+    /// [`RunRunner::maybe_force_rotate`](tmg_harness::RunRunner::maybe_force_rotate)
+    /// returns `true` and the harness rotates to a fresh session
+    /// (SPEC §2.3). Must be in `(0.0, 1.0]`.
+    pub context_force_rotate_threshold: f64,
+
     /// `[harness.escalator]` overrides for the scope-escalation
     /// subagent.
     #[serde(default)]
@@ -875,6 +959,14 @@ fn default_session_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(30 * 60)
 }
 
+const fn default_session_log_compress_after() -> usize {
+    tmg_harness::DEFAULT_SESSION_LOG_COMPRESS_AFTER
+}
+
+const fn default_context_force_rotate_threshold() -> f64 {
+    tmg_harness::DEFAULT_CONTEXT_FORCE_ROTATE_THRESHOLD as f64
+}
+
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
@@ -884,6 +976,8 @@ impl Default for HarnessConfig {
             smoke_test_every_n_sessions: default_smoke_test_every_n_sessions(),
             default_max_sessions: default_default_max_sessions(),
             default_session_timeout: default_session_timeout(),
+            session_log_compress_after: default_session_log_compress_after(),
+            context_force_rotate_threshold: default_context_force_rotate_threshold(),
             escalator: EscalatorConfig::default(),
             escalation: tmg_harness::EscalationConfig::default(),
         }
@@ -2063,5 +2157,109 @@ diff_size_threshold = 500
         let final_config = partial.into_final().unwrap_or_else(|e| panic!("{e}"));
         assert!(!final_config.harness.escalation.enabled);
         assert_eq!(final_config.harness.escalation.diff_size_threshold, 750);
+    }
+
+    /// Issue #38: `[harness] session_log_compress_after` and
+    /// `[harness] context_force_rotate_threshold` parse from TOML and
+    /// flow through to the validated `HarnessConfig`.
+    #[test]
+    fn force_rotate_and_compress_after_load_from_toml() {
+        let toml = r"
+[harness]
+session_log_compress_after = 25
+context_force_rotate_threshold = 0.9
+";
+        let partial: PartialTsumugiConfig = toml::from_str(toml).unwrap_or_else(|e| panic!("{e}"));
+        let final_config = partial.into_final().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(final_config.harness.session_log_compress_after, 25);
+        assert!((final_config.harness.context_force_rotate_threshold - 0.9).abs() < 1e-6);
+    }
+
+    /// `session_log_compress_after = 0` is rejected.
+    #[test]
+    fn session_log_compress_after_zero_rejected() {
+        let toml = r"
+[harness]
+session_log_compress_after = 0
+";
+        let partial: PartialTsumugiConfig = toml::from_str(toml).unwrap_or_else(|e| panic!("{e}"));
+        let Err(err) = partial.into_final() else {
+            panic!("zero session_log_compress_after must be rejected");
+        };
+        assert!(
+            matches!(
+                err,
+                ConfigError::InvalidValue { ref field, .. }
+                    if field == "harness.session_log_compress_after"
+            ),
+            "got {err:?}",
+        );
+    }
+
+    /// `context_force_rotate_threshold` outside `(0.0, 1.0]` is
+    /// rejected.
+    #[test]
+    fn context_force_rotate_threshold_out_of_range_rejected() {
+        for bad in ["0.0", "1.5", "-0.1"] {
+            let toml = format!(
+                r"
+[harness]
+context_force_rotate_threshold = {bad}
+"
+            );
+            let partial: PartialTsumugiConfig =
+                toml::from_str(&toml).unwrap_or_else(|e| panic!("{e}"));
+            let Err(err) = partial.into_final() else {
+                panic!("out-of-range threshold {bad} must be rejected");
+            };
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::InvalidValue { ref field, .. }
+                        if field == "harness.context_force_rotate_threshold"
+                ),
+                "got {err:?} for {bad}",
+            );
+        }
+    }
+
+    /// Env-var overrides for the new knobs validate their inputs.
+    #[test]
+    fn force_rotate_env_overrides_apply() {
+        let mut partial = PartialTsumugiConfig::default();
+        let env_fn = |key: &str| -> Option<String> {
+            match key {
+                "TMG_HARNESS_SESSION_LOG_COMPRESS_AFTER" => Some("33".to_owned()),
+                "TMG_HARNESS_CONTEXT_FORCE_ROTATE_THRESHOLD" => Some("0.85".to_owned()),
+                _ => None,
+            }
+        };
+        partial
+            .apply_env_overrides(&env_fn)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let final_config = partial.into_final().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(final_config.harness.session_log_compress_after, 33);
+        assert!((final_config.harness.context_force_rotate_threshold - 0.85).abs() < 1e-6);
+    }
+
+    #[test]
+    fn force_rotate_env_override_bad_value_rejected() {
+        let mut partial = PartialTsumugiConfig::default();
+        let env_fn = |key: &str| -> Option<String> {
+            if key == "TMG_HARNESS_CONTEXT_FORCE_ROTATE_THRESHOLD" {
+                Some("2.0".to_owned())
+            } else {
+                None
+            }
+        };
+        let result = partial.apply_env_overrides(&env_fn);
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidValue { ref field, .. })
+                    if field == "TMG_HARNESS_CONTEXT_FORCE_ROTATE_THRESHOLD"
+            ),
+            "got {result:?}",
+        );
     }
 }
