@@ -46,7 +46,7 @@ Task tool:
 
 ### Step 2.5 — Runtime Verification (動作確認)
 
-PR が作成されたら、ワンショットモードで動作確認を行う。
+PR が作成されたら、ワンショット **と** TUI の両方で動作確認を行う。
 LLM サーバーが稼働している場合のみ実行する。
 
 ```bash
@@ -54,25 +54,48 @@ LLM サーバーが稼働している場合のみ実行する。
 curl -s --max-time 5 "${TMG_LLM_ENDPOINT:-http://localhost:8080}/health" && echo "LLM available" || echo "LLM unavailable"
 ```
 
-**LLM が利用可能な場合:**
+**LLM が利用不可能な場合:** 両方スキップして「LLM unavailable — runtime verification skipped」と記録する。
 
-issue の内容に応じた適切なテストプロンプトを選び、ワンショットで実行:
+**LLM が利用可能な場合、以下を順に実行:**
+
+#### A. ワンショットモード検証
+
+issue の内容に応じた適切なテストプロンプトで実行:
 
 ```bash
-timeout 120 ./target/debug/tmg --prompt "<issue に関連するプロンプト>" --event-log /tmp/tmg-issue-<number>.jsonl 2>&1
+timeout 120 ./target/debug/tmg --prompt "<issue に関連するプロンプト>" --event-log /tmp/tmg-issue-<number>-oneshot.jsonl 2>&1
 ```
 
-イベントログ (`/tmp/tmg-issue-<number>.jsonl`) を読んで検証:
-- `token` イベントが存在するか (LLM レスポンスが返っている)
+イベントログを読んで検証:
+- `token` イベントが存在するか
 - `is_error: true` のイベントがないか
 - `done` イベントで正常終了しているか
 
+#### B. TUI モード検証
+
+`expect` で TUI を起動し、テストプロンプトを送って動作を検証する:
+
+```bash
+expect -c '
+  set timeout 120
+  spawn ./target/debug/tmg --event-log /tmp/tmg-issue-<number>-tui.jsonl
+  sleep 3
+  send "<issue に関連するプロンプト>\r"
+  sleep 30
+  send "\x03"
+  expect eof
+' 2>&1
+```
+
+イベントログ (`/tmp/tmg-issue-<number>-tui.jsonl`) を読んで検証:
+- ワンショットと同様に `token` / `done` イベントの存在確認
+- `is_error: true` がないこと
+- TUI 経由でもエージェントループが正常に動作していること
+
 **検証に失敗した場合:**
 1. issue-implementer エージェントに修正を依頼
-2. 修正後に再度 runtime verification を実行
+2. 修正後に再度 runtime verification を実行 (ワンショット + TUI)
 3. 最大 2 回のリトライで解決しない場合はユーザーにフラグを立てて次の issue に進む
-
-**LLM が利用不可能な場合:** スキップして「LLM unavailable — runtime verification skipped」と記録する。
 
 ### Step 3 — Review the PR
 

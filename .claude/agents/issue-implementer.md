@@ -82,34 +82,65 @@ Execute the following checks in order:
 
 ## 4.5. Runtime Verification (動作確認)
 
-QA チェック通過後、変更がランタイム動作に影響する場合は実際にバイナリを動かして検証する。
+QA チェック通過後、実際にバイナリを動かしてランタイム動作を検証する。
 LLM サーバー (`llama-server`) が稼働している場合のみ実行する。未稼働の場合はスキップして記録する。
 
-### ワンショットモード検証
+### 前提: LLM サーバー疎通確認
+
+```bash
+curl -s --max-time 5 "${TMG_LLM_ENDPOINT:-http://localhost:8080}/health" && echo "LLM_AVAILABLE" || echo "LLM_UNAVAILABLE"
+```
+
+LLM が利用不可能な場合は **ワンショット・TUI 両方をスキップ** して「LLM unavailable — runtime verification skipped」と記録する。
+
+### Step A: ワンショットモード検証
 
 変更内容に応じたプロンプトで `--event-log` 付きワンショット実行を行い、イベントログを検証する:
 
 ```bash
-# LLM サーバー疎通確認
-curl -s --max-time 5 "${TMG_LLM_ENDPOINT:-http://localhost:8080}/health" && LLM_AVAILABLE=1 || LLM_AVAILABLE=0
+timeout 120 ./target/debug/tmg --prompt "<変更に関連するテストプロンプト>" --event-log /tmp/tmg-verify-oneshot.jsonl 2>&1
 ```
 
-LLM が利用可能な場合:
-
-```bash
-timeout 120 ./target/debug/tmg --prompt "<変更に関連するテストプロンプト>" --event-log /tmp/tmg-verify.jsonl 2>&1
-```
-
-イベントログ (`/tmp/tmg-verify.jsonl`) を読んで以下を確認:
+イベントログ (`/tmp/tmg-verify-oneshot.jsonl`) を Read で読んで以下を確認:
 - `token` イベントが存在する (レスポンスが返っている)
 - `is_error: true` のイベントがない
 - `done` イベントで正常終了している
 - 変更に関連するツール呼び出しがある場合、`tool_call` → `tool_result` ペアが正しい
 
-### TUI モード検証 (任意)
+### Step B: TUI モード検証
 
-TUI に影響する変更の場合、ユーザーに手動確認を案内する:
-> TUI の動作確認が必要です。PR 作成後に `/run-tui` で検証してください。
+`expect` コマンドで TUI を起動し、テストプロンプトを送信して `--event-log` でイベントを記録する。
+TUI の描画内容ではなく、**イベントログ** で動作を判定する。
+
+```bash
+expect -c '
+  set timeout 120
+  spawn ./target/debug/tmg --event-log /tmp/tmg-verify-tui.jsonl
+  sleep 3
+  send "<変更に関連するテストプロンプト>\r"
+  sleep 30
+  send "\x03"
+  expect eof
+' 2>&1
+```
+
+- `sleep 3`: TUI の初期化待ち
+- `send "...\r"`: テストプロンプトを入力して Enter
+- `sleep 30`: LLM レスポンスとツール実行の完了待ち (長めに取る)
+- `send "\x03"`: Ctrl+C で正常終了
+
+**expect が使えない場合** は `script` コマンドにフォールバック:
+
+```bash
+script -q /dev/null bash -c '
+  timeout 60 sh -c "sleep 3 && echo \"<テストプロンプト>\" && sleep 30 && kill -INT \$\$" | ./target/debug/tmg --event-log /tmp/tmg-verify-tui.jsonl
+' 2>&1 || true
+```
+
+イベントログ (`/tmp/tmg-verify-tui.jsonl`) を Read で読んで以下を確認:
+- `token` イベントが存在する (TUI 経由でも LLM レスポンスが返っている)
+- ワンショットと同様にエラーがないこと
+- TUI 終了後にターミナルエスケープシーケンスの異常がないこと (expect の出力を確認)
 
 ### 検証結果の記録
 
@@ -120,8 +151,11 @@ PR 本文に検証結果を追記する:
 - LLM server: available / unavailable (skipped)
 - One-shot mode: PASS / FAIL / SKIP
   - Events: N tokens, M tool calls, 0 errors
-- TUI mode: manual verification recommended / N/A
+- TUI mode: PASS / FAIL / SKIP
+  - Events: N tokens, M tool calls, 0 errors
 ```
+
+検証失敗時は原因を調査し、コード修正が必要なら修正→QA再実行→再検証の流れで対応する。
 
 ## 5. Worktree Cleanup
 
