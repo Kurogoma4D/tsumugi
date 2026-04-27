@@ -3,13 +3,15 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use clap::Parser;
+use tmg_harness::{RunRunner, RunStore, RunSummary, SessionEndTrigger};
 use tmg_llm::ToolCallingMode;
 use tokio::sync::Mutex;
 
 mod config;
 mod error;
+mod harness_init;
 
-use config::TsumugiConfig;
+use config::{HarnessConfig, TsumugiConfig};
 
 /// tsumugi - a local-LLM-powered coding agent
 #[derive(Parser, Debug)]
@@ -121,6 +123,7 @@ fn main() -> anyhow::Result<()> {
             context_config,
             config.llm.tool_calling,
             cli.event_log,
+            &config.harness,
         )?;
     }
 
@@ -210,12 +213,23 @@ fn run_prompt(
 /// and input area. The TUI handles multi-turn conversations with
 /// streaming LLM responses. Includes subagent support via
 /// `spawn_agent` tool, with custom agent definitions from TOML.
+///
+/// Initialises a [`RunStore`] and resolves the active [`Run`] following
+/// the policy described in [`harness_init::resolve_startup_run`]: when
+/// `harness.auto_resume_on_start` is `true` and a resumable run exists,
+/// the most recent one is loaded; otherwise a fresh ad-hoc run is
+/// created. The run is wrapped in a [`RunRunner`] which begins one
+/// session that lives for the duration of the TUI; the session is ended
+/// with a normal-completion trigger when the TUI returns and aborted
+/// with `UserCancelled` if the cancellation token fired or the TUI
+/// returned an error.
 fn run_tui(
     endpoint: &str,
     model: &str,
     context_config: tmg_core::ContextConfig,
     tool_calling_mode: tmg_core::ToolCallingMode,
     event_log: Option<PathBuf>,
+    harness_config: &HarnessConfig,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -233,8 +247,31 @@ fn run_tui(
         });
 
         let cwd = std::env::current_dir()?;
-        // Use cwd as project root for now (could be improved with git root detection).
-        let project_root = cwd.clone();
+        // Canonicalise so the persisted `workspace_path` and the
+        // `workspace` symlink target are absolute and stable across
+        // shells that may have entered via a symlinked path. Falls
+        // back to the raw cwd if canonicalisation fails (e.g. on
+        // unusual filesystems).
+        let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+        // Use canonical cwd as project root for now (could be improved with git root detection).
+        let project_root = canonical_cwd.clone();
+
+        // Resolve `runs_dir`: relative paths are interpreted against cwd
+        // so the on-disk layout matches `.tsumugi/runs/<run-id>` for the
+        // current project.
+        let runs_dir = if harness_config.runs_dir.is_absolute() {
+            harness_config.runs_dir.clone()
+        } else {
+            canonical_cwd.join(&harness_config.runs_dir)
+        };
+        let store = Arc::new(RunStore::new(runs_dir));
+        let run = harness_init::resolve_startup_run(harness_config, &store, canonical_cwd.clone())
+            .context("resolving startup run")?;
+        let mut runner = RunRunner::new(run, Arc::clone(&store));
+        let session_handle = runner
+            .begin_session()
+            .context("beginning harness session")?;
+        let run_summary: RunSummary = runner.summary();
 
         // Discover custom agent definitions.
         let custom_agent_metas = tmg_agents::discover_custom_agents(&project_root)
@@ -263,23 +300,56 @@ fn run_tui(
             registry,
             cancel.clone(),
             &project_root,
-            &cwd,
+            &canonical_cwd,
             context_config,
             tool_calling_mode,
         )?;
 
-        tmg_tui::run(
+        let tui_cancel = cancel.clone();
+        let tui_result = tmg_tui::run(
             agent,
             model,
-            cancel,
+            tui_cancel,
             project_root,
-            cwd,
+            canonical_cwd,
             Some(subagent_manager),
             custom_agent_defs,
             event_log,
+            Some(run_summary),
         )
-        .await?;
+        .await;
 
+        // Close the harness session before propagating the TUI result so
+        // that `last_session_at` / `session_count` are persisted even on
+        // error or cancellation paths. Capture the underlying error
+        // message in the `Errored` trigger so post-mortem inspection of
+        // the run sees the real failure rather than a generic string.
+        let trigger = if let Err(ref e) = tui_result {
+            SessionEndTrigger::Errored {
+                message: format!("TUI returned an error: {e:#}"),
+            }
+        } else if cancel.is_cancelled() {
+            SessionEndTrigger::UserCancelled
+        } else {
+            SessionEndTrigger::Completed
+        };
+        if let Err(e) = runner.end_session(session_handle, trigger) {
+            // Persisting on shutdown is best-effort; surface as a
+            // warning rather than masking the original TUI result.
+            eprintln_warning(&format!("failed to persist run state on shutdown: {e}"));
+        }
+
+        tui_result?;
         Ok::<(), anyhow::Error>(())
     })
+}
+
+/// Print a warning to stderr without violating the workspace
+/// `print_stderr` lint.
+#[expect(
+    clippy::print_stderr,
+    reason = "best-effort shutdown warning; surfaced to operator without disturbing the TUI exit code"
+)]
+fn eprintln_warning(message: &str) {
+    eprintln!("[tmg] warning: {message}");
 }

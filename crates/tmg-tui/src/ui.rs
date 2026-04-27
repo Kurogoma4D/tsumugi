@@ -37,24 +37,28 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-/// Draw the header bar: model name, context usage, and subagent count.
+/// Draw the header bar: model name, context usage, optional run id,
+/// and subagent count.
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let running_count = app.running_subagent_count();
+    let has_run = app.current_run().is_some();
+    let has_agents = running_count > 0;
 
-    let constraints = if running_count > 0 {
-        vec![
-            Constraint::Percentage(35),
-            Constraint::Percentage(35),
-            Constraint::Percentage(30),
-        ]
-    } else {
-        vec![Constraint::Percentage(50), Constraint::Percentage(50)]
-    };
+    // Build constraints dynamically: Model, Context are always present;
+    // Run is added when a run is active; Agents when subagents are running.
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(4);
+    let total_panes: u16 = 2 + u16::from(has_run) + u16::from(has_agents);
+    let pane_pct: u16 = 100 / total_panes;
+    for _ in 0..total_panes {
+        constraints.push(Constraint::Percentage(pane_pct));
+    }
 
     let header_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(constraints)
         .split(area);
+
+    let mut idx = 0usize;
 
     let model_block = Block::default().borders(Borders::ALL).title(" Model ");
     let model_text = Paragraph::new(Line::from(vec![Span::styled(
@@ -64,7 +68,8 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             .add_modifier(Modifier::BOLD),
     )]))
     .block(model_block);
-    frame.render_widget(model_text, header_layout[0]);
+    frame.render_widget(model_text, header_layout[idx]);
+    idx += 1;
 
     let context_block = Block::default().borders(Borders::ALL).title(" Context ");
     let context_text = Paragraph::new(Line::from(vec![Span::styled(
@@ -72,9 +77,27 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::Yellow),
     )]))
     .block(context_block);
-    frame.render_widget(context_text, header_layout[1]);
+    frame.render_widget(context_text, header_layout[idx]);
+    idx += 1;
 
-    if running_count > 0 {
+    if let Some(run) = app.current_run() {
+        let run_block = Block::default().borders(Borders::ALL).title(" Run ");
+        let run_text = Paragraph::new(Line::from(vec![
+            Span::styled(
+                run.short_id(),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(run.scope_label, Style::default().fg(Color::DarkGray)),
+        ]))
+        .block(run_block);
+        frame.render_widget(run_text, header_layout[idx]);
+        idx += 1;
+    }
+
+    if has_agents {
         let agents_block = Block::default().borders(Borders::ALL).title(" Agents ");
         let agents_text = Paragraph::new(Line::from(vec![Span::styled(
             format!("{running_count} running"),
@@ -83,7 +106,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )]))
         .block(agents_block);
-        frame.render_widget(agents_text, header_layout[2]);
+        frame.render_widget(agents_text, header_layout[idx]);
     }
 }
 

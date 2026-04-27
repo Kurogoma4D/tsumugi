@@ -15,12 +15,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use tmg_agents::{CustomAgentDef, SubagentManager};
 use tmg_core::AgentLoop;
+use tmg_harness::RunSummary;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -40,6 +41,7 @@ use tokio_util::sync::CancellationToken;
 /// * `subagent_manager` - Optional shared subagent manager for status display.
 /// * `custom_agents` - Custom agent definitions for `/agents` list display.
 /// * `event_log` - Optional path to write structured event log (JSON Lines).
+/// * `current_run` - Optional active run summary for header display.
 ///
 /// # Errors
 ///
@@ -57,6 +59,7 @@ pub async fn run(
     subagent_manager: Option<Arc<Mutex<SubagentManager>>>,
     custom_agents: Vec<CustomAgentDef>,
     event_log: Option<PathBuf>,
+    current_run: Option<RunSummary>,
 ) -> Result<(), TuiError> {
     let mut terminal = ratatui::init();
 
@@ -96,6 +99,10 @@ pub async fn run(
 
     if !custom_agents.is_empty() {
         app.set_custom_agents(custom_agents);
+    }
+
+    if let Some(run) = current_run {
+        app.set_current_run(run);
     }
 
     let result = event::run_event_loop(&mut terminal, &mut app, cancel).await;

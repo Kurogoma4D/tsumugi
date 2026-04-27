@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use tmg_agents::{AgentType, CustomAgentDef, SubagentManager, SubagentSummary, truncate_str};
 use tmg_core::{AgentLoop, CoreError, StreamSink, format_context_usage};
+use tmg_harness::RunSummary;
 use tmg_llm::Role;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -171,6 +172,9 @@ pub struct App {
 
     /// Optional path for structured event logging (JSON Lines).
     event_log_path: Option<PathBuf>,
+
+    /// The currently active run, used for header display.
+    current_run: Option<RunSummary>,
 }
 
 impl App {
@@ -205,7 +209,18 @@ impl App {
             pending_compact: false,
             thinking: false,
             event_log_path: event_log,
+            current_run: None,
         }
+    }
+
+    /// Set the active run for header display.
+    pub fn set_current_run(&mut self, run: RunSummary) {
+        self.current_run = Some(run);
+    }
+
+    /// Return the active run, if any.
+    pub fn current_run(&self) -> Option<&RunSummary> {
+        self.current_run.as_ref()
     }
 
     /// Set the subagent manager for status display.
@@ -608,9 +623,10 @@ impl App {
 
         // Open the event log writer if configured (append mode so all
         // turns accumulate in a single file).
-        let event_log_writer = self.event_log_path.as_deref().and_then(|path| {
-            tmg_core::EventLogWriter::open_append(path).ok()
-        });
+        let event_log_writer = self
+            .event_log_path
+            .as_deref()
+            .and_then(|path| tmg_core::EventLogWriter::open_append(path).ok());
 
         let join = tokio::spawn(async move {
             let channel_sink = ChannelStreamSink { tx: tx.clone() };

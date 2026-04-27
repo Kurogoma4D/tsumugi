@@ -115,6 +115,40 @@ impl PartialSkillsConfig {
     }
 }
 
+/// Partial harness config used for deserialization from TOML.
+///
+/// All fields are `Option` so we can distinguish "not set" from
+/// "explicitly set to the default value", matching the
+/// [`PartialLlmConfig`] convention.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PartialHarnessConfig {
+    pub runs_dir: Option<PathBuf>,
+    pub auto_resume_on_start: Option<bool>,
+}
+
+impl PartialHarnessConfig {
+    /// Merge `other` into `self`. `Some` fields in `other` take precedence.
+    fn merge_from(&mut self, other: &Self) {
+        if other.runs_dir.is_some() {
+            self.runs_dir.clone_from(&other.runs_dir);
+        }
+        if other.auto_resume_on_start.is_some() {
+            self.auto_resume_on_start = other.auto_resume_on_start;
+        }
+    }
+
+    /// Convert to final `HarnessConfig`, filling in defaults for unset
+    /// fields.
+    fn into_final(self) -> HarnessConfig {
+        HarnessConfig {
+            runs_dir: self.runs_dir.unwrap_or_else(default_runs_dir),
+            auto_resume_on_start: self
+                .auto_resume_on_start
+                .unwrap_or(default_auto_resume_on_start()),
+        }
+    }
+}
+
 /// Partial top-level config used for deserialization and merging.
 ///
 /// Deserialized from TOML, merged across sources, then converted to
@@ -129,6 +163,8 @@ struct PartialTsumugiConfig {
     pub tui: TuiConfig,
     #[serde(default)]
     pub skills: PartialSkillsConfig,
+    #[serde(default)]
+    pub harness: PartialHarnessConfig,
 }
 
 impl PartialTsumugiConfig {
@@ -139,6 +175,7 @@ impl PartialTsumugiConfig {
         self.sandbox.merge_from(&other.sandbox);
         self.tui.merge_from(&other.tui);
         self.skills.merge_from(&other.skills);
+        self.harness.merge_from(&other.harness);
     }
 
     /// Apply environment variable overrides (`TMG_*` prefix).
@@ -207,6 +244,17 @@ impl PartialTsumugiConfig {
             })?;
             self.sandbox.timeout_secs = Some(n);
         }
+        if let Some(v) = env_fn("TMG_HARNESS_RUNS_DIR") {
+            self.harness.runs_dir = Some(PathBuf::from(v));
+        }
+        if let Some(v) = env_fn("TMG_HARNESS_AUTO_RESUME_ON_START") {
+            let parsed = parse_bool(&v).map_err(|()| ConfigError::InvalidValue {
+                field: "TMG_HARNESS_AUTO_RESUME_ON_START".to_owned(),
+                value: v,
+                reason: "must be one of: true, false, 1, 0".to_owned(),
+            })?;
+            self.harness.auto_resume_on_start = Some(parsed);
+        }
         Ok(())
     }
 
@@ -217,7 +265,17 @@ impl PartialTsumugiConfig {
             sandbox: self.sandbox,
             tui: self.tui,
             skills: self.skills.into_final(),
+            harness: self.harness.into_final(),
         }
+    }
+}
+
+/// Parse a `bool` from a string, accepting common truthy/falsy spellings.
+fn parse_bool(value: &str) -> Result<bool, ()> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(()),
     }
 }
 
@@ -312,6 +370,34 @@ pub struct TuiConfig {
     pub show_token_usage: Option<bool>,
 }
 
+/// Harness settings from `[harness]` section.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HarnessConfig {
+    /// Directory where run state is persisted (relative to cwd).
+    pub runs_dir: PathBuf,
+
+    /// Whether to automatically resume the most recent unfinished run on
+    /// startup, instead of creating a new ad-hoc run.
+    pub auto_resume_on_start: bool,
+}
+
+fn default_runs_dir() -> PathBuf {
+    PathBuf::from(".tsumugi").join("runs")
+}
+
+const fn default_auto_resume_on_start() -> bool {
+    true
+}
+
+impl Default for HarnessConfig {
+    fn default() -> Self {
+        Self {
+            runs_dir: default_runs_dir(),
+            auto_resume_on_start: default_auto_resume_on_start(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Top-level config (final, validated)
 // ---------------------------------------------------------------------------
@@ -334,6 +420,10 @@ pub struct TsumugiConfig {
     /// Skill discovery settings.
     #[serde(default)]
     pub skills: tmg_skills::SkillsConfig,
+
+    /// Harness settings (run persistence and resume policy).
+    #[serde(default)]
+    pub harness: HarnessConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -867,5 +957,82 @@ compat_claude = false
         let config = TsumugiConfig::default();
         assert_eq!(config.llm.tool_calling, ToolCallingMode::Auto);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn harness_defaults() {
+        let config = TsumugiConfig::default();
+        assert_eq!(config.harness.runs_dir, default_runs_dir());
+        assert!(config.harness.auto_resume_on_start);
+    }
+
+    #[test]
+    fn harness_section_round_trip() {
+        let toml_str = r#"
+[harness]
+runs_dir = "/tmp/tsumugi-runs"
+auto_resume_on_start = false
+"#;
+        let partial: PartialTsumugiConfig =
+            toml::from_str(toml_str).unwrap_or_else(|e| panic!("{e}"));
+        let config = partial.into_final();
+        assert_eq!(config.harness.runs_dir, PathBuf::from("/tmp/tsumugi-runs"));
+        assert!(!config.harness.auto_resume_on_start);
+    }
+
+    #[test]
+    fn harness_section_merge_overrides() {
+        let mut base = PartialTsumugiConfig::default();
+        base.harness.runs_dir = Some(PathBuf::from(".tsumugi/runs"));
+        base.harness.auto_resume_on_start = Some(true);
+
+        let mut overlay = PartialTsumugiConfig::default();
+        overlay.harness.auto_resume_on_start = Some(false);
+        // runs_dir stays None: should not override.
+
+        base.merge_from(&overlay);
+        let final_config = base.into_final();
+
+        assert_eq!(
+            final_config.harness.runs_dir,
+            PathBuf::from(".tsumugi/runs")
+        );
+        assert!(!final_config.harness.auto_resume_on_start);
+    }
+
+    #[test]
+    fn harness_env_overrides_apply() {
+        let mut config = PartialTsumugiConfig::default();
+        let env_fn = |key: &str| -> Option<String> {
+            match key {
+                "TMG_HARNESS_RUNS_DIR" => Some("/var/tsumugi".to_owned()),
+                "TMG_HARNESS_AUTO_RESUME_ON_START" => Some("false".to_owned()),
+                _ => None,
+            }
+        };
+        config
+            .apply_env_overrides(&env_fn)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let final_config = config.into_final();
+        assert_eq!(final_config.harness.runs_dir, PathBuf::from("/var/tsumugi"));
+        assert!(!final_config.harness.auto_resume_on_start);
+    }
+
+    #[test]
+    fn harness_env_override_invalid_bool_returns_error() {
+        let mut config = PartialTsumugiConfig::default();
+        let env_fn = |key: &str| -> Option<String> {
+            if key == "TMG_HARNESS_AUTO_RESUME_ON_START" {
+                Some("maybe".to_owned())
+            } else {
+                None
+            }
+        };
+        let result = config.apply_env_overrides(&env_fn);
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue { ref field, .. })
+                if field == "TMG_HARNESS_AUTO_RESUME_ON_START"
+        ));
     }
 }
