@@ -13,8 +13,9 @@
 use std::sync::Arc;
 
 use tmg_harness::{HarnessError, Run, RunStore};
+use tmg_sandbox::SandboxMode;
 
-use crate::config::HarnessConfig;
+use crate::config::{HarnessConfig, SandboxConfigSection};
 
 /// Resolve the active [`Run`] at startup, persisting any state changes
 /// through the supplied [`RunStore`].
@@ -45,6 +46,35 @@ pub fn resolve_startup_run(
         return store.load(&summary.id);
     }
     store.create_ad_hoc(workspace_path, None)
+}
+
+/// Emit a one-time warning when the user has configured a stricter
+/// `[sandbox] mode` than the harnessed `init.sh` execution path
+/// honours.
+///
+/// `session_bootstrap::collect_init_script_status` currently hard-codes
+/// `SandboxMode::Full` regardless of the configured policy (the
+/// followup is to plumb `SandboxConfigSection` through
+/// `BootstrapInputs`). Until then we surface the gap so users running
+/// with `read_only` or `workspace_write` are not silently bypassed
+/// when a harnessed run executes its `init.sh`.
+///
+/// No-op when the configured mode is `None` (default) or already
+/// `Full`.
+pub fn warn_if_sandbox_mode_mismatch(sandbox: &SandboxConfigSection) {
+    let Some(configured) = sandbox.mode else {
+        return;
+    };
+    if configured == SandboxMode::Full {
+        return;
+    }
+    tracing::warn!(
+        configured = %configured,
+        effective = %SandboxMode::Full,
+        "harnessed `init.sh` execution currently always runs in `full` sandbox mode, \
+         ignoring the configured `[sandbox] mode`; tracked as a follow-up to plumb the \
+         configured policy through BootstrapInputs",
+    );
 }
 
 #[cfg(test)]

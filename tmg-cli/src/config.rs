@@ -120,7 +120,15 @@ impl PartialSkillsConfig {
 /// All fields are `Option` so we can distinguish "not set" from
 /// "explicitly set to the default value", matching the
 /// [`PartialLlmConfig`] convention.
+///
+/// `deny_unknown_fields` is set so a typo in `tsumugi.toml` (for
+/// example `smoke_test_evry_n_sessions`) is reported at load time
+/// rather than silently ignored. The other partial config sections
+/// stay permissive for now so unrelated tools can write extra keys
+/// without breaking config loading; the harness section is the most
+/// likely place for typos given how recently the knobs were added.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PartialHarnessConfig {
     pub runs_dir: Option<PathBuf>,
     pub auto_resume_on_start: Option<bool>,
@@ -164,11 +172,51 @@ impl PartialHarnessConfig {
 
     /// Convert to final `HarnessConfig`, filling in defaults for unset
     /// fields.
+    ///
+    /// Validates that the three positive-integer / non-zero-duration
+    /// knobs are strictly greater than zero. A zero
+    /// `smoke_test_every_n_sessions` would mean "smoke-test on every
+    /// 0-th session" (undefined / divide-by-zero downstream); a zero
+    /// `default_max_sessions` would prevent any session from running;
+    /// a zero `default_session_timeout` would race the inner sandbox
+    /// timer against the outer `tokio::time::timeout` and always fire
+    /// immediately.
     fn into_final(self) -> Result<HarnessConfig, ConfigError> {
         let default_session_timeout = match self.default_session_timeout.as_deref() {
             Some(raw) => parse_humantime_duration("harness.default_session_timeout", raw)?,
             None => default_session_timeout(),
         };
+
+        let smoke_test_every_n_sessions = self
+            .smoke_test_every_n_sessions
+            .unwrap_or_else(default_smoke_test_every_n_sessions);
+        if smoke_test_every_n_sessions == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "harness.smoke_test_every_n_sessions".to_owned(),
+                value: smoke_test_every_n_sessions.to_string(),
+                reason: "must be a positive integer (>= 1)".to_owned(),
+            });
+        }
+
+        let default_max_sessions = self
+            .default_max_sessions
+            .unwrap_or_else(default_default_max_sessions);
+        if default_max_sessions == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "harness.default_max_sessions".to_owned(),
+                value: default_max_sessions.to_string(),
+                reason: "must be a positive integer (>= 1)".to_owned(),
+            });
+        }
+
+        if default_session_timeout.is_zero() {
+            return Err(ConfigError::InvalidValue {
+                field: "harness.default_session_timeout".to_owned(),
+                value: humantime::format_duration(default_session_timeout).to_string(),
+                reason: "must be a non-zero duration".to_owned(),
+            });
+        }
+
         Ok(HarnessConfig {
             runs_dir: self.runs_dir.unwrap_or_else(default_runs_dir),
             auto_resume_on_start: self
@@ -177,12 +225,8 @@ impl PartialHarnessConfig {
             bootstrap_max_tokens: self
                 .bootstrap_max_tokens
                 .unwrap_or_else(default_bootstrap_max_tokens),
-            smoke_test_every_n_sessions: self
-                .smoke_test_every_n_sessions
-                .unwrap_or_else(default_smoke_test_every_n_sessions),
-            default_max_sessions: self
-                .default_max_sessions
-                .unwrap_or_else(default_default_max_sessions),
+            smoke_test_every_n_sessions,
+            default_max_sessions,
             default_session_timeout,
         })
     }
@@ -236,6 +280,10 @@ impl PartialTsumugiConfig {
     ///
     /// Returns an error if a numeric environment variable is present but
     /// cannot be parsed.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear list of env-var overrides; splitting into helpers would obscure the one-knob-per-block layout"
+    )]
     fn apply_env_overrides(
         &mut self,
         env_fn: &dyn Fn(&str) -> Option<String>,
@@ -320,24 +368,45 @@ impl PartialTsumugiConfig {
         if let Some(v) = env_fn("TMG_HARNESS_SMOKE_TEST_EVERY_N_SESSIONS") {
             let n = v.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
                 field: "TMG_HARNESS_SMOKE_TEST_EVERY_N_SESSIONS".to_owned(),
-                value: v,
+                value: v.clone(),
                 reason: "must be a non-negative integer".to_owned(),
             })?;
+            if n == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "TMG_HARNESS_SMOKE_TEST_EVERY_N_SESSIONS".to_owned(),
+                    value: v,
+                    reason: "must be a positive integer (>= 1)".to_owned(),
+                });
+            }
             self.harness.smoke_test_every_n_sessions = Some(n);
         }
         if let Some(v) = env_fn("TMG_HARNESS_DEFAULT_MAX_SESSIONS") {
             let n = v.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
                 field: "TMG_HARNESS_DEFAULT_MAX_SESSIONS".to_owned(),
-                value: v,
+                value: v.clone(),
                 reason: "must be a non-negative integer".to_owned(),
             })?;
+            if n == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "TMG_HARNESS_DEFAULT_MAX_SESSIONS".to_owned(),
+                    value: v,
+                    reason: "must be a positive integer (>= 1)".to_owned(),
+                });
+            }
             self.harness.default_max_sessions = Some(n);
         }
         if let Some(v) = env_fn("TMG_HARNESS_DEFAULT_SESSION_TIMEOUT") {
             // Validate now so a bad string is reported with a precise
             // env-var name; the parsed value is re-derived in
             // `into_final` so the storage shape stays a `String`.
-            let _ = parse_humantime_duration("TMG_HARNESS_DEFAULT_SESSION_TIMEOUT", &v)?;
+            let parsed = parse_humantime_duration("TMG_HARNESS_DEFAULT_SESSION_TIMEOUT", &v)?;
+            if parsed.is_zero() {
+                return Err(ConfigError::InvalidValue {
+                    field: "TMG_HARNESS_DEFAULT_SESSION_TIMEOUT".to_owned(),
+                    value: v,
+                    reason: "must be a non-zero duration".to_owned(),
+                });
+            }
             self.harness.default_session_timeout = Some(v);
         }
         Ok(())
@@ -1271,6 +1340,141 @@ bootstrap_max_tokens = 1024
             Err(ConfigError::InvalidValue { ref field, .. })
                 if field == "TMG_HARNESS_BOOTSTRAP_MAX_TOKENS"
         ));
+    }
+
+    #[test]
+    fn harness_zero_smoke_test_every_n_sessions_rejected() {
+        let toml_str = r"
+[harness]
+smoke_test_every_n_sessions = 0
+";
+        let partial: PartialTsumugiConfig =
+            toml::from_str(toml_str).unwrap_or_else(|e| panic!("{e}"));
+        let result = partial.into_final();
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidValue { ref field, .. })
+                    if field == "harness.smoke_test_every_n_sessions"
+            ),
+            "expected InvalidValue for smoke_test_every_n_sessions, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn harness_zero_default_max_sessions_rejected() {
+        let toml_str = r"
+[harness]
+default_max_sessions = 0
+";
+        let partial: PartialTsumugiConfig =
+            toml::from_str(toml_str).unwrap_or_else(|e| panic!("{e}"));
+        let result = partial.into_final();
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidValue { ref field, .. })
+                    if field == "harness.default_max_sessions"
+            ),
+            "expected InvalidValue for default_max_sessions, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn harness_zero_default_session_timeout_rejected() {
+        let toml_str = r#"
+[harness]
+default_session_timeout = "0s"
+"#;
+        let partial: PartialTsumugiConfig =
+            toml::from_str(toml_str).unwrap_or_else(|e| panic!("{e}"));
+        let result = partial.into_final();
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidValue { ref field, .. })
+                    if field == "harness.default_session_timeout"
+            ),
+            "expected InvalidValue for default_session_timeout, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn harness_env_zero_smoke_test_every_n_sessions_rejected() {
+        let mut config = PartialTsumugiConfig::default();
+        let env_fn = |key: &str| -> Option<String> {
+            if key == "TMG_HARNESS_SMOKE_TEST_EVERY_N_SESSIONS" {
+                Some("0".to_owned())
+            } else {
+                None
+            }
+        };
+        let result = config.apply_env_overrides(&env_fn);
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidValue { ref field, .. })
+                    if field == "TMG_HARNESS_SMOKE_TEST_EVERY_N_SESSIONS"
+            ),
+            "expected InvalidValue, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn harness_env_zero_default_max_sessions_rejected() {
+        let mut config = PartialTsumugiConfig::default();
+        let env_fn = |key: &str| -> Option<String> {
+            if key == "TMG_HARNESS_DEFAULT_MAX_SESSIONS" {
+                Some("0".to_owned())
+            } else {
+                None
+            }
+        };
+        let result = config.apply_env_overrides(&env_fn);
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidValue { ref field, .. })
+                    if field == "TMG_HARNESS_DEFAULT_MAX_SESSIONS"
+            ),
+            "expected InvalidValue, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn harness_env_zero_default_session_timeout_rejected() {
+        let mut config = PartialTsumugiConfig::default();
+        let env_fn = |key: &str| -> Option<String> {
+            if key == "TMG_HARNESS_DEFAULT_SESSION_TIMEOUT" {
+                Some("0s".to_owned())
+            } else {
+                None
+            }
+        };
+        let result = config.apply_env_overrides(&env_fn);
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidValue { ref field, .. })
+                    if field == "TMG_HARNESS_DEFAULT_SESSION_TIMEOUT"
+            ),
+            "expected InvalidValue, got {result:?}"
+        );
+    }
+
+    /// Fix #7: a typo in `[harness]` should fail at load time rather
+    /// than be silently ignored.
+    #[test]
+    fn harness_unknown_field_typo_is_rejected_at_load() {
+        let toml_str = r"
+[harness]
+smoke_test_evry_n_sessions = 3
+";
+        let result: Result<PartialTsumugiConfig, _> = toml::from_str(toml_str);
+        assert!(
+            result.is_err(),
+            "expected `deny_unknown_fields` to reject the typo, got {result:?}"
+        );
     }
 
     #[test]

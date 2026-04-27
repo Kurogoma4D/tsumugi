@@ -17,8 +17,8 @@
 //! - `features_summary` (compact view of `features.json`)
 //! - `init_script_status` (exit code + tail of stdout/stderr from
 //!   running `init.sh` with the `[harness] default_session_timeout`
-//!   budget)
-//! - `smoke_test_result` (stub `{ "tester_unavailable": true }` until
+//!   budget — plumbed through [`RunRunner::default_session_timeout`])
+//! - `smoke_test_result` (`{ "status": "unavailable", ... }` until
 //!   the tester subagent ships in a follow-up issue)
 //!
 //! When the combined output exceeds `bootstrap_max_tokens`, harnessed
@@ -56,13 +56,6 @@ const GIT_LOG_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default number of features included in the `features_summary`.
 const DEFAULT_FEATURES_TOP_N: usize = 20;
-
-/// Default time budget for running `init.sh` during harnessed bootstrap.
-///
-/// The script is meant to be cheap (`yarn install`-class workloads), so
-/// 60 seconds is a reasonable upper bound; longer-running setup should
-/// move into a dedicated subagent.
-const DEFAULT_INIT_SCRIPT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Number of stdout/stderr tail lines to surface for `init.sh`.
 const INIT_SCRIPT_TAIL_LINES: usize = 20;
@@ -180,17 +173,37 @@ pub struct InitScriptStatus {
 /// the bootstrap always returns the [`Unavailable`](Self::Unavailable)
 /// variant so the LLM can reason about its absence rather than seeing
 /// no field at all.
+///
+/// Serialised with an explicit `status` tag so the wire shape is:
+///
+/// ```json
+/// { "status": "unavailable", "reason": "..." }
+/// // or, once the tester ships:
+/// { "status": "available", "passed": true }
+/// ```
+///
+/// The redundant `tester_unavailable: true` flag from the previous
+/// `#[serde(untagged)]` shape is dropped: the tag carries the same
+/// signal and an untagged enum cannot grow new variants without ambiguity.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(untagged)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum SmokeTestResult {
-    /// Tester subagent is not yet wired up; `tester_unavailable` is
-    /// always `true`.
+    /// Tester subagent is not yet wired up.
     Unavailable {
-        /// Always `true`; present so the LLM sees a stable, easily
-        /// matched signal.
-        tester_unavailable: bool,
         /// Reason the tester wasn't run (kept short and actionable).
         reason: String,
+    },
+    /// Tester subagent ran and produced a verdict.
+    ///
+    /// Reserved for the follow-up issue that ships the tester; the
+    /// variant is included now so the JSON shape is stable across the
+    /// two PRs and so callers (LLM prompts, dashboards) can begin
+    /// matching `status == "available"` ahead of time.
+    Available {
+        /// Whether the smoke test passed.
+        // TODO(#tester-subagent): this field is filled in by the tester
+        // subagent; today the harness never constructs this variant.
+        passed: bool,
     },
 }
 
@@ -218,6 +231,13 @@ struct BootstrapInputs {
 struct HarnessBootstrapInputs {
     features: FeatureList,
     init_script: InitScript,
+    /// Wall-clock budget for running `init.sh`, sourced from
+    /// [`RunRunner::default_session_timeout`].
+    ///
+    /// Both the outer `tokio::time::timeout` and the inner sandbox
+    /// timer (`SandboxConfig::with_timeout`) are set from this value so
+    /// the two deadlines coincide.
+    init_script_timeout: Duration,
 }
 
 async fn run_bootstrap(runner: &Arc<Mutex<RunRunner>>) -> Result<BootstrapPayload, ToolError> {
@@ -236,6 +256,7 @@ async fn run_bootstrap(runner: &Arc<Mutex<RunRunner>>) -> Result<BootstrapPayloa
             RunScope::Harnessed { .. } => Some(HarnessBootstrapInputs {
                 features: guard.features().clone(),
                 init_script: guard.init_script().clone(),
+                init_script_timeout: guard.default_session_timeout(),
             }),
             RunScope::AdHoc => None,
         };
@@ -256,8 +277,12 @@ async fn run_bootstrap(runner: &Arc<Mutex<RunRunner>>) -> Result<BootstrapPayloa
     let (features_summary, init_script_status, smoke_test_result) =
         if let Some(harness) = inputs.harness_inputs.as_ref() {
             let features_summary = collect_features_summary(&harness.features);
-            let init_script_status =
-                collect_init_script_status(&harness.init_script, &inputs.workspace_path).await;
+            let init_script_status = collect_init_script_status(
+                &harness.init_script,
+                &inputs.workspace_path,
+                harness.init_script_timeout,
+            )
+            .await;
             let smoke_test_result = Some(tester_unavailable_placeholder());
             (features_summary, init_script_status, smoke_test_result)
         } else {
@@ -308,9 +333,15 @@ fn collect_features_summary(features: &FeatureList) -> Option<FeaturesSummary> {
 /// Returns `None` when `init.sh` does not exist on disk; the agent will
 /// see no `init_script_status` field rather than a confusing
 /// not-found error.
+///
+/// Both the inner sandbox timer (`SandboxConfig::with_timeout`) and the
+/// outer `tokio::time::timeout` inside [`InitScript::run`] are set from
+/// `timeout` so a long-running script is killed exactly once at the
+/// configured deadline rather than 30 s earlier by the sandbox default.
 async fn collect_init_script_status(
     init_script: &InitScript,
     workspace: &Path,
+    timeout: Duration,
 ) -> Option<InitScriptStatus> {
     if !init_script.exists() {
         return None;
@@ -320,10 +351,19 @@ async fn collect_init_script_status(
     // the `init.sh` execution path. A future issue will tighten the
     // policy to `WorkspaceWrite` once we are confident that
     // initialiser scripts only need to touch the workspace.
-    let sandbox_config = SandboxConfig::new(workspace).with_mode(SandboxMode::Full);
+    //
+    // NOTE: this hard-codes `Full` regardless of the user's
+    // `[sandbox]` configuration. Until we plumb the configured
+    // `SandboxConfigSection` through `BootstrapInputs`, callers that
+    // configure a stricter mode at the CLI level should see a one-time
+    // warning emitted from the CLI startup path
+    // (`harness_init::warn_if_sandbox_mode_mismatch`).
+    let sandbox_config = SandboxConfig::new(workspace)
+        .with_mode(SandboxMode::Full)
+        .with_timeout(timeout.as_secs());
     let sandbox = SandboxContext::new(sandbox_config);
 
-    match init_script.run(&sandbox, DEFAULT_INIT_SCRIPT_TIMEOUT).await {
+    match init_script.run(&sandbox, timeout).await {
         Ok(output) => Some(init_script_status_from_output(&output)),
         Err(err) => {
             tracing::warn!(
@@ -354,7 +394,6 @@ fn init_script_status_from_output(output: &InitScriptOutput) -> InitScriptStatus
 // `RunRunner::session_count()`.
 fn tester_unavailable_placeholder() -> SmokeTestResult {
     SmokeTestResult::Unavailable {
-        tester_unavailable: true,
         reason: "tester subagent not yet implemented".to_owned(),
     }
 }
@@ -905,14 +944,21 @@ mod tests {
             .as_ref()
             .unwrap_or_else(|| panic!("expected smoke_test_result"));
         match smoke {
-            SmokeTestResult::Unavailable {
-                tester_unavailable,
-                reason,
-            } => {
-                assert!(tester_unavailable);
-                assert!(!reason.is_empty());
+            SmokeTestResult::Unavailable { reason } => {
+                assert!(!reason.is_empty(), "reason should not be empty");
+            }
+            SmokeTestResult::Available { .. } => {
+                panic!("tester subagent is not implemented yet; expected Unavailable");
             }
         }
+
+        // Wire-shape regression: the new `#[serde(tag = "status", ...)]`
+        // form must serialise as `{ "status": "unavailable", "reason": ... }`
+        // and must NOT carry the old `tester_unavailable` boolean.
+        let json = serde_json::to_value(smoke).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(json["status"], "unavailable", "wire shape: {json}");
+        assert!(json.get("tester_unavailable").is_none(), "{json}");
+        assert!(json["reason"].is_string(), "{json}");
     }
 
     /// Acceptance: when `init.sh` exists in a harnessed run, it is

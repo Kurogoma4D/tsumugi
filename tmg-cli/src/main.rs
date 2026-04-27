@@ -13,7 +13,7 @@ mod config;
 mod error;
 mod harness_init;
 
-use config::{HarnessConfig, TsumugiConfig};
+use config::{HarnessConfig, SandboxConfigSection, TsumugiConfig};
 
 /// tsumugi - a local-LLM-powered coding agent
 #[derive(Parser, Debug)]
@@ -126,6 +126,7 @@ fn main() -> anyhow::Result<()> {
             config.llm.tool_calling,
             cli.event_log,
             &config.harness,
+            &config.sandbox,
         )?;
     }
 
@@ -232,6 +233,7 @@ fn run_tui(
     tool_calling_mode: tmg_core::ToolCallingMode,
     event_log: Option<PathBuf>,
     harness_config: &HarnessConfig,
+    sandbox_config: &SandboxConfigSection,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -271,6 +273,13 @@ fn run_tui(
             .context("resolving startup run")?;
         let mut runner = RunRunner::new(run, Arc::clone(&store));
         runner.set_bootstrap_max_tokens(harness_config.bootstrap_max_tokens);
+        runner.set_default_session_timeout(harness_config.default_session_timeout);
+        // One-time warning when the user's `[sandbox] mode` is stricter
+        // than the harnessed `init.sh` execution path honours; see
+        // `harness_init::warn_if_sandbox_mode_mismatch` for details.
+        if matches!(runner.scope(), tmg_harness::RunScope::Harnessed { .. }) {
+            harness_init::warn_if_sandbox_mode_mismatch(sandbox_config);
+        }
         let session_handle = runner
             .begin_session()
             .context("beginning harness session")?;

@@ -27,14 +27,35 @@
 //!
 //! - flips `passes` from `false` → `true` for an existing `id`,
 //! - rejects unknown ids with [`HarnessError::UnknownFeatureId`],
-//! - re-serialises and atomically writes back the file, preserving the
-//!   exact ordering and every other field byte-for-byte (other than
-//!   serde's pretty-printing of the targeted feature).
+//! - re-serialises and atomically writes back the file, producing a
+//!   *structurally identical* document (same key set, same array
+//!   ordering, same scalar values for every field other than the
+//!   targeted feature's `passes`). The text is not necessarily
+//!   byte-for-byte identical — `serde_json::to_string_pretty` chooses
+//!   its own whitespace — but the parse tree round-trips.
 //!
 //! Atomic write uses the same `*.tmp` + rename pattern as
 //! [`RunStore::save`](crate::store::RunStore::save) and
 //! [`SessionLog::save`](crate::artifacts::SessionLog::save), so concurrent
 //! readers never observe a half-written file.
+//!
+//! ## Concurrency
+//!
+//! Single-process operation is assumed (the same assumption documented
+//! on [`RunStore`](crate::store::RunStore)).
+//! [`FeatureList::mark_passing`] is implemented as a read-modify-write
+//! sequence (`read` → mutate in memory → atomic rename) and is **not**
+//! protected against concurrent writers. Two simultaneous writers — for
+//! example a future tester subagent racing the user-facing
+//! `feature_list_mark_passing` tool, or two `tmg` processes pointing at
+//! the same `runs_dir` — can lose updates: each reads the same baseline,
+//! mutates its own copy, and the second `rename` overwrites the first.
+//!
+//! The atomic rename guarantees readers never see a torn file, so
+//! corruption of the JSON itself is not possible. Cross-writer
+//! mutual exclusion is intentionally out of scope for now; `flock(2)`
+//! around the read-write window is the natural follow-up if/when we
+//! gain a second mutator.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -108,6 +129,17 @@ pub struct FeaturesSummaryEntry {
 /// Append-only-ish writer/reader for a run's `features.json`.
 ///
 /// Cloning a [`FeatureList`] is cheap (path-only).
+///
+/// ## Mutation guarantee
+///
+/// [`FeatureList::mark_passing`] re-emits the features file via
+/// `serde_json::to_string_pretty`, so the on-disk text is **not**
+/// byte-for-byte identical with the input (whitespace, trailing
+/// newlines, and key ordering inside an object can change). What is
+/// guaranteed is that the output is *structurally identical* to the
+/// input: the same set of keys, the same `Vec<Feature>` ordering, and
+/// every value preserved exactly **modulo the targeted feature's
+/// `passes` field**.
 #[derive(Debug, Clone)]
 pub struct FeatureList {
     path: PathBuf,
@@ -172,6 +204,19 @@ impl FeatureList {
     ///   simplicity, but the contents remain equivalent).
     /// - All other fields (other features, category, description,
     ///   steps) are preserved exactly as read.
+    ///
+    /// # Concurrency
+    ///
+    /// This is a read-modify-write sequence (`read` → mutate → atomic
+    /// rename) with **no inter-writer locking**. The atomic rename
+    /// rules out torn-file corruption for readers, but two writers
+    /// racing on the same `features.json` (e.g. the runner and a
+    /// future tester subagent, or two `tmg` processes against the same
+    /// `runs_dir`) can lose updates: each reads the same baseline,
+    /// flips its target, and the second `rename` clobbers the first.
+    /// Single-process operation is assumed, consistent with
+    /// [`RunStore`](crate::store::RunStore). Adding `flock(2)` around
+    /// the read-write window is the natural follow-up.
     pub fn mark_passing(&self, feature_id: &str) -> Result<(), HarnessError> {
         let mut parsed = self.read()?;
         let Some(target) = parsed.features.iter_mut().find(|f| f.id == feature_id) else {
@@ -363,7 +408,8 @@ mod tests {
         let after = list.read().unwrap_or_else(|e| panic!("{e}"));
 
         // Only the targeted feature's `passes` changed; every other
-        // field is byte-equal.
+        // field is structurally identical (same scalars, same order)
+        // even though the on-disk whitespace may have shifted.
         assert_eq!(before.features.len(), after.features.len());
         for (b, a) in before.features.iter().zip(after.features.iter()) {
             assert_eq!(b.id, a.id);

@@ -26,6 +26,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 
@@ -37,6 +38,13 @@ use crate::store::RunStore;
 
 /// Default max tokens for `session_bootstrap` output before truncation.
 pub const DEFAULT_BOOTSTRAP_MAX_TOKENS: usize = 4096;
+
+/// Default wall-clock budget for one harnessed session.
+///
+/// Mirrors the CLI's `[harness] default_session_timeout` default
+/// (`30m`); used as a fallback when the runner has not been
+/// configured with a value from `tsumugi.toml`.
+pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Run runner wrapping a [`Run`] plus its artifacts.
 ///
@@ -73,6 +81,14 @@ pub struct RunRunner {
     /// [`set_bootstrap_max_tokens`](Self::set_bootstrap_max_tokens) for
     /// the full semantics.
     bootstrap_max_tokens: usize,
+    /// Wall-clock budget for one harnessed session.
+    ///
+    /// Reads from `[harness] default_session_timeout` in `tsumugi.toml`
+    /// (humantime string, e.g. `"30m"`). Used by the harnessed
+    /// `session_bootstrap` to cap `init.sh` execution so the inner
+    /// sandbox timer matches the outer `tokio::time::timeout` deadline.
+    /// Defaults to [`DEFAULT_SESSION_TIMEOUT`].
+    default_session_timeout: Duration,
 }
 
 impl RunRunner {
@@ -93,6 +109,7 @@ impl RunRunner {
             init_script,
             active_session: None,
             bootstrap_max_tokens: DEFAULT_BOOTSTRAP_MAX_TOKENS,
+            default_session_timeout: DEFAULT_SESSION_TIMEOUT,
         }
     }
 
@@ -120,6 +137,26 @@ impl RunRunner {
     #[must_use]
     pub fn bootstrap_max_tokens(&self) -> usize {
         self.bootstrap_max_tokens
+    }
+
+    /// Set the per-session wall-clock budget.
+    ///
+    /// This is the value plumbed into `session_bootstrap`'s `init.sh`
+    /// execution so that the inner sandbox timer (`with_timeout`) and
+    /// the outer `tokio::time::timeout` share the same deadline.
+    /// Defaults to [`DEFAULT_SESSION_TIMEOUT`].
+    pub fn set_default_session_timeout(&mut self, timeout: Duration) {
+        self.default_session_timeout = timeout;
+    }
+
+    /// Return the current per-session wall-clock budget.
+    ///
+    /// Read by `session_bootstrap` to bound `init.sh` execution; see
+    /// [`set_default_session_timeout`](Self::set_default_session_timeout)
+    /// for the contract.
+    #[must_use]
+    pub fn default_session_timeout(&self) -> Duration {
+        self.default_session_timeout
     }
 
     /// Borrow the active run.

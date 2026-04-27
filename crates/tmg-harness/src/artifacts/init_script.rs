@@ -119,6 +119,17 @@ impl InitScript {
     /// On timeout, `InitScriptOutput::timed_out` is set to `true` and
     /// `stdout` / `stderr` are empty.
     ///
+    /// # Cancel safety
+    ///
+    /// Cancelling the returned future (e.g. dropping it from inside a
+    /// `select!` branch) cancels the inner `wait_with_output` future
+    /// from tokio, which is documented as cancel-safe: the spawned
+    /// child process is configured with `kill_on_drop(true)` by the
+    /// sandbox layer, so the underlying `sh` invocation is killed
+    /// rather than orphaned. Any partial stdout/stderr buffered up to
+    /// the cancellation point is **not** observable by the caller —
+    /// the future is dropped before the buffers are returned.
+    ///
     /// # Errors
     ///
     /// - [`InitScriptError::NotFound`] when the script does not exist.

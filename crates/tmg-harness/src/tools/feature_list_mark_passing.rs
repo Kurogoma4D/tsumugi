@@ -73,22 +73,35 @@ impl Tool for FeatureListMarkPassingTool {
                 return Err(ToolError::invalid_params("`feature_id` must not be empty"));
             }
 
+            // Take a cheap clone of the `FeatureList` handle so we can
+            // touch the disk without holding the runner lock. The
+            // session-side side-effect (`features_marked_passing`) is
+            // intentionally deferred until after the on-disk write
+            // succeeds: recording the id before the write would leave
+            // the session log claiming the feature was marked even when
+            // the underlying file was not modified (unknown id, I/O
+            // error). See the `unknown_id_*` regression tests below.
             let features_handle = {
-                let mut guard = runner.lock().await;
-                // Side-effect: record the id in the active session's
-                // `features_marked_passing` for downstream summaries.
-                if let Some(session) = guard.active_session_mut()
-                    && !session.features_marked_passing.iter().any(|x| x == trimmed)
-                {
-                    session.features_marked_passing.push(trimmed.to_owned());
-                }
+                let guard = runner.lock().await;
                 guard.features().clone()
             };
 
             match features_handle.mark_passing(trimmed) {
-                Ok(()) => Ok(ToolResult::success(format!(
-                    "marked feature `{trimmed}` as passing"
-                ))),
+                Ok(()) => {
+                    // Re-acquire the lock to record the side-effect.
+                    // Done in a second critical section because the
+                    // file-write above can block long enough that we do
+                    // not want it to hold the runner mutex.
+                    let mut guard = runner.lock().await;
+                    if let Some(session) = guard.active_session_mut()
+                        && !session.features_marked_passing.iter().any(|x| x == trimmed)
+                    {
+                        session.features_marked_passing.push(trimmed.to_owned());
+                    }
+                    Ok(ToolResult::success(format!(
+                        "marked feature `{trimmed}` as passing"
+                    )))
+                }
                 Err(HarnessError::UnknownFeatureId { feature_id }) => Ok(ToolResult::error(
                     format!("unknown feature id: {feature_id}"),
                 )),
@@ -202,13 +215,28 @@ mod tests {
     #[tokio::test]
     async fn unknown_id_returns_tool_error_result() {
         let (_tmp, runner) = make_runner_with_features(sample_json());
-        let tool = FeatureListMarkPassingTool::new(runner);
+        let tool = FeatureListMarkPassingTool::new(Arc::clone(&runner));
         let res = tool
             .execute(serde_json::json!({ "feature_id": "feat-999" }))
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(res.is_error, "expected is_error=true, got {res:?}");
         assert!(res.output.contains("feat-999"), "{}", res.output);
+
+        // The side-effect on the active session must NOT have been
+        // applied: the on-disk write was rejected, so the session log
+        // would otherwise lie about features being marked. Regression
+        // test for the ordering bug between the runner-side bookkeeping
+        // and the file write.
+        let guard = runner.lock().await;
+        let session = guard
+            .active_session()
+            .unwrap_or_else(|| panic!("active session"));
+        assert!(
+            session.features_marked_passing.is_empty(),
+            "features_marked_passing should remain empty after a failed mark; got {:?}",
+            session.features_marked_passing,
+        );
     }
 
     #[tokio::test]
