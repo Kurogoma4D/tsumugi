@@ -31,6 +31,7 @@ tmg-sandbox = { workspace = true }
 tmg-skills = { workspace = true }
 tmg-tools = { workspace = true }
 tmg-tui = { workspace = true }
+tmg-workflow = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

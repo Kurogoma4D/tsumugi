@@ -1,0 +1,31 @@
+[package]
+name = "tmg-workflow"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tmg-llm = { workspace = true }
+tmg-tools = { workspace = true }
+tmg-agents = { workspace = true }
+tmg-sandbox = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+tokio = { workspace = true, features = ["fs", "sync", "time", "rt-multi-thread", "macros"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+dirs = { workspace = true }
+humantime = { workspace = true }
+humantime-serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs"] }
+tempfile = { workspace = true }
+toml = { workspace = true }
+
+[lints]
+workspace = true
