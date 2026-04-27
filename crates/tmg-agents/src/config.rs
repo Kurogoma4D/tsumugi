@@ -326,6 +326,31 @@ impl AgentType {
         let quoted = format!("\"{name}\"");
         serde_json::from_str(&quoted).ok()
     }
+
+    /// Whether this agent type may be spawned directly by the LLM via
+    /// the `spawn_agent` tool.
+    ///
+    /// Returns `false` for agents whose lifecycle is owned by the
+    /// harness rather than the model. Currently the only such agent is
+    /// [`AgentType::Escalator`]: the escalator is invoked by the
+    /// harness during scope evaluation and must never be reachable from
+    /// an LLM `spawn_agent` call, otherwise the model could trigger
+    /// recursive escalation decisions or bypass the harness gating.
+    ///
+    /// Used by `spawn_agent` to filter [`AgentType::ALL`] when building
+    /// the JSON-Schema `enum` and the human-readable error list.
+    #[must_use]
+    pub fn is_user_spawnable(&self) -> bool {
+        match self {
+            Self::Explore
+            | Self::Worker
+            | Self::Plan
+            | Self::Initializer
+            | Self::Tester
+            | Self::Qa => true,
+            Self::Escalator => false,
+        }
+    }
 }
 
 impl std::fmt::Display for AgentType {
@@ -338,7 +363,7 @@ impl std::fmt::Display for AgentType {
 /// agent.
 #[derive(Debug, Clone)]
 pub enum AgentKind {
-    /// A built-in agent type (explore, worker, plan, initializer, tester, qa).
+    /// A built-in agent type (explore, worker, plan, initializer, tester, qa, escalator).
     Builtin(AgentType),
 
     /// A custom agent loaded from a TOML definition file.

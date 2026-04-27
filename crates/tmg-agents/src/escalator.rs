@@ -13,9 +13,10 @@
 //! ```
 //!
 //! `estimated_features` is OPTIONAL and is only meaningful when
-//! `escalate` is `true`; emitting it as `null`, `0`, or a string is
-//! rejected so that downstream automation does not have to guess what
-//! the model meant.
+//! `escalate` is `true`; emitting it as `null`, `0`, a float, or a
+//! string is rejected so that downstream automation does not have to
+//! guess what the model meant. If there are no features to estimate,
+//! emit `escalate: false` and omit the field entirely.
 //!
 //! [`parse_verdict`] is the only sanctioned entry point for accepting
 //! escalator output. It uses `#[serde(deny_unknown_fields)]` and an
@@ -23,19 +24,24 @@
 //! surfaced loudly rather than silently routed to the wrong control
 //! flow.
 
-use serde::de::Deserializer;
+use serde::de::{Deserializer, Error as DeError, Unexpected};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Deserialize `estimated_features` as a strict non-negative integer
-/// when present, rejecting explicit `null` (the system prompt forbids
-/// it -- see [`crate::config::AgentType::Escalator::system_prompt`]).
+/// Deserialize `estimated_features` as a strict positive integer when
+/// present, rejecting explicit `null`, `0`, floats, and strings (the
+/// system prompt forbids those -- see
+/// [`crate::config::AgentType::Escalator::system_prompt`]).
 ///
 /// Used in combination with `#[serde(default)]` on the field so that
 /// "field omitted" still maps to `None`. Without this helper, serde's
 /// default `Option<u32>` adapter would silently accept `null` and
 /// `None` interchangeably, masking model bugs that emit `null`
 /// instead of omitting the key entirely.
+///
+/// `0` is rejected explicitly: a zero estimate is meaningless for the
+/// escalator's purpose. If there are no features to estimate, the
+/// model should emit `escalate: false` and omit the field.
 fn deserialize_estimated_features<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
 where
     D: Deserializer<'de>,
@@ -43,7 +49,15 @@ where
     // Deserialize as a plain `u32`. If serde encounters `null` it will
     // raise an `invalid type: null` error, which is exactly what we
     // want -- it gets surfaced as `ParseError::Json` to the caller.
+    // Floats (e.g. `3.0`, `3.5`) are rejected by `u32` deserialization
+    // because `serde_json` keeps `f64` and `u64` as distinct types.
     let value = u32::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(D::Error::invalid_value(
+            Unexpected::Unsigned(0),
+            &"a positive integer (omit the field instead of sending 0)",
+        ));
+    }
     Ok(Some(value))
 }
 
@@ -112,8 +126,9 @@ pub enum ParseError {
 /// Strict rules:
 ///
 /// - Required fields: `escalate` (bool) and `reason` (string).
-/// - Optional field: `estimated_features` (non-negative integer, fits
-///   in `u32`).
+/// - Optional field: `estimated_features` (strictly positive integer
+///   that fits in `u32`; `0`, floats, strings, and `null` are
+///   rejected — omit the field instead).
 /// - Unknown fields are rejected by `#[serde(deny_unknown_fields)]`.
 /// - Trailing non-whitespace input is rejected via [`ParseError::TrailingInput`].
 ///
@@ -129,23 +144,26 @@ pub fn parse_verdict(json: &str) -> Result<EscalatorVerdict, ParseError> {
     // "reason":"x"} garbage` because the default parser stops at the
     // closing brace.
     let mut stream = serde_json::Deserializer::from_str(json).into_iter::<EscalatorVerdict>();
-    let verdict = stream.next().ok_or_else(|| {
-        // Synthesize a Json error so the caller does not need to
-        // distinguish "empty input" from "malformed JSON" — both
-        // are genuine parse failures.
-        let synthetic = serde_json::from_str::<EscalatorVerdict>("")
-            .err()
-            .unwrap_or_else(|| {
-                // serde_json should always fail on empty input;
-                // keep a defensive fallback so the helper stays
-                // total.
-                serde_json::Error::io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "empty escalator verdict",
-                ))
-            });
-        ParseError::Json(synthetic)
-    })??;
+    let verdict = match stream.next() {
+        Some(item) => item?,
+        None => {
+            // The streaming iterator yields `None` only when the input
+            // contains no JSON value at all (empty or whitespace-only).
+            // Re-run the parser on the original input so the caller
+            // sees a normal `serde_json::Error`. The work is bounded
+            // by the size of the (already-empty) slice, so this is
+            // both faster and clearer than fabricating an error by
+            // hand. `serde_json` is contractually required to fail on
+            // whitespace-only input; if it ever returned `Ok` here the
+            // streaming iterator would have yielded a value, so the
+            // `Ok` branch below short-circuits to `Ok(verdict)` and
+            // keeps the function total without an `unwrap`/`expect`.
+            return match serde_json::from_str::<EscalatorVerdict>(json) {
+                Ok(v) => Ok(v),
+                Err(e) => Err(ParseError::Json(e)),
+            };
+        }
+    };
 
     let consumed = stream.byte_offset();
     let remainder = json[consumed..].trim_start();
@@ -258,6 +276,51 @@ mod tests {
         }"#;
         let err = parse_verdict(json).expect_err("string estimate must fail");
         assert!(matches!(err, ParseError::Json(_)));
+    }
+
+    #[test]
+    fn rejects_estimated_features_as_zero() {
+        // A `0` estimate is meaningless for the escalator's purpose.
+        // Per the schema docs, when there is nothing to estimate the
+        // model must emit `escalate: false` and omit the field.
+        let json = r#"{
+            "escalate": true,
+            "reason": "no real features",
+            "estimated_features": 0
+        }"#;
+        let err = parse_verdict(json).expect_err("zero estimate must fail");
+        assert!(
+            matches!(err, ParseError::Json(_)),
+            "expected ParseError::Json, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_estimated_features_as_float() {
+        // Both clearly-fractional (3.5) and "would-fool-a-permissive-parser"
+        // (3.0) cases must fail. `serde_json` keeps `f64` and `u64` as
+        // distinct numeric types, so `u32::deserialize` rejects both.
+        let fractional = r#"{
+            "escalate": true,
+            "reason": "ok",
+            "estimated_features": 3.5
+        }"#;
+        let err = parse_verdict(fractional).expect_err("3.5 must fail");
+        assert!(
+            matches!(err, ParseError::Json(_)),
+            "fractional float must produce ParseError::Json, got {err:?}"
+        );
+
+        let whole = r#"{
+            "escalate": true,
+            "reason": "ok",
+            "estimated_features": 3.0
+        }"#;
+        let err = parse_verdict(whole).expect_err("3.0 must fail");
+        assert!(
+            matches!(err, ParseError::Json(_)),
+            "whole-number float must produce ParseError::Json, got {err:?}"
+        );
     }
 
     #[test]
