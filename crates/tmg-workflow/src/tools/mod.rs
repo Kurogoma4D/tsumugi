@@ -57,3 +57,24 @@ pub fn register_workflow_tools(
 pub fn new_background_runs() -> BackgroundRunsHandle {
     Arc::new(Mutex::new(std::collections::HashMap::new()))
 }
+
+/// Fire the cancellation token on every registered background run.
+///
+/// Intended for the host (e.g. the CLI) to call before runtime
+/// shutdown so in-flight workflows have a chance to terminate
+/// promptly rather than be aborted at the runtime boundary. Mirrors
+/// [`RunWorkflowTool::cancel_all`] but does not require holding a
+/// reference to the tool — the CLI registers the tool into a
+/// `ToolRegistry` (a type-erasing container) and only the shared
+/// `BackgroundRunsHandle` is left in scope.
+///
+/// Returns the number of run entries observed.
+pub async fn cancel_all_background_runs(handle: &BackgroundRunsHandle) -> usize {
+    let runs = handle.lock().await;
+    let mut count = 0;
+    for entry in runs.values() {
+        entry.cancel.cancel();
+        count += 1;
+    }
+    count
+}

@@ -186,11 +186,19 @@ pub struct App {
     /// Optional receiver of [`WorkflowProgress`] events from a running
     /// workflow.
     ///
-    /// Wired in issue #41 as a minimal hook so the TUI can show *that*
-    /// a workflow is running and which step is current. The detailed
-    /// rendering (progress bar, stage list, elapsed) is tracked under
-    /// issue #45; for now we surface a single line in the activity
-    /// pane and update it as events arrive.
+    /// **Status (#41 → #45):** the receiver field, the
+    /// [`Self::set_workflow_progress_rx`] setter, and the
+    /// [`Self::drain_workflow_progress`] drain are wired into `App` as
+    /// a half-built API. The CLI does *not* yet attach a sender to a
+    /// running workflow — the foreground `run_workflow` path still
+    /// owns its own internal channel — so these symbols are inert at
+    /// runtime. The full plumbing (passing the workflow's
+    /// `mpsc::Sender<WorkflowProgress>` from inside the
+    /// `RunWorkflowTool` foreground branch through to the `App`) is
+    /// tracked under issue #45 along with the activity-pane
+    /// rendering. Keeping the half-built API in the file documents
+    /// the intended contract and lets #45 land as a wire-up rather
+    /// than a fresh design.
     workflow_progress_rx: Option<mpsc::Receiver<WorkflowProgress>>,
 
     /// Display state for the currently-running workflow, if any.
@@ -256,10 +264,14 @@ impl App {
         }
     }
 
-    /// Attach a workflow progress receiver. The CLI calls this when a
-    /// foreground workflow tool call dispatches the engine; the TUI
-    /// drains the channel from its event loop and updates a small
-    /// status section.
+    /// Attach a workflow progress receiver.
+    ///
+    /// Intended use: the CLI clones the workflow's progress sender
+    /// when a foreground `run_workflow` dispatches the engine and
+    /// passes the receiver here so the TUI's event loop drains
+    /// progress events. **Currently unused** — see
+    /// [`Self::workflow_progress_rx`] for the plan; #45 is the
+    /// follow-up that wires a real sender through.
     pub fn set_workflow_progress_rx(&mut self, rx: mpsc::Receiver<WorkflowProgress>) {
         self.workflow_progress_rx = Some(rx);
         self.workflow_status = None;
@@ -271,6 +283,10 @@ impl App {
     /// We update [`Self::workflow_status`] in place. The detailed
     /// rendering is intentionally minimal — issue #45 owns the full
     /// activity-pane layout; this is the wiring deliverable for #41.
+    ///
+    /// **Currently unused at runtime** — no caller installs a real
+    /// receiver via [`Self::set_workflow_progress_rx`] yet, so this
+    /// drain is a no-op in practice. The full wiring lands with #45.
     pub fn drain_workflow_progress(&mut self) -> bool {
         let Some(rx) = self.workflow_progress_rx.as_mut() else {
             return false;

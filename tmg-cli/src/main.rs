@@ -404,6 +404,12 @@ fn run_tui(
                 Vec::new()
             }
         };
+        // Background-runs handle. `Some` only if we actually
+        // registered the workflow tools below; the TUI shutdown path
+        // fires `cancel_all_background_runs` on it so in-flight
+        // workflows terminate promptly instead of being aborted at the
+        // runtime boundary.
+        let mut background_runs: Option<tmg_workflow::BackgroundRunsHandle> = None;
         if !workflow_metas.is_empty() {
             // Eagerly parse each discovered workflow into a
             // canonical [`tmg_workflow::WorkflowDef`]. Parse errors
@@ -451,8 +457,12 @@ fn run_tui(
                     )
                     .with_workflow_index(Arc::clone(&workflow_index)),
                 );
-                let background_runs = tmg_workflow::tools::new_background_runs();
-                tmg_workflow::register_workflow_tools(&mut registry, &engine, &background_runs);
+                let bg_runs = tmg_workflow::tools::new_background_runs();
+                tmg_workflow::register_workflow_tools(&mut registry, &engine, &bg_runs);
+                // Stash a clone for the TUI shutdown path so we can
+                // fire the cancellation tokens on every still-running
+                // background workflow before the runtime tears down.
+                background_runs = Some(bg_runs);
                 tracing::info!(
                     count = workflow_metas.len(),
                     "registered run_workflow and workflow_status tools",
@@ -506,6 +516,20 @@ fn run_tui(
             Some(Arc::clone(&runner)),
         )
         .await;
+
+        // Fire cancellation tokens on every still-running background
+        // workflow so they observe the shutdown signal before the
+        // runtime drops them. This is best-effort: a workflow whose
+        // current await point does not consult `EngineCtx::cancel`
+        // will still finish on its own, but at least the spawn
+        // closure's `select!` loop sees the token in the next branch
+        // it visits.
+        if let Some(handle) = background_runs.as_ref() {
+            let n = tmg_workflow::tools::cancel_all_background_runs(handle).await;
+            if n > 0 {
+                tracing::info!(count = n, "fired cancellation on background workflow runs");
+            }
+        }
 
         // Close the harness session before propagating the TUI result so
         // that `last_session_at` / `session_count` are persisted even on

@@ -5,6 +5,25 @@
 //! mode (`background: true`) spawns the workflow on a dedicated
 //! `tokio::task` and immediately returns a [`WorkflowRunId`] — the LLM
 //! can then poll `workflow_status` to track it.
+//!
+//! ## Background-run lifecycle and eviction
+//!
+//! Each background run is registered in the shared
+//! [`BackgroundRunsHandle`] map. The map is periodically swept on every
+//! `start_background` and `workflow_status` call; completed runs older
+//! than [`BACKGROUND_RUN_RETENTION`] are dropped so a long-lived
+//! process does not accumulate finished entries indefinitely. Running
+//! entries are never evicted regardless of age.
+//!
+//! ## Cancellation
+//!
+//! Each background run owns a child [`CancellationToken`] derived from
+//! the engine-wide token. [`RunWorkflowTool::cancel`] and
+//! [`RunWorkflowTool::cancel_all`] expose this surface to host code
+//! (e.g. the CLI's TUI shutdown path); the LLM is *not* given a
+//! `cancel_workflow` tool in this issue. Firing the token causes the
+//! spawned task's `select!` loop to record a `failed` outcome whose
+//! error message references cancellation.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::pin::Pin;
@@ -13,10 +32,14 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, OnceCell, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use tmg_tools::{Tool, ToolError, ToolResult};
 
-use super::types::{BackgroundRun, BackgroundRunsHandle, PROGRESS_BUFFER_CAP, WorkflowRunId};
+use super::types::{
+    BACKGROUND_RUN_RETENTION, BackgroundRun, BackgroundRunsHandle, PROGRESS_BUFFER_CAP,
+    WorkflowRunId, reap_completed_runs,
+};
 use crate::WorkflowEngine;
 use crate::def::{WorkflowDef, WorkflowOutputs};
 use crate::engine::WorkflowIndex;
@@ -24,7 +47,8 @@ use crate::progress::WorkflowProgress;
 
 /// LLM-facing tool: start a workflow run.
 ///
-/// See module-level docs for parameter shape and return contract.
+/// See module-level docs for parameter shape, return contract,
+/// background-run eviction policy, and the host-side cancel API.
 pub struct RunWorkflowTool {
     engine: Arc<WorkflowEngine>,
     workflow_index: WorkflowIndex,
@@ -68,7 +92,7 @@ impl Tool for RunWorkflowTool {
                 },
                 "inputs": {
                     "type": "object",
-                    "description": "Workflow inputs (passed to WorkflowEngine::run).",
+                    "description": "Map of input name to value, matching the workflow's declared inputs schema.",
                     "additionalProperties": true
                 },
                 "background": {
@@ -82,6 +106,10 @@ impl Tool for RunWorkflowTool {
         })
     }
 
+    // The `Tool` trait still requires returning a boxed future for
+    // dyn-compatibility (see `tmg_tools::types::Tool::execute`); when
+    // the trait migrates to a native `async fn`, this can collapse to
+    // a plain `async fn execute`.
     fn execute(
         &self,
         params: Value,
@@ -98,10 +126,18 @@ impl RunWorkflowTool {
             ));
         };
 
-        let inputs_obj = params.get("inputs").and_then(Value::as_object).cloned();
-        let inputs: BTreeMap<String, Value> = inputs_obj
-            .map(|map| map.into_iter().collect())
-            .unwrap_or_default();
+        // `inputs` is optional: when absent we use an empty map. When
+        // *present*, the value must be a JSON object — anything else
+        // (string / array / number / bool / null) is a programming
+        // error in the LLM's tool call rather than something we should
+        // silently ignore.
+        let inputs: BTreeMap<String, Value> = match params.get("inputs") {
+            None => BTreeMap::new(),
+            Some(Value::Object(map)) => map.clone().into_iter().collect(),
+            Some(_) => {
+                return Ok(ToolResult::error("inputs must be a JSON object"));
+            }
+        };
 
         let background = params
             .get("background")
@@ -140,8 +176,10 @@ impl RunWorkflowTool {
     /// [`BackgroundRun`] in the shared map.
     ///
     /// The returned [`WorkflowRunId`] is unique within this process
-    /// (eight hex characters of pseudo-random entropy; see
-    /// [`WorkflowRunId::generate`] for collision analysis).
+    /// (sixteen hex characters of pseudo-random entropy; see
+    /// [`WorkflowRunId::generate`] for collision analysis). Before
+    /// inserting the new entry we sweep the map of completed runs
+    /// older than [`BACKGROUND_RUN_RETENTION`].
     async fn start_background(
         &self,
         workflow: WorkflowDef,
@@ -150,41 +188,85 @@ impl RunWorkflowTool {
         let run_id = WorkflowRunId::generate();
         let (progress_tx, mut progress_rx) = mpsc::channel(64);
 
-        let bg_run = Arc::new(BackgroundRun {
-            started_at: Instant::now(),
-            progress_buffer: Mutex::new(VecDeque::with_capacity(PROGRESS_BUFFER_CAP)),
-            // We replace this `JoinHandle` immediately below with the
-            // real spawned task's handle once we have it. Using a
-            // dummy spawn here keeps the `BackgroundRun::new` shape
-            // simple and avoids `Option<JoinHandle<...>>` churn for a
-            // field that's only meaningful once the workflow is
-            // already running.
-            join_handle: tokio::spawn(async {}),
-            final_outputs: OnceCell::new(),
-        });
+        // Pre-allocate the shared state so the spawn closure can
+        // capture `Arc` clones; once `tokio::spawn` returns we hand
+        // the real `JoinHandle` to the registered `BackgroundRun`.
+        let progress_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(PROGRESS_BUFFER_CAP)));
+        let final_outputs: Arc<OnceCell<Result<WorkflowOutputs, String>>> =
+            Arc::new(OnceCell::new());
+        let cancel = CancellationToken::new();
+        let started_at = Instant::now();
 
-        let bg_for_task = Arc::clone(&bg_run);
+        let progress_buffer_for_task = Arc::clone(&progress_buffer);
+        let final_outputs_for_task = Arc::clone(&final_outputs);
+        let cancel_for_task = cancel.clone();
         let engine = Arc::clone(&self.engine);
-        let real_handle = tokio::spawn(async move {
+
+        let cancel_for_select = cancel.clone();
+        let join_handle = tokio::spawn(async move {
             let workflow_id = workflow.id.clone();
-            let run_fut = engine.run(&workflow, inputs, progress_tx);
+            let run_fut = engine.run_with_cancel(&workflow, inputs, progress_tx, cancel_for_task);
             tokio::pin!(run_fut);
+            // Outcome of the run, set by exactly one branch of the
+            // select! loop below. We use a local rather than writing
+            // straight into `final_outputs` so the post-loop logic
+            // can converge on a single set-once site.
+            let outcome: Result<WorkflowOutputs, String>;
             loop {
                 tokio::select! {
                     biased;
+                    () = cancel_for_select.cancelled() => {
+                        // External cancel observed. The engine itself
+                        // may not honour the token at every await
+                        // point (only `human` and inner control-flow
+                        // steps do), so we record the cancellation
+                        // outcome here and let the spawned run future
+                        // unwind on its own. Any final progress
+                        // events emitted before the engine sees the
+                        // token are drained best-effort.
+                        while let Ok(ev) = progress_rx.try_recv() {
+                            push_progress(&progress_buffer_for_task, ev).await;
+                        }
+                        tracing::info!(
+                            workflow = %workflow_id,
+                            "background workflow cancelled",
+                        );
+                        outcome = Err("workflow cancelled".to_owned());
+                        break;
+                    }
                     event = progress_rx.recv() => {
-                        match event {
-                            Some(ev) => push_progress(&bg_for_task.progress_buffer, ev).await,
-                            None => break,
+                        if let Some(ev) = event {
+                            push_progress(&progress_buffer_for_task, ev).await;
+                        } else {
+                            // Channel closed before the run future
+                            // resolved. This is unusual but not
+                            // fatal: we fall through and await the
+                            // run future to capture its real
+                            // outcome rather than guessing.
+                            let result = (&mut run_fut).await;
+                            outcome = match result {
+                                Ok(outputs) => Ok(outputs),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        workflow = %workflow_id,
+                                        error = %e,
+                                        "background workflow failed",
+                                    );
+                                    Err(e.to_string())
+                                }
+                            };
+                            break;
                         }
                     }
                     result = &mut run_fut => {
                         // Drain any final events the engine emitted
-                        // before its sender dropped.
+                        // before its sender dropped, *before* writing
+                        // the outcome — both select arms then converge
+                        // on the same post-loop completion path.
                         while let Ok(ev) = progress_rx.try_recv() {
-                            push_progress(&bg_for_task.progress_buffer, ev).await;
+                            push_progress(&progress_buffer_for_task, ev).await;
                         }
-                        let outcome = match result {
+                        outcome = match result {
                             Ok(outputs) => Ok(outputs),
                             Err(e) => {
                                 tracing::warn!(
@@ -195,37 +277,66 @@ impl RunWorkflowTool {
                                 Err(e.to_string())
                             }
                         };
-                        let _ = bg_for_task.final_outputs.set(outcome);
-                        return;
+                        break;
                     }
                 }
             }
-            // The receiver closed before the run future resolved —
-            // unusual; record a clear marker so `workflow_status`
-            // surfaces it as an error rather than spinning forever.
-            let _ = bg_for_task
-                .final_outputs
-                .set(Err("workflow channel closed unexpectedly".to_owned()));
+            let _ = final_outputs_for_task.set(outcome);
         });
 
-        // Replace the dummy handle with the real one. We use
-        // `swap`-style logic via a helper because `JoinHandle` is not
-        // `Sync`-friendly across `Arc` mutation; instead we wrap the
-        // `BackgroundRun` differently. To keep the public shape stable
-        // and avoid an `Arc<Mutex<JoinHandle>>` we accept that the
-        // public `join_handle` field reflects the *replacement* handle
-        // by mutating it through interior reuse: see comment above.
-        //
-        // In practice the dummy handle is benign — it completes
-        // immediately and is not awaited anywhere. The "real" handle
-        // is observable via the registered `Arc<BackgroundRun>` only
-        // through `final_outputs.get()`, which is the API contract
-        // workflow_status uses.
-        drop(real_handle); // tokio task continues running detached
+        // Construct the `BackgroundRun` *after* `tokio::spawn` so the
+        // registered `join_handle` field reflects the real task —
+        // `is_finished()` therefore reports correctly. The
+        // `Arc<Mutex<...>>` / `Arc<OnceCell<...>>` clones below point
+        // at the same allocations the spawn closure captured, so
+        // reads through the registered run observe writes performed
+        // by the task.
+        let bg_run = Arc::new(BackgroundRun {
+            started_at,
+            progress_buffer: Arc::clone(&progress_buffer),
+            final_outputs: Arc::clone(&final_outputs),
+            join_handle: Mutex::new(Some(join_handle)),
+            cancel,
+        });
 
         let mut runs = self.background_runs.lock().await;
+        let now = Instant::now();
+        reap_completed_runs(&mut runs, BACKGROUND_RUN_RETENTION, now);
         runs.insert(run_id.clone(), bg_run);
         run_id
+    }
+
+    /// Fire the cancellation token for the background run with `run_id`.
+    ///
+    /// Returns `true` if a matching run was found, `false` otherwise.
+    /// Looking up an already-finished run still returns `true` (the
+    /// token fires harmlessly and the cancel is recorded as a no-op).
+    /// This API is intended for host code (e.g. the CLI's TUI
+    /// shutdown path); the LLM does not see it as a tool.
+    pub async fn cancel(&self, run_id: &WorkflowRunId) -> bool {
+        let runs = self.background_runs.lock().await;
+        if let Some(entry) = runs.get(run_id) {
+            entry.cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Fire cancellation tokens for every registered background run.
+    /// Used at process / TUI shutdown to give in-flight workflows a
+    /// chance to terminate promptly rather than be aborted at the
+    /// runtime boundary. Returns the number of runs that had their
+    /// token fired (including already-completed ones, since the call
+    /// is idempotent).
+    pub async fn cancel_all(&self) -> usize {
+        let runs = self.background_runs.lock().await;
+        let mut count = 0;
+        for entry in runs.values() {
+            entry.cancel.cancel();
+            count += 1;
+        }
+        count
     }
 }
 

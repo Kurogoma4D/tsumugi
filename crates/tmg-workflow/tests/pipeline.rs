@@ -184,10 +184,7 @@ outputs:
         .unwrap();
     // The loop hits max-iterations since `until` never matches.
     assert!(
-        outputs
-            .values
-            .get("reached")
-            .is_some_and(|v| !v.is_empty()),
+        outputs.values.get("reached").is_some_and(|v| !v.is_empty()),
         "expected non-empty reached output, got: {outputs:?}"
     );
 

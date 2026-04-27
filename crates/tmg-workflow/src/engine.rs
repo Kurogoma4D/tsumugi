@@ -356,6 +356,28 @@ impl WorkflowEngine {
         inputs: BTreeMap<String, Value>,
         progress_tx: mpsc::Sender<WorkflowProgress>,
     ) -> Result<WorkflowOutputs> {
+        // No external cancel token supplied: each run gets its own
+        // private token. Firing it from outside is impossible by
+        // construction.
+        self.run_with_cancel(workflow, inputs, progress_tx, CancellationToken::new())
+            .await
+    }
+
+    /// Like [`Self::run`] but accepts an externally-owned
+    /// [`CancellationToken`] so callers (e.g. the `run_workflow`
+    /// background spawn) can request prompt termination.
+    ///
+    /// The supplied token is *cloned* into the engine context: firing
+    /// it propagates to every step handler that observes
+    /// `EngineCtx::cancel`. Currently that is the `human` step and
+    /// any `parallel` siblings (see `EngineCtx::cancel` docs).
+    pub async fn run_with_cancel(
+        &self,
+        workflow: &WorkflowDef,
+        inputs: BTreeMap<String, Value>,
+        progress_tx: mpsc::Sender<WorkflowProgress>,
+        cancel: CancellationToken,
+    ) -> Result<WorkflowOutputs> {
         // Resolve inputs (apply defaults / required check).
         let resolved_inputs = resolve_inputs(&workflow.inputs, inputs)?;
         let inputs_value = Value::Object(resolved_inputs);
@@ -385,7 +407,7 @@ impl WorkflowEngine {
             inputs: Arc::new(inputs_value),
             progress_tx,
             agent_semaphore,
-            cancel: CancellationToken::new(),
+            cancel,
             workflow_index: self.workflow_index.clone(),
             stages: Arc::new(RwLock::new(BTreeMap::new())),
             workflow_depth: 0,

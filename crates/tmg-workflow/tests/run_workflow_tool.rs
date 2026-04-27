@@ -142,7 +142,7 @@ outputs:
         .and_then(Value::as_str)
         .unwrap()
         .to_owned();
-    assert_eq!(run_id.len(), 8);
+    assert_eq!(run_id.len(), 16);
     assert_eq!(
         parsed.get("status").and_then(Value::as_str),
         Some("running")
@@ -256,9 +256,208 @@ async fn unknown_run_id_returns_clear_error() {
     let status_tool = WorkflowStatusTool::new(bg);
 
     let result = status_tool
-        .execute(serde_json::json!({"run_id": "deadbeef"}))
+        .execute(serde_json::json!({"run_id": "0123456789abcdef"}))
         .await
         .unwrap();
     assert!(result.is_error);
     assert!(result.output.contains("unknown run_id"));
 }
+
+/// A non-object `inputs` parameter is rejected with a clear error
+/// rather than being silently coerced to an empty map.
+#[tokio::test]
+async fn non_object_inputs_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let yaml = r#"
+id: simple
+steps:
+  - id: produce
+    type: shell
+    command: "echo hi"
+outputs:
+  out: "${{ steps.produce.exit_code }}"
+"#;
+    let (engine, index) = build_engine(tmp.path(), vec![("simple", yaml)]);
+    let bg = tools::new_background_runs();
+    let tool = RunWorkflowTool::new(engine, index, bg);
+
+    // Array instead of object.
+    let r = tool
+        .execute(serde_json::json!({"workflow": "simple", "inputs": [1, 2, 3]}))
+        .await
+        .unwrap();
+    assert!(r.is_error, "expected error result for array inputs");
+    assert!(r.output.contains("inputs must be a JSON object"));
+
+    // String instead of object.
+    let r = tool
+        .execute(serde_json::json!({"workflow": "simple", "inputs": "oops"}))
+        .await
+        .unwrap();
+    assert!(r.is_error);
+    assert!(r.output.contains("inputs must be a JSON object"));
+}
+
+/// A successful background workflow ends with `final_outputs == Ok(...)`
+/// rather than the channel-closed sentinel: we observe the same value
+/// twice — first via `workflow_status` and second via a direct read of
+/// the `BackgroundRun` cell — and assert there is no spurious
+/// "channel closed unexpectedly" leak when both select arms could
+/// have raced.
+#[tokio::test]
+async fn successful_run_does_not_leak_channel_closed_sentinel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let yaml = r#"
+id: bg
+steps:
+  - id: produce
+    type: shell
+    command: "echo bg-done"
+outputs:
+  signal: "${{ steps.produce.exit_code }}"
+"#;
+    let (engine, index) = build_engine(tmp.path(), vec![("bg", yaml)]);
+    let bg = tools::new_background_runs();
+    let run_tool = RunWorkflowTool::new(Arc::clone(&engine), index, Arc::clone(&bg));
+    let status_tool = WorkflowStatusTool::new(Arc::clone(&bg));
+
+    // Spawn the run repeatedly to give the select! race plenty of
+    // chances; the bug originally manifested intermittently when the
+    // run-future arm fired and the post-loop "channel closed
+    // unexpectedly" path overwrote the success outcome.
+    for _ in 0..5 {
+        let start = run_tool
+            .execute(serde_json::json!({"workflow": "bg", "background": true}))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&start.output).unwrap();
+        let run_id = parsed
+            .get("run_id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_owned();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let r = status_tool
+                .execute(serde_json::json!({"run_id": run_id.clone()}))
+                .await
+                .unwrap();
+            let parsed: Value = serde_json::from_str(&r.output).unwrap();
+            let status = parsed.get("status").and_then(Value::as_str).unwrap_or("");
+            if status == "completed" {
+                let err = parsed.get("error").cloned().unwrap_or(Value::Null);
+                assert!(
+                    err.is_null(),
+                    "completed run should have null error, got {err:?}",
+                );
+                let out = parsed.get("outputs").cloned().unwrap_or(Value::Null);
+                assert!(
+                    out.is_object(),
+                    "completed run should expose outputs object"
+                );
+                break;
+            }
+            assert_ne!(
+                status, "failed",
+                "run unexpectedly failed; full status = {parsed}",
+            );
+            if std::time::Instant::now() > deadline {
+                panic!("background run did not complete in time; last status = {parsed}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// Cancelling a background run mid-flight terminates promptly with
+/// `status: failed` and an error message referencing cancellation.
+#[tokio::test]
+async fn cancel_mid_run_terminates_with_failed_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Use an outer human step so the engine *itself* has an await
+    // point that observes `EngineCtx::cancel`. The shell step alone
+    // would not honour the token directly, but the spawn closure's
+    // `select!` watches the cancel arm so the *recorded* outcome
+    // still flips to `failed` regardless.
+    let yaml = r#"
+id: long
+steps:
+  - id: wait
+    type: human
+    message: "approve to continue"
+outputs:
+  ok: "${{ steps.wait.output.kind }}"
+"#;
+    let (engine, index) = build_engine(tmp.path(), vec![("long", yaml)]);
+    let bg = tools::new_background_runs();
+    let run_tool = RunWorkflowTool::new(Arc::clone(&engine), index, Arc::clone(&bg));
+    let status_tool = WorkflowStatusTool::new(Arc::clone(&bg));
+
+    let start = run_tool
+        .execute(serde_json::json!({"workflow": "long", "background": true}))
+        .await
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&start.output).unwrap();
+    let run_id = parsed
+        .get("run_id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_owned();
+
+    // Confirm the run is registered and running before we cancel.
+    let r = status_tool
+        .execute(serde_json::json!({"run_id": run_id.clone()}))
+        .await
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&r.output).unwrap();
+    assert_eq!(
+        parsed.get("status").and_then(Value::as_str),
+        Some("running"),
+    );
+
+    // Cancel via the host-side API. The LLM-facing surface stays
+    // unchanged in this issue; only the host (CLI / shutdown path)
+    // can request termination. We deliberately route through
+    // `cancel_all_background_runs` to mirror the CLI shutdown path.
+    let n = tmg_workflow::tools::cancel_all_background_runs(&bg).await;
+    assert!(n >= 1, "cancel_all should have observed at least one run");
+
+    // Poll for the failed status. With the spawn closure's cancel
+    // arm in place this transition is prompt — well under a second
+    // even though the engine's own `human` step has its own
+    // cancellation path.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let r = status_tool
+            .execute(serde_json::json!({"run_id": run_id.clone()}))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&r.output).unwrap();
+        let status = parsed.get("status").and_then(Value::as_str).unwrap_or("");
+        if status == "failed" {
+            let err = parsed
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_lowercase();
+            assert!(
+                err.contains("cancel"),
+                "failed-run error should mention cancellation, got {err:?}",
+            );
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("cancelled run did not record `failed` in time; last status = {parsed}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+// Eviction of completed runs is exercised as a unit test in
+// `crates/tmg-workflow/src/tools/types.rs::tests` (see
+// `reap_completed_runs_evicts_only_completed_old_entries`). The unit
+// test has direct access to the `BackgroundRun` constructor without
+// needing a public test surface; integration coverage of the
+// `start_background` path is provided by the other tests in this
+// file.

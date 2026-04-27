@@ -21,17 +21,31 @@
 //!   `step_id (iter/max)`.
 //! - Otherwise the latest `StepStarted` event's `step_id` is used
 //!   bare.
+//! - If the most recent terminal event for that step is
+//!   `StepCompleted` / `StepFailed` (i.e. nothing has started since
+//!   the step finished), `current_step` is `null` to avoid pretending
+//!   a finished step is still running.
 //! - Outside an active step (run finished, or no events buffered yet)
 //!   the field is `null`.
+//!
+//! ## Eviction side effect
+//!
+//! Every call sweeps the runs map of completed entries older than
+//! [`crate::tools::types::BACKGROUND_RUN_RETENTION`] before performing
+//! its lookup. This keeps a long-lived process from accumulating
+//! finished entries; running entries are never evicted.
 
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use tmg_tools::{Tool, ToolError, ToolResult};
 
-use super::types::{BackgroundRun, BackgroundRunsHandle, WorkflowRunId};
+use super::types::{
+    BACKGROUND_RUN_RETENTION, BackgroundRun, BackgroundRunsHandle, WorkflowRunId,
+    reap_completed_runs,
+};
 use crate::progress::WorkflowProgress;
 
 /// LLM-facing tool: query the status of a previously-started
@@ -73,6 +87,10 @@ impl Tool for WorkflowStatusTool {
         })
     }
 
+    // The `Tool` trait still requires returning a boxed future for
+    // dyn-compatibility (see `tmg_tools::types::Tool::execute`); when
+    // the trait migrates to a native `async fn`, this can collapse to
+    // a plain `async fn execute`.
     fn execute(
         &self,
         params: Value,
@@ -88,10 +106,20 @@ impl WorkflowStatusTool {
                 "missing required parameter: run_id",
             ));
         };
-        let run_id = WorkflowRunId::from_str_unchecked(run_id_str.to_owned());
+        // Reject malformed run ids early — anything that does not
+        // match the canonical 16-char lowercase hex shape cannot be in
+        // the map by construction, and surfacing "unknown run_id" for
+        // a typo is more useful than a silent map miss.
+        let Some(run_id) = WorkflowRunId::parse_lookup_key(run_id_str) else {
+            return Ok(ToolResult::error(format!("unknown run_id: '{run_id_str}'")));
+        };
 
         let bg_run = {
-            let guard = self.background_runs.lock().await;
+            let mut guard = self.background_runs.lock().await;
+            // Sweep stale completed entries opportunistically so a
+            // long-lived session does not accumulate finished runs.
+            // Running entries are never evicted regardless of age.
+            reap_completed_runs(&mut guard, BACKGROUND_RUN_RETENTION, Instant::now());
             guard.get(&run_id).cloned()
         };
         let Some(bg_run) = bg_run else {
@@ -149,35 +177,56 @@ async fn build_status(bg_run: &BackgroundRun) -> Value {
 ///
 /// Priority:
 ///
-/// 1. The most recent `LoopIteration` event → `"<step_id> (i/max)"`.
-/// 2. The most recent `StepStarted` event → `"<step_id>"`.
+/// 1. The most recent `LoopIteration` event → `"<step_id> (i/max)"`
+///    (loops emit iterations *during* their execution, so a trailing
+///    `LoopIteration` always names the active step regardless of
+///    inner-step `StepStarted` events emitted after it).
+/// 2. The most recent `StepStarted` event whose step has not since
+///    received a `StepCompleted` / `StepFailed` event for the same
+///    id → `"<step_id>"`.
 /// 3. None.
+///
+/// Returning `null` once the latest `StepStarted`'s step has
+/// terminated avoids pretending a finished step is still running just
+/// because no later step has begun. This matters between sequential
+/// steps and at the very end of a successful run.
 fn derive_current_step(buffer: &std::collections::VecDeque<WorkflowProgress>) -> Value {
-    let mut last_step_started: Option<&str> = None;
-    let mut last_loop: Option<(&str, u32, u32)> = None;
+    // First pass (newest-to-oldest): if a `LoopIteration` is the most
+    // recent loop-related event we have, it wins outright.
+    for ev in buffer.iter().rev() {
+        if let WorkflowProgress::LoopIteration {
+            step_id,
+            iteration,
+            max,
+        } = ev
+        {
+            return Value::String(format!("{step_id} ({iteration}/{max})"));
+        }
+    }
+
+    // Second pass: find the most recent `StepStarted` whose step has
+    // not since terminated (no later `StepCompleted` / `StepFailed`
+    // for the same id). A trailing termination event for the latest
+    // started step suppresses it so we don't report a finished step
+    // as current.
+    let mut terminated_steps: Vec<&str> = Vec::new();
     for ev in buffer.iter().rev() {
         match ev {
-            WorkflowProgress::LoopIteration {
-                step_id,
-                iteration,
-                max,
-            } => {
-                last_loop = Some((step_id.as_str(), *iteration, *max));
-                break;
+            WorkflowProgress::StepCompleted { step_id, .. }
+            | WorkflowProgress::StepFailed { step_id, .. } => {
+                terminated_steps.push(step_id.as_str());
             }
             WorkflowProgress::StepStarted { step_id, .. } => {
-                if last_step_started.is_none() {
-                    last_step_started = Some(step_id.as_str());
+                let id = step_id.as_str();
+                if !terminated_steps.contains(&id) {
+                    return Value::String(id.to_owned());
                 }
+                // Step started but later terminated; keep walking
+                // for an earlier still-active step (rare; only with
+                // overlapping control-flow events in the buffer).
             }
             _ => {}
         }
-    }
-    if let Some((id, iter, max)) = last_loop {
-        return Value::String(format!("{id} ({iter}/{max})"));
-    }
-    if let Some(id) = last_step_started {
-        return Value::String(id.to_owned());
     }
     Value::Null
 }
@@ -204,6 +253,7 @@ fn format_duration(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::def::StepResult;
     use std::collections::VecDeque;
 
     #[test]
@@ -230,6 +280,8 @@ mod tests {
             step_type: "shell",
         });
         let v = derive_current_step(&q);
+        // The loop iteration wins because we walk newest-to-oldest
+        // and break on the first LoopIteration we see.
         assert_eq!(v, Value::String("verify_loop (3/5)".to_owned()));
     }
 
@@ -247,6 +299,40 @@ mod tests {
     #[test]
     fn derive_current_step_empty() {
         let q: VecDeque<WorkflowProgress> = VecDeque::new();
+        let v = derive_current_step(&q);
+        assert_eq!(v, Value::Null);
+    }
+
+    /// A `StepCompleted` more recent than the latest `StepStarted`
+    /// for the same id suppresses the started event so we don't
+    /// pretend a finished step is still running.
+    #[test]
+    fn derive_current_step_suppresses_finished_step() {
+        let mut q: VecDeque<WorkflowProgress> = VecDeque::new();
+        q.push_back(WorkflowProgress::StepStarted {
+            step_id: "build".to_owned(),
+            step_type: "shell",
+        });
+        q.push_back(WorkflowProgress::StepCompleted {
+            step_id: "build".to_owned(),
+            result: StepResult::default(),
+        });
+        let v = derive_current_step(&q);
+        assert_eq!(v, Value::Null);
+    }
+
+    /// Same idea for `StepFailed`.
+    #[test]
+    fn derive_current_step_suppresses_failed_step() {
+        let mut q: VecDeque<WorkflowProgress> = VecDeque::new();
+        q.push_back(WorkflowProgress::StepStarted {
+            step_id: "verify".to_owned(),
+            step_type: "shell",
+        });
+        q.push_back(WorkflowProgress::StepFailed {
+            step_id: "verify".to_owned(),
+            error: "boom".to_owned(),
+        });
         let v = derive_current_step(&q);
         assert_eq!(v, Value::Null);
     }
