@@ -70,6 +70,21 @@ pub enum AgentType {
     /// Allowed tools: `feature_list_read`, `feature_list_mark_passing`,
     /// `file_read`.
     Qa,
+
+    /// Scope-escalation evaluator (SPEC §5.2 / §9.3).
+    ///
+    /// Read-only judge that decides whether the current task should be
+    /// promoted from an ad-hoc run to a fully harnessed run. Receives a
+    /// snapshot of the user request plus a brief workspace recon and
+    /// returns a strict JSON verdict
+    /// (`{ "escalate": bool, "reason": string, "estimated_features": int? }`).
+    ///
+    /// Allowed tools: `file_read`, `list_dir`. The escalator never
+    /// mutates the workspace and is intended to run on a lightweight,
+    /// dedicated endpoint (configurable via `[harness.escalator]`) so
+    /// the cost of the gating decision stays small relative to the run
+    /// itself; see [`crate::escalator`] for the verdict parser.
+    Escalator,
 }
 
 impl AgentType {
@@ -81,6 +96,7 @@ impl AgentType {
         Self::Initializer,
         Self::Tester,
         Self::Qa,
+        Self::Escalator,
     ];
 
     /// Return the tool names allowed for this agent type.
@@ -116,6 +132,7 @@ impl AgentType {
                 "feature_list_mark_passing",
                 "file_read",
             ],
+            Self::Escalator => &["file_read", "list_dir"],
         }
     }
 
@@ -133,6 +150,8 @@ impl AgentType {
     ///   `feature_list_mark_passing`.
     /// - `Explore` / `Plan`: [`SandboxMode::ReadOnly`].
     /// - `Worker`: [`SandboxMode::WorkspaceWrite`].
+    /// - `Escalator`: [`SandboxMode::ReadOnly`] — the escalator only
+    ///   inspects the workspace to estimate scope and never mutates it.
     ///
     /// # Advisory only
     ///
@@ -147,12 +166,16 @@ impl AgentType {
     #[must_use]
     pub fn sandbox_mode(&self) -> SandboxMode {
         match self {
-            Self::Explore | Self::Plan | Self::Qa => SandboxMode::ReadOnly,
+            Self::Explore | Self::Plan | Self::Qa | Self::Escalator => SandboxMode::ReadOnly,
             Self::Worker | Self::Initializer | Self::Tester => SandboxMode::WorkspaceWrite,
         }
     }
 
     /// Return the system prompt for this agent type.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear per-variant prompt match; splitting would scatter SPEC text across helpers"
+    )]
     pub fn system_prompt(&self) -> &'static str {
         match self {
             Self::Explore => {
@@ -219,6 +242,47 @@ impl AgentType {
                  modify any source file. Report the set of features marked \
                  passing and any features you explicitly chose not to mark."
             }
+            Self::Escalator => {
+                "You are the escalator subagent (SPEC §5.2 / §9.3). Your single \
+                 responsibility is to decide whether the user's current request \
+                 should be promoted from an ad-hoc run to a fully harnessed run. \
+                 You have read-only access to the workspace via `file_read` and \
+                 `list_dir`; do not attempt any other action. \
+                 \
+                 Evaluate the request against this rubric: \
+                 (1) breadth -- does it span multiple subsystems, modules, or \
+                 several distinct features? \
+                 (2) duration -- will it plausibly require multiple sessions \
+                 (more than a single sitting) to complete? \
+                 (3) verification surface -- does it need a stable acceptance \
+                 list (features.json) and recurring smoke tests, or is a \
+                 single-shot fix enough? \
+                 \
+                 If at least two of those signals point to harnessed scope, \
+                 escalate. Otherwise, decline. Be conservative: when in doubt, \
+                 do NOT escalate -- harnessed runs are expensive and the user \
+                 can always re-issue the request with explicit harnessing. \
+                 \
+                 You MUST output a single JSON object and nothing else. The \
+                 schema is strict: \
+                 \
+                 { \"escalate\": <bool>, \"reason\": <string>, \
+                 \"estimated_features\": <int> } \
+                 \
+                 Rules: \
+                 - `escalate` is required and must be `true` or `false`. \
+                 - `reason` is required and must be a concise one- or two- \
+                   sentence justification (no markdown, no newlines inside). \
+                 - `estimated_features` is OPTIONAL. Include it only when \
+                   `escalate` is `true` and you can give a defensible \
+                   integer estimate of how many entries `features.json` will \
+                   eventually need (target 30-50 per the initializer spec). \
+                   If you cannot estimate, OMIT the field entirely -- do not \
+                   send `null`, `0`, or a string. \
+                 - Output JSON only. No prose before or after, no code fences, \
+                   no comments, no extra fields. The harness rejects any \
+                   response that does not parse as exactly this schema."
+            }
         }
     }
 
@@ -235,6 +299,9 @@ impl AgentType {
             Self::Qa => {
                 "Acceptance-criteria QA (read-only; only agent that can mark features passing)"
             }
+            Self::Escalator => {
+                "Scope-escalation evaluator (read-only; emits strict JSON verdict for harnessing)"
+            }
         }
     }
 
@@ -247,6 +314,7 @@ impl AgentType {
             Self::Initializer => "initializer",
             Self::Tester => "tester",
             Self::Qa => "qa",
+            Self::Escalator => "escalator",
         }
     }
 
@@ -349,6 +417,10 @@ mod tests {
         );
         assert_eq!(AgentType::from_name("tester"), Some(AgentType::Tester));
         assert_eq!(AgentType::from_name("qa"), Some(AgentType::Qa));
+        assert_eq!(
+            AgentType::from_name("escalator"),
+            Some(AgentType::Escalator)
+        );
         assert_eq!(AgentType::from_name("unknown"), None);
     }
 
@@ -360,6 +432,7 @@ mod tests {
         assert_eq!(AgentType::Initializer.to_string(), "initializer");
         assert_eq!(AgentType::Tester.to_string(), "tester");
         assert_eq!(AgentType::Qa.to_string(), "qa");
+        assert_eq!(AgentType::Escalator.to_string(), "escalator");
     }
 
     #[test]
@@ -390,10 +463,32 @@ mod tests {
 
     #[test]
     fn all_types_covered() {
-        assert_eq!(AgentType::ALL.len(), 6);
+        assert_eq!(AgentType::ALL.len(), 7);
         assert!(AgentType::ALL.contains(&AgentType::Initializer));
         assert!(AgentType::ALL.contains(&AgentType::Tester));
         assert!(AgentType::ALL.contains(&AgentType::Qa));
+        assert!(AgentType::ALL.contains(&AgentType::Escalator));
+    }
+
+    #[test]
+    fn escalator_spec() {
+        let tools = AgentType::Escalator.allowed_tools();
+        assert_eq!(tools, &["file_read", "list_dir"]);
+        assert_eq!(AgentType::Escalator.sandbox_mode(), SandboxMode::ReadOnly);
+        let prompt = AgentType::Escalator.system_prompt();
+        assert!(!prompt.is_empty());
+        assert!(
+            prompt.contains("escalate"),
+            "escalator prompt must mention the escalate verdict field: {prompt}"
+        );
+        assert!(
+            prompt.contains("estimated_features"),
+            "escalator prompt must describe the optional estimated_features field: {prompt}"
+        );
+        assert!(
+            prompt.contains("JSON"),
+            "escalator prompt must call out strict JSON output: {prompt}"
+        );
     }
 
     #[test]
@@ -513,5 +608,10 @@ mod tests {
             .ok()
             .unwrap_or(AgentType::Explore);
         assert_eq!(parsed, AgentType::Qa);
+
+        let parsed: AgentType = serde_json::from_str("\"escalator\"")
+            .ok()
+            .unwrap_or(AgentType::Explore);
+        assert_eq!(parsed, AgentType::Escalator);
     }
 }

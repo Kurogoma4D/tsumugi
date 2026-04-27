@@ -144,6 +144,68 @@ struct PartialHarnessConfig {
     /// [`load_config`] runs rather than only when the harness tries to
     /// schedule a session.
     pub default_session_timeout: Option<String>,
+    /// `[harness.escalator]` overrides for the scope-escalation
+    /// subagent (SPEC §10.1 / §9.10 / issue #36).
+    #[serde(default)]
+    pub escalator: PartialEscalatorConfig,
+}
+
+/// Partial `[harness.escalator]` config used for deserialization from
+/// TOML.
+///
+/// All three fields are optional; missing values (or empty strings on
+/// `endpoint` / `model`) mean "inherit from the main `[llm]` section"
+/// when the value is later handed to
+/// [`tmg_agents::EscalatorOverrides::from_strings`].
+///
+/// Mirrors the `deny_unknown_fields` policy of [`PartialHarnessConfig`]
+/// so a typo in `[harness.escalator]` is rejected at load time.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialEscalatorConfig {
+    /// Override endpoint URL for escalator spawns. Empty string or
+    /// absent means "inherit `[llm] endpoint`".
+    pub endpoint: Option<String>,
+
+    /// Override model name for escalator spawns. Empty string or
+    /// absent means "inherit `[llm] model`".
+    pub model: Option<String>,
+
+    /// When `true`, the harness rejects requests for the escalator
+    /// subagent (SPEC §9.10 cost management). The auto-promotion gate
+    /// (issue #37) treats a disabled escalator as "do not escalate".
+    pub disable: Option<bool>,
+}
+
+impl PartialEscalatorConfig {
+    /// Merge `other` into `self`. `Some(_)` fields in `other` win,
+    /// mirroring the rest of the partial-config merge story. Empty
+    /// strings are preserved so the same TOML round-trips cleanly;
+    /// the empty-string-as-inherit convention is resolved exactly
+    /// once when the partial is converted to the final
+    /// [`EscalatorConfig`] by the consumer.
+    fn merge_from(&mut self, other: &Self) {
+        if other.endpoint.is_some() {
+            self.endpoint.clone_from(&other.endpoint);
+        }
+        if other.model.is_some() {
+            self.model.clone_from(&other.model);
+        }
+        if other.disable.is_some() {
+            self.disable = other.disable;
+        }
+    }
+
+    /// Resolve into the final [`EscalatorConfig`]. No validation is
+    /// required here -- empty strings are valid (they simply mean
+    /// "inherit") and the disable flag is a plain bool.
+    fn into_final(self) -> EscalatorConfig {
+        EscalatorConfig {
+            endpoint: self.endpoint.unwrap_or_default(),
+            model: self.model.unwrap_or_default(),
+            disable: self.disable.unwrap_or(false),
+        }
+    }
 }
 
 impl PartialHarnessConfig {
@@ -168,6 +230,7 @@ impl PartialHarnessConfig {
             self.default_session_timeout
                 .clone_from(&other.default_session_timeout);
         }
+        self.escalator.merge_from(&other.escalator);
     }
 
     /// Convert to final `HarnessConfig`, filling in defaults for unset
@@ -228,6 +291,7 @@ impl PartialHarnessConfig {
             smoke_test_every_n_sessions,
             default_max_sessions,
             default_session_timeout,
+            escalator: self.escalator.into_final(),
         })
     }
 }
@@ -409,6 +473,20 @@ impl PartialTsumugiConfig {
             }
             self.harness.default_session_timeout = Some(v);
         }
+        if let Some(v) = env_fn("TMG_HARNESS_ESCALATOR_ENDPOINT") {
+            self.harness.escalator.endpoint = Some(v);
+        }
+        if let Some(v) = env_fn("TMG_HARNESS_ESCALATOR_MODEL") {
+            self.harness.escalator.model = Some(v);
+        }
+        if let Some(v) = env_fn("TMG_HARNESS_ESCALATOR_DISABLE") {
+            let parsed = parse_bool(&v).map_err(|()| ConfigError::InvalidValue {
+                field: "TMG_HARNESS_ESCALATOR_DISABLE".to_owned(),
+                value: v,
+                reason: "must be one of: true, false, 1, 0".to_owned(),
+            })?;
+            self.harness.escalator.disable = Some(parsed);
+        }
         Ok(())
     }
 
@@ -524,6 +602,31 @@ pub struct TuiConfig {
     pub show_token_usage: Option<bool>,
 }
 
+/// `[harness.escalator]` settings (SPEC §10.1 / §9.10 / issue #36).
+///
+/// Empty `endpoint` / `model` mean "inherit the main `[llm]`
+/// endpoint / model" when handed to
+/// [`tmg_agents::EscalatorOverrides::from_strings`]. The struct itself
+/// keeps the raw strings so a TOML round-trip preserves the operator's
+/// exact configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct EscalatorConfig {
+    /// Override endpoint for escalator spawns. Empty string means
+    /// "inherit `[llm] endpoint`".
+    #[serde(default)]
+    pub endpoint: String,
+
+    /// Override model for escalator spawns. Empty string means
+    /// "inherit `[llm] model`".
+    #[serde(default)]
+    pub model: String,
+
+    /// When `true`, escalator spawns are rejected with
+    /// `AgentError::EscalatorDisabled`.
+    #[serde(default)]
+    pub disable: bool,
+}
+
 /// Harness settings from `[harness]` section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessConfig {
@@ -562,6 +665,11 @@ pub struct HarnessConfig {
     /// `tsumugi.toml` as a humantime string (e.g. `"30m"`, `"1h30m"`).
     #[serde(with = "humantime_serde")]
     pub default_session_timeout: std::time::Duration,
+
+    /// `[harness.escalator]` overrides for the scope-escalation
+    /// subagent.
+    #[serde(default)]
+    pub escalator: EscalatorConfig,
 }
 
 fn default_runs_dir() -> PathBuf {
@@ -597,6 +705,7 @@ impl Default for HarnessConfig {
             smoke_test_every_n_sessions: default_smoke_test_every_n_sessions(),
             default_max_sessions: default_default_max_sessions(),
             default_session_timeout: default_session_timeout(),
+            escalator: EscalatorConfig::default(),
         }
     }
 }
@@ -1493,5 +1602,174 @@ smoke_test_evry_n_sessions = 3
             Err(ConfigError::InvalidValue { ref field, .. })
                 if field == "TMG_HARNESS_AUTO_RESUME_ON_START"
         ));
+    }
+
+    // ---- [harness.escalator] (issue #36) ---------------------------
+
+    #[test]
+    fn escalator_defaults_inherit_main() {
+        let config = TsumugiConfig::default();
+        assert_eq!(config.harness.escalator.endpoint, "");
+        assert_eq!(config.harness.escalator.model, "");
+        assert!(!config.harness.escalator.disable);
+    }
+
+    #[test]
+    fn escalator_round_trip_from_toml() {
+        let toml_str = r#"
+[harness.escalator]
+endpoint = "http://escalator.invalid"
+model = "tiny"
+disable = true
+"#;
+        let partial: PartialTsumugiConfig =
+            toml::from_str(toml_str).unwrap_or_else(|e| panic!("{e}"));
+        let final_config = partial.into_final().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            final_config.harness.escalator.endpoint,
+            "http://escalator.invalid",
+        );
+        assert_eq!(final_config.harness.escalator.model, "tiny");
+        assert!(final_config.harness.escalator.disable);
+    }
+
+    /// `endpoint = ""` is the documented "inherit main endpoint"
+    /// sentinel; loading must succeed and surface the empty string so
+    /// the spawn-side resolver can decide what to do.
+    #[test]
+    fn escalator_empty_endpoint_round_trips() {
+        let toml_str = r#"
+[harness.escalator]
+endpoint = ""
+model = ""
+disable = false
+"#;
+        let partial: PartialTsumugiConfig =
+            toml::from_str(toml_str).unwrap_or_else(|e| panic!("{e}"));
+        let final_config = partial.into_final().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(final_config.harness.escalator.endpoint, "");
+        assert_eq!(final_config.harness.escalator.model, "");
+        assert!(!final_config.harness.escalator.disable);
+    }
+
+    #[test]
+    fn escalator_partial_overrides() {
+        let toml_str = r#"
+[harness.escalator]
+endpoint = "http://escalator.invalid"
+"#;
+        let partial: PartialTsumugiConfig =
+            toml::from_str(toml_str).unwrap_or_else(|e| panic!("{e}"));
+        let final_config = partial.into_final().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            final_config.harness.escalator.endpoint,
+            "http://escalator.invalid",
+        );
+        assert_eq!(
+            final_config.harness.escalator.model, "",
+            "model not set in TOML must remain empty (inherit main)"
+        );
+        assert!(!final_config.harness.escalator.disable);
+    }
+
+    #[test]
+    fn escalator_unknown_field_rejected_at_load() {
+        // deny_unknown_fields parity with the rest of harness config.
+        let toml_str = r#"
+[harness.escalator]
+endpoint = "http://x"
+disabled = true
+"#;
+        let result: Result<PartialTsumugiConfig, _> = toml::from_str(toml_str);
+        assert!(
+            result.is_err(),
+            "expected deny_unknown_fields to reject `disabled` (typo for `disable`), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn escalator_env_overrides_apply() {
+        let mut config = PartialTsumugiConfig::default();
+        let env_fn = |key: &str| -> Option<String> {
+            match key {
+                "TMG_HARNESS_ESCALATOR_ENDPOINT" => Some("http://env.escalator".to_owned()),
+                "TMG_HARNESS_ESCALATOR_MODEL" => Some("env-tiny".to_owned()),
+                "TMG_HARNESS_ESCALATOR_DISABLE" => Some("true".to_owned()),
+                _ => None,
+            }
+        };
+        config
+            .apply_env_overrides(&env_fn)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let final_config = config.into_final().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            final_config.harness.escalator.endpoint,
+            "http://env.escalator"
+        );
+        assert_eq!(final_config.harness.escalator.model, "env-tiny");
+        assert!(final_config.harness.escalator.disable);
+    }
+
+    #[test]
+    fn escalator_env_disable_invalid_returns_error() {
+        let mut config = PartialTsumugiConfig::default();
+        let env_fn = |key: &str| -> Option<String> {
+            if key == "TMG_HARNESS_ESCALATOR_DISABLE" {
+                Some("maybe".to_owned())
+            } else {
+                None
+            }
+        };
+        let result = config.apply_env_overrides(&env_fn);
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue { ref field, .. })
+                if field == "TMG_HARNESS_ESCALATOR_DISABLE"
+        ));
+    }
+
+    #[test]
+    fn escalator_env_overrides_win_over_toml() {
+        let toml_str = r#"
+[harness.escalator]
+endpoint = "http://from-toml"
+model = "toml-model"
+disable = false
+"#;
+        let mut partial: PartialTsumugiConfig =
+            toml::from_str(toml_str).unwrap_or_else(|e| panic!("{e}"));
+        let env_fn = |key: &str| -> Option<String> {
+            match key {
+                "TMG_HARNESS_ESCALATOR_ENDPOINT" => Some("http://from-env".to_owned()),
+                "TMG_HARNESS_ESCALATOR_DISABLE" => Some("true".to_owned()),
+                _ => None,
+            }
+        };
+        partial
+            .apply_env_overrides(&env_fn)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let final_config = partial.into_final().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(final_config.harness.escalator.endpoint, "http://from-env");
+        // model not env-overridden -> keeps the TOML value.
+        assert_eq!(final_config.harness.escalator.model, "toml-model");
+        assert!(final_config.harness.escalator.disable);
+    }
+
+    #[test]
+    fn escalator_partial_merge_overrides() {
+        let mut base = PartialTsumugiConfig::default();
+        base.harness.escalator.endpoint = Some("http://global".to_owned());
+        base.harness.escalator.model = Some("global-model".to_owned());
+
+        let mut overlay = PartialTsumugiConfig::default();
+        overlay.harness.escalator.endpoint = Some("http://project".to_owned());
+        overlay.harness.escalator.disable = Some(true);
+
+        base.merge_from(&overlay);
+        let final_config = base.into_final().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(final_config.harness.escalator.endpoint, "http://project");
+        // overlay did not set `model`; global wins.
+        assert_eq!(final_config.harness.escalator.model, "global-model");
+        assert!(final_config.harness.escalator.disable);
     }
 }

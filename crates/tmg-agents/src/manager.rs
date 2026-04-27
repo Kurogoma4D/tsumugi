@@ -3,6 +3,28 @@
 //! The [`SubagentManager`] tracks all subagent instances, spawns them
 //! as tokio tasks in a [`JoinSet`], and provides methods to query
 //! status and collect results.
+//!
+//! ## Endpoint / model resolution
+//!
+//! Each spawn picks an `(endpoint, model)` pair using the precedence
+//! rules in [`SubagentManager::resolve_endpoint`]:
+//!
+//! - [`AgentKind::Custom`]: a non-empty `endpoint` / `model` on the
+//!   custom-agent definition wins; missing fields fall back to the
+//!   manager defaults.
+//! - [`AgentKind::Builtin`] of [`AgentType::Escalator`]: non-empty
+//!   values from [`EscalatorOverrides`] win; missing fields fall back
+//!   to the manager defaults so the escalator can transparently share
+//!   the main endpoint until a dedicated lightweight model is
+//!   configured.
+//! - All other built-in agents always run on the manager defaults.
+//!
+//! TODO(SPEC §10.1 `[llm.subagent_pool]`): when load-balanced subagent
+//! endpoints land, the round-robin pool MUST NOT route the escalator;
+//! the escalator owns its dedicated endpoint so its cost stays
+//! predictable (SPEC §9.10). Keep that wiring out of
+//! `resolve_endpoint` for the escalator branch even after the pool
+//! exists.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -17,10 +39,51 @@ use tmg_llm::LlmClient;
 use crate::builtins::{
     RunToolProvider, registry_for_agent_kind, registry_for_agent_kind_with_run_provider,
 };
-use crate::config::{AgentKind, SubagentConfig};
+use crate::config::{AgentKind, AgentType, SubagentConfig};
 use crate::error::AgentError;
 use crate::runner::SubagentRunner;
 use crate::status::SubagentStatus;
+
+/// Optional overrides for the escalator subagent's `(endpoint, model)`
+/// pair plus an explicit disable switch (SPEC §9.10 / §10.1
+/// `[harness.escalator]`).
+///
+/// Empty / `None` fields fall back to the manager's main endpoint and
+/// model so a partially-configured TOML still produces a working
+/// escalator. The `disabled` flag is enforced inside
+/// [`SubagentManager::spawn_inner`]: a disabled escalator request
+/// produces [`AgentError::EscalatorDisabled`] before any LLM client
+/// is constructed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EscalatorOverrides {
+    /// Optional override endpoint URL. `None` (or `Some("")` after the
+    /// caller normalises empty strings) means "inherit the main
+    /// endpoint".
+    pub endpoint: Option<String>,
+
+    /// Optional override model name. `None` means "inherit the main
+    /// model".
+    pub model: Option<String>,
+
+    /// When `true`, requests for the escalator are rejected with
+    /// [`AgentError::EscalatorDisabled`].
+    pub disabled: bool,
+}
+
+impl EscalatorOverrides {
+    /// Construct overrides from raw config values, treating empty
+    /// strings as `None` so an unset `[harness.escalator]` field
+    /// (`endpoint = ""`) inherits the main endpoint.
+    #[must_use]
+    pub fn from_strings(endpoint: String, model: String, disabled: bool) -> Self {
+        let normalize = |s: String| if s.is_empty() { None } else { Some(s) };
+        Self {
+            endpoint: normalize(endpoint),
+            model: normalize(model),
+            disabled,
+        }
+    }
+}
 
 /// A unique identifier for a subagent instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -99,6 +162,12 @@ pub struct SubagentManager {
     /// runs without those tools, which is the intended degraded
     /// behaviour for Run-less code paths.
     run_tool_provider: Option<Arc<dyn RunToolProvider>>,
+
+    /// Optional overrides for the escalator's endpoint / model and
+    /// the operator's disable switch. Defaults to "no overrides, not
+    /// disabled" so manager construction stays a single positional
+    /// call until a `[harness.escalator]` section is present.
+    escalator_overrides: EscalatorOverrides,
 }
 
 impl SubagentManager {
@@ -106,6 +175,9 @@ impl SubagentManager {
     ///
     /// The `default_endpoint` and `default_model` are used when a custom
     /// agent does not specify its own endpoint/model overrides.
+    /// The escalator overrides default to "no overrides, not disabled";
+    /// install them with [`Self::with_escalator_overrides`] when a
+    /// `[harness.escalator]` section is configured.
     pub fn new(
         client: LlmClient,
         parent_cancel: CancellationToken,
@@ -121,7 +193,42 @@ impl SubagentManager {
             instances: Arc::new(Mutex::new(BTreeMap::new())),
             next_id: 1,
             run_tool_provider: None,
+            escalator_overrides: EscalatorOverrides::default(),
         }
+    }
+
+    /// Install (or replace) the [`EscalatorOverrides`] used when
+    /// spawning the escalator subagent.
+    ///
+    /// Builder-style consuming method so the call site reads:
+    ///
+    /// ```ignore
+    /// let manager = SubagentManager::new(client, cancel, ep, model)
+    ///     .with_escalator_overrides(EscalatorOverrides::from_strings(
+    ///         cfg.endpoint.clone(),
+    ///         cfg.model.clone(),
+    ///         cfg.disable,
+    ///     ));
+    /// ```
+    #[must_use]
+    pub fn with_escalator_overrides(mut self, overrides: EscalatorOverrides) -> Self {
+        self.escalator_overrides = overrides;
+        self
+    }
+
+    /// Replace the [`EscalatorOverrides`] in-place.
+    ///
+    /// Useful when the manager already lives behind an `Arc<Mutex<_>>`
+    /// and the escalator config changes after construction (e.g. a
+    /// future config-reload path).
+    pub fn set_escalator_overrides(&mut self, overrides: EscalatorOverrides) {
+        self.escalator_overrides = overrides;
+    }
+
+    /// Borrow the currently-installed escalator overrides.
+    #[must_use]
+    pub fn escalator_overrides(&self) -> &EscalatorOverrides {
+        &self.escalator_overrides
     }
 
     /// Install (or replace) the [`RunToolProvider`] used for spawning
@@ -138,6 +245,56 @@ impl SubagentManager {
     #[must_use]
     pub fn run_tool_provider(&self) -> Option<&Arc<dyn RunToolProvider>> {
         self.run_tool_provider.as_ref()
+    }
+
+    /// Resolve the `(endpoint, model)` pair for a given [`AgentKind`].
+    ///
+    /// Precedence rules (see the module-level docs for context):
+    ///
+    /// - [`AgentKind::Custom`]: a non-empty `endpoint` / `model` on
+    ///   the custom-agent definition wins; missing fields fall back
+    ///   to the manager defaults.
+    /// - [`AgentKind::Builtin`] of [`AgentType::Escalator`]: non-empty
+    ///   values from [`EscalatorOverrides`] win; missing fields fall
+    ///   back to the manager defaults.
+    /// - All other built-in agents always run on the manager defaults.
+    ///
+    /// Exposed so the spawn path (and the dedicated test
+    /// [`Self::resolved_endpoint_for_kind`]) share a single source of
+    /// truth for the precedence rules.
+    fn resolve_endpoint(&self, kind: &AgentKind) -> (String, String) {
+        match kind {
+            AgentKind::Custom(def) => {
+                let endpoint = def.endpoint().unwrap_or(&self.default_endpoint).to_owned();
+                let model = def.model().unwrap_or(&self.default_model).to_owned();
+                (endpoint, model)
+            }
+            AgentKind::Builtin(AgentType::Escalator) => {
+                let endpoint = self
+                    .escalator_overrides
+                    .endpoint
+                    .clone()
+                    .unwrap_or_else(|| self.default_endpoint.clone());
+                let model = self
+                    .escalator_overrides
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| self.default_model.clone());
+                (endpoint, model)
+            }
+            AgentKind::Builtin(_) => (self.default_endpoint.clone(), self.default_model.clone()),
+        }
+    }
+
+    /// Test/inspection helper that returns the `(endpoint, model)`
+    /// pair a hypothetical spawn of `kind` would receive.
+    ///
+    /// Bypasses LLM-client construction so test code (and future
+    /// diagnostics commands) can verify the precedence rules without
+    /// a live llama-server.
+    #[must_use]
+    pub fn resolved_endpoint_for_kind(&self, kind: &AgentKind) -> (String, String) {
+        self.resolve_endpoint(kind)
     }
 
     /// Spawn a subagent and return its ID immediately.
@@ -179,6 +336,16 @@ impl SubagentManager {
         config: SubagentConfig,
         notify: Option<oneshot::Sender<Result<String, AgentError>>>,
     ) -> Result<SubagentId, AgentError> {
+        // Reject disabled-escalator requests up front, before
+        // allocating an ID or constructing an LLM client. SPEC §9.10
+        // expects the auto-promotion path to treat this as "do not
+        // escalate" rather than as a generic LLM/tool failure.
+        if matches!(config.agent_kind, AgentKind::Builtin(AgentType::Escalator))
+            && self.escalator_overrides.disabled
+        {
+            return Err(AgentError::EscalatorDisabled);
+        }
+
         let id = SubagentId(self.next_id);
         self.next_id += 1;
 
@@ -197,20 +364,21 @@ impl SubagentManager {
             instances.insert(id, instance);
         }
 
-        // For custom agents with a specific endpoint/model, create a
-        // dedicated LlmClient. Otherwise, use the shared client.
-        let client = if let AgentKind::Custom(ref def) = config.agent_kind {
-            if def.endpoint().is_some() || def.model().is_some() {
-                let endpoint = def.endpoint().unwrap_or(&self.default_endpoint);
-                let model = def.model().unwrap_or(&self.default_model);
-                let llm_config = tmg_llm::LlmClientConfig::new(endpoint, model);
-                tmg_llm::LlmClient::new(llm_config).map_err(AgentError::Llm)?
-            } else {
+        // Resolve the endpoint / model with the centralised precedence
+        // rules (see `resolve_endpoint`). When the resolved pair
+        // matches the manager defaults we keep the shared `self.client`
+        // to avoid constructing a redundant `LlmClient`; otherwise we
+        // spin up a dedicated client. This reuse keeps the common
+        // built-in path allocation-free while still letting custom
+        // agents and the escalator land on a different endpoint.
+        let (resolved_endpoint, resolved_model) = self.resolve_endpoint(&config.agent_kind);
+        let client =
+            if resolved_endpoint == self.default_endpoint && resolved_model == self.default_model {
                 self.client.clone()
-            }
-        } else {
-            self.client.clone()
-        };
+            } else {
+                let llm_config = tmg_llm::LlmClientConfig::new(&resolved_endpoint, &resolved_model);
+                tmg_llm::LlmClient::new(llm_config).map_err(AgentError::Llm)?
+            };
 
         let agent_kind = config.agent_kind.clone();
         let task = config.task.clone();
@@ -349,6 +517,7 @@ impl SubagentManager {
 
 #[cfg(test)]
 #[expect(clippy::panic, reason = "test assertions")]
+#[expect(clippy::expect_used, reason = "test assertions")]
 mod tests {
     use super::*;
     use crate::config::AgentType;
@@ -434,6 +603,224 @@ mod tests {
         let summaries = manager.summaries().await;
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].agent_name, "explore");
+
+        cancel.cancel();
+        manager.shutdown().await;
+    }
+
+    /// Helper that builds a default-configured manager for endpoint
+    /// resolution tests. Returns `None` when `LlmClient::new` fails so
+    /// the test can early-exit gracefully (mirrors the pattern used by
+    /// the spawn tests above).
+    fn make_manager_for_resolution_tests() -> Option<SubagentManager> {
+        let config = tmg_llm::LlmClientConfig::new("http://main:8080", "main-model");
+        let client = tmg_llm::LlmClient::new(config).ok()?;
+        Some(SubagentManager::new(
+            client,
+            CancellationToken::new(),
+            "http://main:8080",
+            "main-model",
+        ))
+    }
+
+    #[test]
+    fn escalator_overrides_from_strings_treats_empty_as_none() {
+        let overrides = EscalatorOverrides::from_strings(String::new(), String::new(), false);
+        assert_eq!(overrides.endpoint, None);
+        assert_eq!(overrides.model, None);
+        assert!(!overrides.disabled);
+
+        let overrides = EscalatorOverrides::from_strings(
+            "http://escalator.invalid".to_owned(),
+            "tiny".to_owned(),
+            true,
+        );
+        assert_eq!(
+            overrides.endpoint.as_deref(),
+            Some("http://escalator.invalid"),
+        );
+        assert_eq!(overrides.model.as_deref(), Some("tiny"));
+        assert!(overrides.disabled);
+    }
+
+    #[test]
+    fn resolved_endpoint_for_builtin_uses_main_defaults() {
+        let Some(manager) = make_manager_for_resolution_tests() else {
+            return;
+        };
+        for kind in [
+            AgentKind::Builtin(AgentType::Explore),
+            AgentKind::Builtin(AgentType::Worker),
+            AgentKind::Builtin(AgentType::Plan),
+            AgentKind::Builtin(AgentType::Initializer),
+            AgentKind::Builtin(AgentType::Tester),
+            AgentKind::Builtin(AgentType::Qa),
+        ] {
+            let (ep, model) = manager.resolved_endpoint_for_kind(&kind);
+            assert_eq!(ep, "http://main:8080", "wrong endpoint for {}", kind.name());
+            assert_eq!(model, "main-model", "wrong model for {}", kind.name());
+        }
+    }
+
+    /// Acceptance criterion (issue #36): the escalator endpoint
+    /// override must actually be used at spawn time, not silently
+    /// dropped. We verify this via the public
+    /// [`SubagentManager::resolved_endpoint_for_kind`] helper rather
+    /// than a mock `LlmClient` so the test stays unit-scoped.
+    #[test]
+    fn resolved_endpoint_for_escalator_uses_overrides() {
+        let Some(manager) = make_manager_for_resolution_tests() else {
+            return;
+        };
+        let manager = manager.with_escalator_overrides(EscalatorOverrides::from_strings(
+            "http://escalator.invalid".to_owned(),
+            "lite".to_owned(),
+            false,
+        ));
+
+        let (ep, model) =
+            manager.resolved_endpoint_for_kind(&AgentKind::Builtin(AgentType::Escalator));
+        assert_eq!(ep, "http://escalator.invalid");
+        assert_eq!(model, "lite");
+
+        // Other built-ins must keep using the main endpoint even when
+        // escalator overrides are installed.
+        let (ep, model) =
+            manager.resolved_endpoint_for_kind(&AgentKind::Builtin(AgentType::Explore));
+        assert_eq!(ep, "http://main:8080");
+        assert_eq!(model, "main-model");
+    }
+
+    /// Regression: an empty `[harness.escalator] endpoint = ""` must
+    /// fall back to the main endpoint instead of trying to talk to a
+    /// blank URL.
+    #[test]
+    fn resolved_endpoint_for_escalator_falls_back_to_main_when_empty() {
+        let Some(manager) = make_manager_for_resolution_tests() else {
+            return;
+        };
+        let manager = manager.with_escalator_overrides(EscalatorOverrides::from_strings(
+            String::new(),
+            String::new(),
+            false,
+        ));
+
+        let (ep, model) =
+            manager.resolved_endpoint_for_kind(&AgentKind::Builtin(AgentType::Escalator));
+        assert_eq!(ep, "http://main:8080");
+        assert_eq!(model, "main-model");
+    }
+
+    /// Partial overrides: only `endpoint` set, `model` empty -> the
+    /// model inherits the main config while the endpoint is honoured.
+    #[test]
+    fn resolved_endpoint_for_escalator_mixes_override_and_default() {
+        let Some(manager) = make_manager_for_resolution_tests() else {
+            return;
+        };
+        let manager = manager.with_escalator_overrides(EscalatorOverrides::from_strings(
+            "http://escalator.invalid".to_owned(),
+            String::new(),
+            false,
+        ));
+
+        let (ep, model) =
+            manager.resolved_endpoint_for_kind(&AgentKind::Builtin(AgentType::Escalator));
+        assert_eq!(ep, "http://escalator.invalid");
+        assert_eq!(model, "main-model");
+    }
+
+    #[test]
+    fn resolved_endpoint_for_custom_uses_def_overrides() {
+        let Some(manager) = make_manager_for_resolution_tests() else {
+            return;
+        };
+
+        let toml = r#"
+name = "reviewer"
+description = "test"
+instructions = "do things"
+endpoint = "http://custom:7777"
+model = "custom-model"
+
+[tools]
+allow = ["file_read"]
+"#;
+        let def = crate::custom::CustomAgentDef::from_toml(toml, "test.toml")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let kind = AgentKind::Custom(Arc::new(def));
+        let (ep, model) = manager.resolved_endpoint_for_kind(&kind);
+        assert_eq!(ep, "http://custom:7777");
+        assert_eq!(model, "custom-model");
+    }
+
+    #[tokio::test]
+    async fn escalator_disabled_rejects_spawn() {
+        let config = tmg_llm::LlmClientConfig::new("http://main:8080", "main-model");
+        let Ok(client) = tmg_llm::LlmClient::new(config) else {
+            return;
+        };
+        let cancel = CancellationToken::new();
+        let mut manager =
+            SubagentManager::new(client, cancel.clone(), "http://main:8080", "main-model")
+                .with_escalator_overrides(EscalatorOverrides::from_strings(
+                    String::new(),
+                    String::new(),
+                    true,
+                ));
+
+        let cfg = SubagentConfig {
+            agent_kind: AgentKind::Builtin(AgentType::Escalator),
+            task: "should be rejected".to_owned(),
+            background: true,
+        };
+        let err = manager
+            .spawn(cfg)
+            .await
+            .expect_err("disabled escalator must reject spawn");
+        assert!(
+            matches!(err, AgentError::EscalatorDisabled),
+            "expected AgentError::EscalatorDisabled, got {err:?}"
+        );
+
+        // Other builtins must still be spawnable when only the
+        // escalator is disabled.
+        let cfg_explore = SubagentConfig {
+            agent_kind: AgentKind::Builtin(AgentType::Explore),
+            task: "explore should still spawn".to_owned(),
+            background: true,
+        };
+        manager
+            .spawn(cfg_explore)
+            .await
+            .unwrap_or_else(|e| panic!("non-escalator spawn must still succeed: {e}"));
+
+        cancel.cancel();
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn escalator_not_disabled_by_default() {
+        let config = tmg_llm::LlmClientConfig::new("http://main:8080", "main-model");
+        let Ok(client) = tmg_llm::LlmClient::new(config) else {
+            return;
+        };
+        let cancel = CancellationToken::new();
+        let mut manager =
+            SubagentManager::new(client, cancel.clone(), "http://main:8080", "main-model");
+
+        let cfg = SubagentConfig {
+            agent_kind: AgentKind::Builtin(AgentType::Escalator),
+            task: "default escalator should spawn".to_owned(),
+            background: true,
+        };
+        // The actual LLM call will fail because no server is running,
+        // but the spawn-side gating must succeed.
+        let result = manager.spawn(cfg).await;
+        assert!(
+            result.is_ok(),
+            "default config should permit escalator spawn; got {result:?}",
+        );
 
         cancel.cancel();
         manager.shutdown().await;
