@@ -21,6 +21,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
+use serde::ser::Error as _;
 
 use crate::artifacts::ProgressLog;
 use crate::error::HarnessError;
@@ -31,6 +32,20 @@ pub const RUN_FILENAME: &str = "run.toml";
 
 /// Filename of the workspace symlink under each run directory.
 pub const WORKSPACE_LINK: &str = "workspace";
+
+/// Filename of the "current run" pointer at the runs-dir root.
+///
+/// The pointer is written as a symlink on Unix-like platforms (the
+/// runtime falls back to a JSON pointer file if symlink creation
+/// fails). [`RunStore::current`] resolves it back to a [`RunId`] for
+/// CLI commands that default to the most-recent active run.
+pub const CURRENT_FILENAME: &str = "current";
+
+/// Fallback pointer-file name used when symlink creation fails.
+///
+/// Stores `{ "run_id": "<id>" }` in JSON so the CLI can still resolve
+/// the current run on platforms where symlinks are restricted.
+pub const CURRENT_POINTER_FILENAME: &str = "current.json";
 
 /// Filename of the human-readable progress log under each run directory.
 pub const PROGRESS_FILENAME: &str = "progress.md";
@@ -143,6 +158,11 @@ impl RunStore {
         ProgressLog::init(self.progress_file(&run.id))?;
 
         self.save(&run)?;
+        // Best-effort: point `current` at the freshly-created run so
+        // CLI commands without a `run_id` argument default to it.
+        if let Err(e) = self.set_current(&run.id) {
+            tracing::warn!(error = %e, "failed to update current run pointer");
+        }
         Ok(run)
     }
 
@@ -271,6 +291,42 @@ impl RunStore {
         Ok(run)
     }
 
+    /// Demote a harnessed run back to ad-hoc scope.
+    ///
+    /// SPEC §9.8 `tmg run downgrade`: flips `Run::scope` back to
+    /// [`RunScope::AdHoc`] and clears the top-level `workflow_id` /
+    /// `max_sessions` mirrors so the LLM stops seeing harnessed-only
+    /// tools on the next registry refresh.
+    ///
+    /// **Important:** the on-disk `features.json` and `init.sh` files
+    /// are intentionally **not** deleted. They are preserved so a
+    /// subsequent `tmg run upgrade` can re-promote without losing the
+    /// initializer's work, and so post-mortem inspection of an
+    /// ad-hoc-now run still has access to the harness artifacts. The
+    /// `RunRunnerToolProvider` re-installed by the caller decides
+    /// whether the LLM sees those tools — see
+    /// [`crate::tools::RunRunnerToolProvider`] for the policy.
+    ///
+    /// Returns the updated [`Run`] record. A no-op when the run is
+    /// already ad-hoc (still re-saves to keep `run.toml` durable).
+    ///
+    /// # Errors
+    ///
+    /// - [`HarnessError::RunNotFound`] when the run id has no
+    ///   corresponding `run.toml`.
+    /// - [`HarnessError::IdMismatch`] when the loaded record's id
+    ///   disagrees with the directory name.
+    /// - [`HarnessError::Serialize`] / [`HarnessError::Io`] for write
+    ///   failures.
+    pub fn downgrade_to_ad_hoc(&self, run_id: &RunId) -> Result<Run, HarnessError> {
+        let mut run = self.load(run_id)?;
+        run.scope = RunScope::AdHoc;
+        run.workflow_id = None;
+        run.max_sessions = None;
+        self.save(&run)?;
+        Ok(run)
+    }
+
     /// List all runs as lightweight summaries.
     ///
     /// Entries that fail to load (e.g. missing or malformed `run.toml`)
@@ -327,6 +383,11 @@ impl RunStore {
     /// `Some`, only runs whose stored `workspace_path` matches are
     /// eligible; this prevents resuming a run from a different project
     /// when several projects share the same `runs_dir` configuration.
+    ///
+    /// As a side-effect, the [`current`](Self::current) pointer is
+    /// updated to the returned run so subsequent argument-less CLI
+    /// commands target it. Failures to update the pointer are logged
+    /// at `warn` and do not propagate.
     pub fn latest_resumable(
         &self,
         workspace_path: Option<&Path>,
@@ -346,9 +407,133 @@ impl RunStore {
                     continue;
                 }
             }
+            // Best-effort: update `current` to the resolved run.
+            if let Err(e) = self.set_current(&summary.id) {
+                tracing::warn!(error = %e, "failed to update current run pointer");
+            }
             return Ok(Some(summary));
         }
         Ok(None)
+    }
+
+    /// Path of the `current` pointer at the runs-dir root.
+    ///
+    /// Symlink form is preferred but a `current.json` pointer file is
+    /// used as a fallback when symlink creation fails.
+    #[must_use]
+    pub fn current_link_path(&self) -> PathBuf {
+        self.runs_dir.join(CURRENT_FILENAME)
+    }
+
+    /// Path of the JSON-pointer fallback used when symlink creation
+    /// fails.
+    #[must_use]
+    pub fn current_pointer_path(&self) -> PathBuf {
+        self.runs_dir.join(CURRENT_POINTER_FILENAME)
+    }
+
+    /// Set the `current` pointer to `run_id`.
+    ///
+    /// Tries to create a symlink at `<runs_dir>/current` pointing at
+    /// `<run_id>`. If symlink creation fails (e.g. on platforms where
+    /// symlinks require elevated permissions), a JSON pointer file
+    /// (`<runs_dir>/current.json`) is written as a fallback so the
+    /// CLI's `tmg run resume` / `status` / etc. can still resolve the
+    /// most recent active run.
+    pub fn set_current(&self, run_id: &RunId) -> Result<(), HarnessError> {
+        fs::create_dir_all(&self.runs_dir).map_err(|e| HarnessError::io(&self.runs_dir, e))?;
+
+        let link = self.current_link_path();
+        let pointer = self.current_pointer_path();
+
+        // Remove any existing symlink/pointer-file before re-creating
+        // so we never observe a stale value mid-update.
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_file(&pointer);
+
+        match create_current_symlink(run_id.as_str(), &link) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "current symlink creation failed; falling back to JSON pointer file",
+                );
+                let payload = serde_json::json!({ "run_id": run_id.as_str() });
+                let serialized = serde_json::to_string(&payload).map_err(|src| {
+                    HarnessError::Serialize {
+                        path: pointer.clone(),
+                        // Re-package serde_json error as toml::ser::Error
+                        // is awkward; fall back to an `Io` error so the
+                        // caller still sees the failure path. We embed
+                        // the JSON error message into the chained error.
+                        source: toml::ser::Error::custom(src.to_string()),
+                    }
+                })?;
+                fs::write(&pointer, serialized).map_err(|e| HarnessError::io(&pointer, e))?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Resolve the `current` pointer back to a [`RunId`], or `None` if
+    /// no current pointer is set.
+    ///
+    /// Tries the symlink first, then the JSON-pointer fallback. A
+    /// dangling symlink (target run was deleted) is treated as `None`.
+    pub fn current(&self) -> Result<Option<RunId>, HarnessError> {
+        let link = self.current_link_path();
+        match fs::read_link(&link) {
+            Ok(target) => {
+                // The symlink target is the run-id (relative path).
+                let id_str = target
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_owned);
+                if let Some(id) = id_str {
+                    let run_id = RunId::from_string(id);
+                    // Verify the target run still exists; treat
+                    // dangling links as "no current".
+                    if self.run_file(&run_id).exists() {
+                        return Ok(Some(run_id));
+                    }
+                }
+                // Fall through to JSON pointer if the symlink is
+                // dangling or otherwise unparseable.
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Try the JSON-pointer fallback below.
+            }
+            Err(_) => {
+                // Some other read error (e.g. EINVAL because the entry
+                // is not a symlink). Fall through to JSON pointer.
+            }
+        }
+
+        let pointer = self.current_pointer_path();
+        let content = match fs::read_to_string(&pointer) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(HarnessError::io(&pointer, e)),
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    path = %pointer.display(),
+                    error = %e,
+                    "current.json is not valid JSON; treating as no current",
+                );
+                return Ok(None);
+            }
+        };
+        let Some(id_str) = parsed.get("run_id").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let run_id = RunId::from_string(id_str.to_owned());
+        if !self.run_file(&run_id).exists() {
+            return Ok(None);
+        }
+        Ok(Some(run_id))
     }
 }
 
@@ -411,6 +596,33 @@ fn create_workspace_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
 
 #[cfg(not(any(unix, windows)))]
 fn create_workspace_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "symlinks not supported on this platform",
+    ))
+}
+
+/// Create a symlink at `link` pointing at `<runs_dir>/<target>`. The
+/// link target is a *relative* path (just the run id) so the symlink
+/// works irrespective of how the runs-dir is reached.
+#[cfg(unix)]
+fn create_current_symlink(target: &str, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_current_symlink(target: &str, link: &Path) -> std::io::Result<()> {
+    // Windows directory symlinks need an absolute or canonical-ish
+    // path; we resolve it relative to the link's parent directory.
+    let target_path = match link.parent() {
+        Some(parent) => parent.join(target),
+        None => std::path::PathBuf::from(target),
+    };
+    std::os::windows::fs::symlink_dir(&target_path, link)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_current_symlink(_target: &str, _link: &Path) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "symlinks not supported on this platform",
@@ -645,6 +857,72 @@ mod tests {
         let reloaded = store.load(&run.id).unwrap_or_else(|e| panic!("{e}"));
         assert!(matches!(reloaded.scope, RunScope::Harnessed { .. }));
         assert_eq!(reloaded.workflow_id.as_deref(), Some("auto-promoted"));
+    }
+
+    #[test]
+    fn create_ad_hoc_sets_current_pointer() {
+        let (tmp, store) = make_store();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap_or_else(|e| panic!("{e}"));
+        let run = store
+            .create_ad_hoc(workspace, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let resolved = store
+            .current()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("expected current pointer to be set"));
+        assert_eq!(resolved, run.id);
+    }
+
+    #[test]
+    fn set_current_overwrites_previous_pointer() {
+        let (tmp, store) = make_store();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap_or_else(|e| panic!("{e}"));
+        let run_a = store
+            .create_ad_hoc(workspace.clone(), None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let run_b = store
+            .create_ad_hoc(workspace, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        // After two `create_ad_hoc` calls the pointer should track the
+        // most recent one.
+        let resolved = store
+            .current()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("expected current pointer to be set"));
+        assert_eq!(resolved, run_b.id);
+        assert_ne!(resolved, run_a.id);
+    }
+
+    #[test]
+    fn current_returns_none_when_unset() {
+        let (_tmp, store) = make_store();
+        // No runs created yet; no pointer should exist.
+        let resolved = store.current().unwrap_or_else(|e| panic!("{e}"));
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn current_returns_none_for_dangling_pointer() {
+        let (tmp, store) = make_store();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap_or_else(|e| panic!("{e}"));
+        let run = store
+            .create_ad_hoc(workspace, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        // Delete the run directory underneath the pointer.
+        std::fs::remove_dir_all(store.run_dir(&run.id)).unwrap_or_else(|e| panic!("{e}"));
+
+        let resolved = store.current().unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            resolved.is_none(),
+            "dangling current pointer should resolve to None"
+        );
     }
 
     #[test]
