@@ -4,26 +4,38 @@
 //! Every interaction with `tmg` happens within a [`Run`], whether
 //! ad-hoc (interactive TUI session) or harnessed by a workflow.
 //!
-//! The crate is intentionally minimal in this first slice: it
-//! provides the data model, a TOML-backed [`RunStore`], and a
-//! [`RunRunner`] that the CLI startup sequence uses to attach the
-//! existing `AgentLoop` to a persisted run.
+//! In addition to the [`Run`] / [`RunStore`] / [`RunRunner`] data plane
+//! the crate provides:
+//!
+//! - artifact I/O for [`progress.md`](artifacts::ProgressLog) and
+//!   [`session_NNN.json`](artifacts::SessionLog)
+//! - Run-scoped tools that the LLM can invoke:
+//!   [`ProgressAppendTool`], [`SessionBootstrapTool`],
+//!   [`SessionSummarySaveTool`]
+//! - a [`HarnessStreamSink`] decorator that updates the active
+//!   session's stats from the existing
+//!   [`StreamSink`](tmg_core::StreamSink) callbacks
 //!
 //! Forthcoming features (tracked as separate issues):
 //!
-//! - `progress.md` / `session_log.jsonl` writers
-//! - `features.json` schema for harnessed runs
+//! - `features.json` schema for harnessed runs (#34)
 //! - workflow engine integration and escalation evaluator
 //! - `tmg run` CLI subcommand and richer TUI surface
 
+pub mod artifacts;
 pub mod error;
 pub mod run;
 pub mod runner;
 pub mod session;
+pub mod sink;
 pub mod store;
+pub mod tools;
 
+pub use artifacts::{ProgressLog, SessionLog, SessionLogEntry};
 pub use error::HarnessError;
 pub use run::{Run, RunId, RunScope, RunStatus, RunSummary};
-pub use runner::RunRunner;
+pub use runner::{DEFAULT_BOOTSTRAP_MAX_TOKENS, RunRunner};
 pub use session::{Session, SessionEndTrigger, SessionHandle};
-pub use store::{RUN_FILENAME, RunStore, WORKSPACE_LINK};
+pub use sink::HarnessStreamSink;
+pub use store::{PROGRESS_FILENAME, RUN_FILENAME, RunStore, SESSION_LOG_DIRNAME, WORKSPACE_LINK};
+pub use tools::{ProgressAppendTool, SessionBootstrapTool, SessionSummarySaveTool};

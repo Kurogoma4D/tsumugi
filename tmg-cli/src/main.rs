@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use clap::Parser;
-use tmg_harness::{RunRunner, RunStore, RunSummary, SessionEndTrigger};
+use tmg_harness::{
+    ProgressAppendTool, RunRunner, RunStore, RunSummary, SessionBootstrapTool, SessionEndTrigger,
+    SessionSummarySaveTool,
+};
 use tmg_llm::ToolCallingMode;
 use tokio::sync::Mutex;
 
@@ -268,10 +271,16 @@ fn run_tui(
         let run = harness_init::resolve_startup_run(harness_config, &store, canonical_cwd.clone())
             .context("resolving startup run")?;
         let mut runner = RunRunner::new(run, Arc::clone(&store));
+        runner.set_bootstrap_max_tokens(harness_config.bootstrap_max_tokens);
         let session_handle = runner
             .begin_session()
             .context("beginning harness session")?;
         let run_summary: RunSummary = runner.summary();
+
+        // Wrap the runner in Arc<Mutex<...>> so the Run-scoped tools and
+        // the bootstrap path share one source of truth for the active
+        // session.
+        let runner = Arc::new(Mutex::new(runner));
 
         // Discover custom agent definitions.
         let custom_agent_metas = tmg_agents::discover_custom_agents(&project_root)
@@ -288,14 +297,20 @@ fn run_tui(
             model,
         )));
 
-        // Create the tool registry with spawn_agent tool (including custom agents).
+        // Create the tool registry: built-ins, then spawn_agent, then
+        // the three Run-scoped harness tools. Order matters for the
+        // sorted-by-name registration but later registrations would
+        // shadow same-named earlier ones; we don't expect collisions.
         let mut registry = tmg_tools::default_registry();
         registry.register(tmg_agents::SpawnAgentTool::with_custom_agents(
             Arc::clone(&subagent_manager),
             custom_agent_defs.clone(),
         ));
+        registry.register(ProgressAppendTool::new(Arc::clone(&runner)));
+        registry.register(SessionBootstrapTool::new(Arc::clone(&runner)));
+        registry.register(SessionSummarySaveTool::new(Arc::clone(&runner)));
 
-        let agent = tmg_core::AgentLoop::with_context_config(
+        let mut agent = tmg_core::AgentLoop::with_context_config(
             client,
             registry,
             cancel.clone(),
@@ -304,6 +319,12 @@ fn run_tui(
             context_config,
             tool_calling_mode,
         )?;
+
+        // Run session_bootstrap once and inject its output as a system
+        // message so the LLM has the SPEC §9.7 context bundle for its
+        // first turn. Failure is non-fatal: the agent simply starts
+        // without the auto-injected bundle.
+        inject_bootstrap(&mut agent, Arc::clone(&runner)).await;
 
         let tui_cancel = cancel.clone();
         let tui_result = tmg_tui::run(
@@ -333,7 +354,11 @@ fn run_tui(
         } else {
             SessionEndTrigger::Completed
         };
-        if let Err(e) = runner.end_session(session_handle, trigger) {
+        let end_result = {
+            let mut guard = runner.lock().await;
+            guard.end_session(&session_handle, trigger)
+        };
+        if let Err(e) = end_result {
             // Persisting on shutdown is best-effort; surface as a
             // warning rather than masking the original TUI result.
             eprintln_warning(&format!("failed to persist run state on shutdown: {e}"));
@@ -352,4 +377,24 @@ fn run_tui(
 )]
 fn eprintln_warning(message: &str) {
     eprintln!("[tmg] warning: {message}");
+}
+
+/// Run `session_bootstrap` once and push its output into the agent's
+/// history as a system message.
+///
+/// Failures (e.g. a missing `git` binary or a serialization error) are
+/// surfaced as a stderr warning but never abort startup; the TUI is
+/// usable without the bootstrap bundle.
+async fn inject_bootstrap(agent: &mut tmg_core::AgentLoop, runner: Arc<Mutex<RunRunner>>) {
+    let bootstrap_tool = SessionBootstrapTool::new(runner);
+    match bootstrap_tool.run_once().await {
+        Ok(payload) => match serde_json::to_string_pretty(&payload) {
+            Ok(json) => {
+                let injected = format!("[session_bootstrap]\n{json}\n[/session_bootstrap]");
+                agent.push_system_message(injected);
+            }
+            Err(e) => eprintln_warning(&format!("failed to serialize bootstrap payload: {e}")),
+        },
+        Err(e) => eprintln_warning(&format!("session_bootstrap failed: {e}")),
+    }
 }

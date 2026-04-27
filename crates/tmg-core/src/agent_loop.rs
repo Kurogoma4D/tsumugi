@@ -225,6 +225,17 @@ impl AgentLoop {
         &self.history
     }
 
+    /// Append a system message to the conversation history.
+    ///
+    /// Used by the harness startup path to inject the
+    /// `session_bootstrap` payload into the agent's context before the
+    /// first user turn. Subsequent calls keep appending; the message is
+    /// preserved across the loop until the next
+    /// [`clear_history`](Self::clear_history).
+    pub fn push_system_message(&mut self, content: impl Into<String>) {
+        self.history.push(Message::system(content));
+    }
+
     /// Clear conversation history, retaining only the system prompt and
     /// any injected prompt-file messages.
     ///
@@ -620,6 +631,20 @@ mod tests {
         let chat = msg.to_chat_message();
         assert_eq!(chat.role, tmg_llm::Role::Tool);
         assert_eq!(chat.tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn push_system_message_appends_to_history() {
+        // Build a Message directly (not via AgentLoop::new which requires
+        // an LLM client) and verify the same role/content roundtrip used
+        // by `push_system_message`.
+        let injected = Message::system("BOOTSTRAP: hello");
+        assert_eq!(injected.role(), tmg_llm::Role::System);
+        assert_eq!(injected.content(), "BOOTSTRAP: hello");
+
+        let chat = injected.to_chat_message();
+        assert_eq!(chat.role, tmg_llm::Role::System);
+        assert_eq!(chat.content.as_deref(), Some("BOOTSTRAP: hello"));
     }
 
     #[test]

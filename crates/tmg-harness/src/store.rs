@@ -20,6 +20,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::artifacts::ProgressLog;
 use crate::error::HarnessError;
 use crate::run::{Run, RunId, RunSummary};
 
@@ -28,6 +29,12 @@ pub const RUN_FILENAME: &str = "run.toml";
 
 /// Filename of the workspace symlink under each run directory.
 pub const WORKSPACE_LINK: &str = "workspace";
+
+/// Filename of the human-readable progress log under each run directory.
+pub const PROGRESS_FILENAME: &str = "progress.md";
+
+/// Sub-directory under each run directory holding `session_NNN.json` files.
+pub const SESSION_LOG_DIRNAME: &str = "session_log";
 
 /// Persistent store for runs rooted at a directory (typically
 /// `.tsumugi/runs/`).
@@ -71,6 +78,18 @@ impl RunStore {
         self.run_dir(run_id).join(RUN_FILENAME)
     }
 
+    /// Path for a run's `progress.md`.
+    #[must_use]
+    pub fn progress_file(&self, run_id: &RunId) -> PathBuf {
+        self.run_dir(run_id).join(PROGRESS_FILENAME)
+    }
+
+    /// Directory holding a run's `session_NNN.json` files.
+    #[must_use]
+    pub fn session_log_dir(&self, run_id: &RunId) -> PathBuf {
+        self.run_dir(run_id).join(SESSION_LOG_DIRNAME)
+    }
+
     /// Create a fresh ad-hoc run rooted at `workspace_path`.
     ///
     /// `initial_request` is currently unused at the persistence level
@@ -96,6 +115,12 @@ impl RunStore {
         // is still usable without the convenience link.
         let link_path = run_dir.join(WORKSPACE_LINK);
         let _ = create_workspace_symlink(&run.workspace_path, &link_path);
+
+        // Initialise progress.md with the SPEC §9.6 boilerplate. Done
+        // here (and not in RunRunner) so that even resuming an
+        // externally-deleted progress.md re-creates a well-formed file
+        // on the next run-creation; existing content is preserved.
+        ProgressLog::init(self.progress_file(&run.id))?;
 
         self.save(&run)?;
         Ok(run)
@@ -315,6 +340,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let store = RunStore::new(dir.path().join("runs"));
         (dir, store)
+    }
+
+    #[test]
+    fn create_ad_hoc_initialises_progress_md() {
+        let (tmp, store) = make_store();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap_or_else(|e| panic!("{e}"));
+        let run = store
+            .create_ad_hoc(workspace, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let progress_path = store.progress_file(&run.id);
+        assert!(
+            progress_path.exists(),
+            "progress.md should be created at run init"
+        );
+        let content = std::fs::read_to_string(&progress_path).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(content, "# Progress Log\n");
     }
 
     #[test]

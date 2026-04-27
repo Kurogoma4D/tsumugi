@@ -55,12 +55,46 @@ pub enum HarnessError {
         /// Run id actually present inside the loaded `run.toml`.
         found: String,
     },
+
+    /// Failed to serialize a [`Session`](crate::session::Session) to JSON.
+    #[error("failed to serialize session at {path}: {source}")]
+    SessionSerialize {
+        /// Target file path.
+        path: PathBuf,
+        /// Underlying serialization error.
+        source: serde_json::Error,
+    },
+
+    /// Failed to deserialize a `session_NNN.json` from disk.
+    #[error("failed to parse session log at {path}: {source}")]
+    SessionDeserialize {
+        /// Source file path.
+        path: PathBuf,
+        /// Underlying deserialization error.
+        source: serde_json::Error,
+    },
 }
 
 impl HarnessError {
     /// Construct an [`HarnessError::Io`] from a path and `std::io::Error`.
     pub fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         Self::Io {
+            path: path.into(),
+            source,
+        }
+    }
+
+    /// Construct a [`HarnessError::SessionSerialize`].
+    pub fn session_serialize(path: impl Into<PathBuf>, source: serde_json::Error) -> Self {
+        Self::SessionSerialize {
+            path: path.into(),
+            source,
+        }
+    }
+
+    /// Construct a [`HarnessError::SessionDeserialize`].
+    pub fn session_deserialize(path: impl Into<PathBuf>, source: serde_json::Error) -> Self {
+        Self::SessionDeserialize {
             path: path.into(),
             source,
         }
