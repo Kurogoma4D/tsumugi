@@ -88,6 +88,34 @@ pub trait StreamSink {
 /// immediate context for the current task.
 const PRESERVE_RECENT_MESSAGES: usize = 6;
 
+/// Lightweight summary of one [`AgentLoop::turn`] handed to the
+/// optional [`TurnObserver`] callback.
+///
+/// Carries enough metric inputs for the harness's auto-promotion gate
+/// (SPEC §9.10) without forcing the loop to reach into the harness.
+/// Producing it is allocation-cheap: the underlying counters live on
+/// `AgentLoop` already, and the user-message text is owned anyway.
+#[derive(Debug, Clone, Default)]
+pub struct TurnSummary {
+    /// Token count after the turn, taken from the loop's cached counter.
+    pub tokens_used: usize,
+
+    /// Number of tool calls observed across all rounds in this turn.
+    pub tool_calls: u32,
+
+    /// User input that opened this turn. Carried verbatim so harness
+    /// keyword detectors can see the original text.
+    pub user_message: String,
+}
+
+/// Boxed callback invoked once per [`AgentLoop::turn`] completion.
+///
+/// The harness installs one of these via
+/// [`AgentLoop::set_turn_observer`] to feed the auto-promotion gate
+/// (SPEC §9.10). Callbacks must not panic; any error is intentionally
+/// swallowed by the loop because the metric channel is best-effort.
+pub type TurnObserver = Box<dyn Fn(&TurnSummary) + Send + Sync>;
+
 /// An agent loop that manages conversation history, streams LLM
 /// responses, dispatches tool calls, and loops until the model is done.
 ///
@@ -124,6 +152,13 @@ pub struct AgentLoop {
 
     /// Tool calling strategy (native, `prompt_based`, or auto).
     tool_calling_mode: ToolCallingMode,
+
+    /// Optional callback invoked at the end of every [`Self::turn`].
+    ///
+    /// Installed by the harness wire-up to feed the auto-promotion
+    /// gate (SPEC §9.10). The default is `None`, so non-harness
+    /// callers (e.g. one-shot CLI mode) pay nothing.
+    turn_observer: Option<TurnObserver>,
 }
 
 impl AgentLoop {
@@ -192,7 +227,17 @@ impl AgentLoop {
             token_counter,
             compressor,
             tool_calling_mode,
+            turn_observer: None,
         })
+    }
+
+    /// Install (or replace) the per-turn observer callback.
+    ///
+    /// Pass `None` to clear an existing observer. The callback is
+    /// invoked at most once per [`Self::turn`] call; if the agent
+    /// loop is cancelled mid-turn, the observer is **not** invoked.
+    pub fn set_turn_observer(&mut self, observer: Option<TurnObserver>) {
+        self.turn_observer = observer;
     }
 
     /// Build the system prompt string based on the tool calling mode.
@@ -352,6 +397,11 @@ impl AgentLoop {
         // Add user message to history.
         self.history.push(Message::user(user_input));
 
+        // Track per-turn metrics for the optional `turn_observer`. We
+        // only need a tool-call counter; tokens come from the cached
+        // counter at turn end and the user message is already owned.
+        let mut tool_calls_total: u32 = 0;
+
         for _round in 0..MAX_TOOL_ROUNDS {
             if self.cancel.is_cancelled() {
                 return Err(CoreError::Cancelled);
@@ -373,11 +423,14 @@ impl AgentLoop {
                     sink.on_warning(&format!("auto-compression failed: {e}"))?;
                 }
 
+                self.notify_turn_observer(user_input, tool_calls_total);
                 return Ok(());
             }
 
             // We have tool calls. Record the assistant message with tool
             // calls in history, then execute them.
+            tool_calls_total = tool_calls_total
+                .saturating_add(u32::try_from(tool_calls.len()).unwrap_or(u32::MAX));
             self.history.push(Message::assistant_with_tool_calls(
                 response_text,
                 tool_calls.clone(),
@@ -397,7 +450,25 @@ impl AgentLoop {
         // Update token count even on max-rounds termination.
         self.token_counter.request_update(&self.history).await;
 
+        self.notify_turn_observer(user_input, tool_calls_total);
         Ok(())
+    }
+
+    /// Invoke the installed [`TurnObserver`] (if any) with a fresh
+    /// [`TurnSummary`].
+    ///
+    /// Errors from the observer are intentionally swallowed: the
+    /// metric channel is best-effort and must not abort an already-
+    /// completed turn.
+    fn notify_turn_observer(&self, user_input: &str, tool_calls_total: u32) {
+        if let Some(observer) = self.turn_observer.as_ref() {
+            let summary = TurnSummary {
+                tokens_used: self.token_counter.cached_count(),
+                tool_calls: tool_calls_total,
+                user_message: user_input.to_owned(),
+            };
+            observer(&summary);
+        }
     }
 
     /// Stream one round of LLM output, returning the accumulated text

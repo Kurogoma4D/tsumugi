@@ -343,6 +343,7 @@ fn run_tui(
         ));
         register_run_tools(&mut registry, Arc::clone(&runner)).await;
 
+        let max_context_tokens = context_config.max_context_tokens;
         let mut agent = tmg_core::AgentLoop::with_context_config(
             client,
             registry,
@@ -352,6 +353,21 @@ fn run_tui(
             context_config,
             tool_calling_mode,
         )?;
+
+        // Wire the auto-promotion gate (issue #37): after every turn,
+        // the harness observer records the turn metrics into
+        // `RunRunner::session_state` so the
+        // [`tmg_harness::EscalationEvaluator`] sees the SPEC §9.10
+        // trigger inputs.
+        //
+        // The evaluator itself is **not** wired here yet: the TUI
+        // event loop is the natural integration point for the async
+        // background task that drives `evaluate` + `escalate_to_harnessed`,
+        // and the TUI module owns the necessary `tokio::spawn` plumbing.
+        // For now the runner's `session_state` is updated synchronously
+        // so a future `tmg run upgrade` command can read the same
+        // signals; the auto-evaluation hookup is tracked as a follow-up.
+        install_turn_observer(&mut agent, Arc::clone(&runner), max_context_tokens);
 
         // Run session_bootstrap once and inject its output as a system
         // message so the LLM has the SPEC §9.7 context bundle for its
@@ -428,6 +444,45 @@ fn log_end_session_error(err: &tmg_harness::HarnessError) {
 )]
 fn eprintln_warning(message: &str) {
     eprintln!("[tmg] warning: {message}");
+}
+
+/// Install the per-turn observer that feeds [`tmg_harness::SessionState`].
+///
+/// The observer captures the runner Arc plus the configured context
+/// budget so that `RunRunner::after_turn` is called with both pieces
+/// after every `AgentLoop::turn`. The callback uses `try_lock` so a
+/// long-running tool that's still holding the runner lock cannot
+/// stall the agent loop; in the rare contention case, one turn's
+/// metrics are skipped and a `tracing::trace!` is emitted.
+///
+/// Note: the auto-promotion evaluator hookup (`detect_signals` →
+/// `evaluate` → `escalate_to_harnessed`) is intentionally not part
+/// of this wire-up. Wiring the async escalator round-trip into the
+/// TUI is a follow-up; see issue #46 for the banner integration.
+fn install_turn_observer(
+    agent: &mut tmg_core::AgentLoop,
+    runner: Arc<Mutex<RunRunner>>,
+    max_context_tokens: usize,
+) {
+    let observer: tmg_core::TurnObserver = Box::new(move |summary: &tmg_core::TurnSummary| {
+        // The Arc clone is cheap; the lock guard is dropped quickly so
+        // the harness sink and the run-scoped tools can re-acquire it
+        // immediately.
+        let harness_summary = tmg_harness::TurnSummary {
+            tokens_used: summary.tokens_used,
+            tool_calls: summary.tool_calls,
+            files_modified: Vec::new(),
+            diff_lines: 0,
+            user_message: summary.user_message.clone(),
+        };
+        match runner.try_lock() {
+            Ok(mut guard) => guard.after_turn(&harness_summary, max_context_tokens),
+            Err(_) => {
+                tracing::trace!("RunRunner busy; skipping after_turn update for one turn",);
+            }
+        }
+    });
+    agent.set_turn_observer(Some(observer));
 }
 
 /// Run `session_bootstrap` once and push its output into the agent's
