@@ -397,6 +397,11 @@ pub struct HarnessConfig {
 
     /// Maximum tokens for the `session_bootstrap` payload before the
     /// tool truncates older progress sessions / git log entries to fit.
+    ///
+    /// Set to `0` to disable truncation entirely (the payload is
+    /// emitted in full regardless of size). Any value `>= 1` is a hard
+    /// budget; older `progress.md` sessions and tail-end git log lines
+    /// are shed until the serialized payload fits.
     pub bootstrap_max_tokens: usize,
 }
 

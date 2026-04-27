@@ -89,14 +89,16 @@ impl<S: StreamSink> StreamSink for HarnessStreamSink<S> {
         is_error: bool,
     ) -> Result<(), CoreError> {
         if !is_error && FILE_MODIFYING_TOOLS.contains(&name) {
-            // Best-effort: the tool's `output` does not currently encode
-            // a structured "modified path" field, so we record the tool
-            // name as a coarse marker. Refining this once the file
-            // tools surface paths is tracked as a follow-up.
-            let marker = format!("(via {name})");
+            // Try to extract the actual modified path. Tools may emit
+            // either structured JSON (`{"path": "..."}` /
+            // `{"file_path": "..."}`) or a free-form success string
+            // such as `Successfully wrote N bytes to '<path>'`. Fall
+            // back to the coarse `(via {name})` marker only when no
+            // path is recoverable.
+            let entry = extract_modified_path(output).unwrap_or_else(|| format!("(via {name})"));
             self.with_active_session(|s| {
-                if !s.files_modified.contains(&marker) {
-                    s.files_modified.push(marker);
+                if !s.files_modified.contains(&entry) {
+                    s.files_modified.push(entry);
                 }
             });
         }
@@ -105,6 +107,54 @@ impl<S: StreamSink> StreamSink for HarnessStreamSink<S> {
 
     fn on_warning(&mut self, message: &str) -> Result<(), CoreError> {
         self.inner.on_warning(message)
+    }
+}
+
+/// Try to recover the modified file path from a tool's textual output.
+///
+/// The lookup tries, in order:
+///
+/// 1. Parse `output` as JSON and read the `path` or `file_path` string
+///    field.
+/// 2. Match the canonical success messages emitted by `file_write`
+///    (`Successfully wrote N bytes to '<path>'`) and `file_patch`
+///    (`Successfully patched '<path>'`).
+///
+/// Returns `None` when no path can be extracted; callers fall back to
+/// a `(via {name})` marker.
+fn extract_modified_path(output: &str) -> Option<String> {
+    // 1. Structured JSON shape — used by future file tools that emit
+    //    `{"path": "..."}` / `{"file_path": "..."}`.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(output) {
+        for key in ["path", "file_path"] {
+            if let Some(s) = value.get(key).and_then(serde_json::Value::as_str) {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_owned());
+                }
+            }
+        }
+    }
+
+    // 2. Free-form success strings emitted by today's `file_write` /
+    //    `file_patch` tools. Both put the path inside single quotes
+    //    near the end of the line; pulling the *last* `'…'` segment is
+    //    robust to wording differences.
+    extract_quoted_path(output)
+}
+
+/// Return the contents of the last `'…'`-quoted span in `s`, if any.
+///
+/// Matches both `file_write`'s "...to '<path>'" and `file_patch`'s
+/// "...patched '<path>'" wording without requiring a regex dependency.
+fn extract_quoted_path(s: &str) -> Option<String> {
+    let close = s.rfind('\'')?;
+    let open = s[..close].rfind('\'')?;
+    let candidate = &s[open + 1..close];
+    if candidate.is_empty() {
+        None
+    } else {
+        Some(candidate.to_owned())
     }
 }
 
@@ -154,13 +204,23 @@ mod tests {
     async fn on_tool_result_records_file_modifications() {
         let (_tmp, runner) = make_runner();
         let mut sink = HarnessStreamSink::new(NullSink, Arc::clone(&runner));
-        sink.on_tool_result("file_write", "ok", false)
-            .unwrap_or_else(|e| panic!("{e}"));
-        sink.on_tool_result("file_patch", "ok", false)
+        // Free-form success strings emitted by today's tools. The sink
+        // pulls the path out of the trailing single-quoted segment.
+        sink.on_tool_result(
+            "file_write",
+            "Successfully wrote 11 bytes to '/tmp/foo.rs'",
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        sink.on_tool_result("file_patch", "Successfully patched '/tmp/bar.rs'", false)
             .unwrap_or_else(|e| panic!("{e}"));
         // Errored writes should not count.
-        sink.on_tool_result("file_write", "boom", true)
-            .unwrap_or_else(|e| panic!("{e}"));
+        sink.on_tool_result(
+            "file_write",
+            "Successfully wrote 0 bytes to '/tmp/baz'",
+            true,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         // Non-write tools should not count.
         sink.on_tool_result("file_read", "ok", false)
             .unwrap_or_else(|e| panic!("{e}"));
@@ -170,26 +230,213 @@ mod tests {
             .active_session()
             .unwrap_or_else(|| panic!("active session"));
         assert!(
-            session
-                .files_modified
-                .iter()
-                .any(|m| m.contains("file_write")),
-            "missing file_write: {:?}",
+            session.files_modified.contains(&"/tmp/foo.rs".to_owned()),
+            "missing file_write path: {:?}",
             session.files_modified
         );
         assert!(
-            session
-                .files_modified
-                .iter()
-                .any(|m| m.contains("file_patch")),
-            "missing file_patch: {:?}",
+            session.files_modified.contains(&"/tmp/bar.rs".to_owned()),
+            "missing file_patch path: {:?}",
             session.files_modified
         );
         assert_eq!(
             session.files_modified.len(),
             2,
-            "should dedupe by tool name: {:?}",
+            "should dedupe per path: {:?}",
             session.files_modified
         );
+    }
+
+    /// Path extraction succeeds for unstructured `file_write` output and
+    /// dedupes when the same file is written twice within one session.
+    #[tokio::test]
+    async fn on_tool_result_dedupes_repeated_paths() {
+        let (_tmp, runner) = make_runner();
+        let mut sink = HarnessStreamSink::new(NullSink, Arc::clone(&runner));
+        sink.on_tool_result(
+            "file_write",
+            "Successfully wrote 5 bytes to '/tmp/dupe.rs'",
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        sink.on_tool_result(
+            "file_write",
+            "Successfully wrote 17 bytes to '/tmp/dupe.rs'",
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        let guard = runner.lock().await;
+        let session = guard
+            .active_session()
+            .unwrap_or_else(|| panic!("active session"));
+        assert_eq!(session.files_modified, vec!["/tmp/dupe.rs".to_owned()]);
+    }
+
+    /// Structured JSON outputs (the future shape of file tools) are
+    /// preferred over the free-form regex when both are present.
+    #[tokio::test]
+    async fn on_tool_result_extracts_path_from_json() {
+        let (_tmp, runner) = make_runner();
+        let mut sink = HarnessStreamSink::new(NullSink, Arc::clone(&runner));
+        sink.on_tool_result(
+            "file_write",
+            r#"{"path": "/tmp/json_path.rs", "bytes": 42}"#,
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        sink.on_tool_result(
+            "file_patch",
+            r#"{"file_path": "/tmp/file_path_key.rs"}"#,
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        let guard = runner.lock().await;
+        let session = guard
+            .active_session()
+            .unwrap_or_else(|| panic!("active session"));
+        assert!(
+            session
+                .files_modified
+                .contains(&"/tmp/json_path.rs".to_owned()),
+            "{:?}",
+            session.files_modified,
+        );
+        assert!(
+            session
+                .files_modified
+                .contains(&"/tmp/file_path_key.rs".to_owned()),
+            "{:?}",
+            session.files_modified,
+        );
+    }
+
+    /// When neither a JSON shape nor the canonical text format matches,
+    /// the sink falls back to the coarse `(via {name})` marker so the
+    /// session still records that *something* was modified.
+    #[tokio::test]
+    async fn on_tool_result_falls_back_when_path_unrecoverable() {
+        let (_tmp, runner) = make_runner();
+        let mut sink = HarnessStreamSink::new(NullSink, Arc::clone(&runner));
+        sink.on_tool_result("file_write", "no path here, sorry", false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let guard = runner.lock().await;
+        let session = guard
+            .active_session()
+            .unwrap_or_else(|| panic!("active session"));
+        assert_eq!(session.files_modified, vec!["(via file_write)".to_owned()]);
+    }
+
+    #[test]
+    fn extract_quoted_path_works() {
+        assert_eq!(
+            extract_quoted_path("Successfully wrote 11 bytes to '/tmp/foo.rs'"),
+            Some("/tmp/foo.rs".to_owned()),
+        );
+        assert_eq!(
+            extract_quoted_path("Successfully patched '/tmp/bar.rs'"),
+            Some("/tmp/bar.rs".to_owned()),
+        );
+        assert_eq!(extract_quoted_path("no quotes"), None);
+        assert_eq!(extract_quoted_path("only one '"), None);
+        assert_eq!(extract_quoted_path("empty ''"), None);
+    }
+
+    #[test]
+    fn extract_modified_path_prefers_json_over_text() {
+        // When both keys are present in JSON, `path` wins (it's listed
+        // first in the lookup order).
+        let json = r#"{"path": "/json", "file_path": "/other"}"#;
+        assert_eq!(extract_modified_path(json), Some("/json".to_owned()));
+    }
+
+    #[test]
+    fn extract_modified_path_handles_text_fallback() {
+        let text = "Successfully wrote 11 bytes to '/tmp/x.rs'";
+        assert_eq!(extract_modified_path(text), Some("/tmp/x.rs".to_owned()));
+    }
+
+    /// Mirrors the production composition used by the TUI: an inner
+    /// channel-style forwarding sink wrapped with `HarnessStreamSink`.
+    /// After fake tool events flow through the wrapper, the runner's
+    /// active session sees both `tool_calls_count` and `files_modified`
+    /// updated, and the inner sink continues to receive every callback.
+    #[tokio::test]
+    async fn wrapping_inner_sink_updates_runner_and_forwards() {
+        use std::sync::Mutex as StdMutex;
+
+        // A test sink that records every callback so we can assert
+        // forwarding semantics (no events swallowed by the decorator).
+        #[derive(Default)]
+        struct RecordingSink {
+            events: Arc<StdMutex<Vec<String>>>,
+        }
+        impl StreamSink for RecordingSink {
+            fn on_token(&mut self, token: &str) -> Result<(), CoreError> {
+                self.events
+                    .lock()
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .push(format!("token:{token}"));
+                Ok(())
+            }
+            fn on_tool_call(&mut self, name: &str, _args: &str) -> Result<(), CoreError> {
+                self.events
+                    .lock()
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .push(format!("call:{name}"));
+                Ok(())
+            }
+            fn on_tool_result(
+                &mut self,
+                name: &str,
+                _output: &str,
+                _is_error: bool,
+            ) -> Result<(), CoreError> {
+                self.events
+                    .lock()
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .push(format!("result:{name}"));
+                Ok(())
+            }
+        }
+
+        let (_tmp, runner) = make_runner();
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let inner = RecordingSink {
+            events: Arc::clone(&events),
+        };
+        let mut wrapped = HarnessStreamSink::new(inner, Arc::clone(&runner));
+
+        wrapped.on_token("hello").unwrap_or_else(|e| panic!("{e}"));
+        wrapped
+            .on_tool_call("file_write", "{}")
+            .unwrap_or_else(|e| panic!("{e}"));
+        wrapped
+            .on_tool_result(
+                "file_write",
+                "Successfully wrote 5 bytes to '/tmp/wired.rs'",
+                false,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        // Inner sink must have received every event in order.
+        let recorded = events.lock().unwrap_or_else(|e| panic!("{e}")).clone();
+        assert_eq!(
+            recorded,
+            vec![
+                "token:hello".to_owned(),
+                "call:file_write".to_owned(),
+                "result:file_write".to_owned(),
+            ],
+        );
+
+        // And the decorator must have updated the runner's active session.
+        let guard = runner.lock().await;
+        let session = guard
+            .active_session()
+            .unwrap_or_else(|| panic!("active session"));
+        assert_eq!(session.tool_calls_count, 1);
+        assert_eq!(session.files_modified, vec!["/tmp/wired.rs".to_owned()]);
     }
 }

@@ -23,6 +23,11 @@ use tmg_tools::{Tool, ToolError, ToolResult};
 use tokio::sync::Mutex;
 
 use crate::runner::RunRunner;
+// `TokenCounter` is referenced for its `estimate_tokens` heuristic only.
+// The previously-supported "attach an LLM-backed counter" path was
+// dropped in PR #57 review (see commit history): the `/tokenize`
+// round-trip is undesirable on the synchronous bootstrap path, so we
+// always fall back to the heuristic.
 
 /// Default number of git log entries to include.
 const DEFAULT_GIT_LOG_LIMIT: usize = 30;
@@ -124,7 +129,6 @@ struct BootstrapInputs {
     progress_log_path: PathBuf,
     bootstrap_max_tokens: usize,
     last_hint: Option<String>,
-    token_counter: Option<Arc<TokenCounter>>,
 }
 
 async fn run_bootstrap(runner: &Arc<Mutex<RunRunner>>) -> Result<BootstrapPayload, ToolError> {
@@ -143,7 +147,6 @@ async fn run_bootstrap(runner: &Arc<Mutex<RunRunner>>) -> Result<BootstrapPayloa
             progress_log_path: guard.progress_log().path().to_path_buf(),
             bootstrap_max_tokens: guard.bootstrap_max_tokens(),
             last_hint,
-            token_counter: guard.token_counter().cloned(),
         }
     };
 
@@ -162,8 +165,7 @@ async fn run_bootstrap(runner: &Arc<Mutex<RunRunner>>) -> Result<BootstrapPayloa
 
     let max_tokens = inputs.bootstrap_max_tokens;
     if max_tokens > 0 {
-        let counter_ref = inputs.token_counter.as_deref();
-        truncate_to_budget(&mut payload, max_tokens, counter_ref);
+        truncate_to_budget(&mut payload, max_tokens);
     }
 
     Ok(payload)
@@ -203,44 +205,42 @@ async fn collect_git_log(workspace: &std::path::Path, limit: usize) -> String {
     }
 }
 
-/// Compute an approximate token count for `text` using `counter` when
-/// available, falling back to the static heuristic otherwise.
-fn approx_tokens(text: &str, counter: Option<&TokenCounter>) -> usize {
-    // We avoid awaiting the per-call `/tokenize` round-trip here because
-    // the bootstrap path runs synchronously inside the tool dispatch
-    // and shelling out to the LLM server during startup is undesirable.
-    // The cached counter (if any) is consulted only for symmetry; in
-    // practice we always fall back to the heuristic.
-    let _ = counter;
+/// Approximate token count for `text` using
+/// [`TokenCounter::estimate_tokens`] (the chars-per-4 heuristic).
+///
+/// We deliberately do not consult the LLM-backed `/tokenize` endpoint
+/// here: the bootstrap path runs synchronously inside the tool dispatch,
+/// and shelling out to the LLM server during startup is undesirable.
+fn estimate_tokens(text: &str) -> usize {
     TokenCounter::estimate_tokens(text)
 }
 
 /// Trim the payload until its serialized form fits within `max_tokens`.
 ///
 /// Strategy: shed older progress sessions first, then trim the git log
-/// from its tail (oldest commits). The summary field and working
-/// directory are preserved as long as they fit individually. Sets
-/// `payload.truncated = true` when any reduction was applied.
-fn truncate_to_budget(
-    payload: &mut BootstrapPayload,
-    max_tokens: usize,
-    counter: Option<&TokenCounter>,
-) {
-    let initial = approx_tokens(&serialize_for_size(payload), counter);
+/// from its tail (oldest commits), then drop `last_session_hint` as a
+/// last resort. **`working_directory` is preserved unconditionally** —
+/// it is never trimmed, so the post-truncation token count is bounded by
+/// `max_tokens + estimate_tokens(working_directory) + framing overhead`
+/// rather than `max_tokens` alone.
+///
+/// Sets `payload.truncated = true` when any reduction was applied.
+fn truncate_to_budget(payload: &mut BootstrapPayload, max_tokens: usize) {
+    let initial = estimate_tokens(&serialize_for_size(payload));
     if initial <= max_tokens {
         return;
     }
     payload.truncated = true;
 
     // 1) Drop oldest progress sessions one at a time.
-    while approx_tokens(&serialize_for_size(payload), counter) > max_tokens {
+    while estimate_tokens(&serialize_for_size(payload)) > max_tokens {
         if !drop_oldest_progress_session(&mut payload.progress_summary) {
             break;
         }
     }
 
     // 2) Trim the git log from the bottom (oldest commit) by lines.
-    while approx_tokens(&serialize_for_size(payload), counter) > max_tokens
+    while estimate_tokens(&serialize_for_size(payload)) > max_tokens
         && !payload.recent_git_log.is_empty()
     {
         let mut lines: Vec<&str> = payload.recent_git_log.lines().collect();
@@ -257,7 +257,7 @@ fn truncate_to_budget(
     }
 
     // 3) Last resort: clear the hint to free up budget.
-    if approx_tokens(&serialize_for_size(payload), counter) > max_tokens {
+    if estimate_tokens(&serialize_for_size(payload)) > max_tokens {
         payload.last_session_hint = None;
     }
 }
@@ -280,36 +280,35 @@ fn serialize_for_size(payload: &BootstrapPayload) -> String {
 /// Remove the oldest `## Session ...` block from `progress_summary`.
 ///
 /// Returns `true` if a session was dropped, `false` otherwise.
+///
+/// **Precondition:** by construction, `progress_summary` is the output
+/// of [`ProgressLog::read_recent_sessions`](crate::artifacts::ProgressLog::read_recent_sessions),
+/// which always starts at a `## Session ` header (or is empty). We
+/// therefore do not need to scan for the first header — we drain from
+/// byte `0` to the next header. An assertion guards the precondition
+/// in debug builds.
 fn drop_oldest_progress_session(progress_summary: &mut String) -> bool {
-    // Find the first session header.
-    let Some(first_idx) = find_first_session_header(progress_summary) else {
-        if progress_summary.is_empty() {
-            return false;
-        }
-        progress_summary.clear();
-        return true;
-    };
+    if progress_summary.is_empty() {
+        return false;
+    }
+    debug_assert!(
+        progress_summary.starts_with("## Session "),
+        "drop_oldest_progress_session expects content to begin at a session header; \
+         got: {:?}",
+        &progress_summary[..progress_summary.len().min(40)],
+    );
 
-    // Then find the next header *after* the first one; drop everything
-    // up to that point.
-    let after_first = first_idx + "## Session".len();
+    // Find the next header after the first one; drop everything up to
+    // that point. If there is no next header, the entire summary is a
+    // single session block — drop it all.
+    let after_first = "## Session".len();
     if let Some(next_rel) = progress_summary[after_first..].find("\n## Session ") {
-        let next_idx = after_first + next_rel + 1; // skip the leading \n
+        let next_idx = after_first + next_rel + 1; // skip the leading '\n'
         progress_summary.drain(..next_idx);
-        true
     } else {
-        // Only one session block left; drop the whole thing.
         progress_summary.clear();
-        true
     }
-}
-
-/// Locate the first `## Session ` header in `progress_summary`.
-fn find_first_session_header(s: &str) -> Option<usize> {
-    if s.starts_with("## Session ") {
-        return Some(0);
-    }
-    s.find("\n## Session ").map(|i| i + 1)
+    true
 }
 
 #[cfg(test)]
@@ -435,14 +434,62 @@ mod tests {
         let tool = SessionBootstrapTool::new(Arc::clone(&runner));
         let payload = tool.run_once().await.unwrap_or_else(|e| panic!("{e}"));
         assert!(payload.truncated, "payload should be marked truncated");
-        // Heuristic: characters/4. Final payload must fit in 64 tokens
-        // (~256 chars) modulo the working_directory which we never trim.
+        // `working_directory` is preserved unconditionally by
+        // `truncate_to_budget`, so the post-truncation payload's
+        // estimated token count must fit within
+        // `budget + estimate_tokens(working_directory)`. Allow a small
+        // constant for JSON framing overhead (`{}`, quotes, field names);
+        // 64 tokens is comfortably above what the heuristic produces for
+        // the bookkeeping fields.
         let serialized = serialize_for_size(&payload);
+        let actual = TokenCounter::estimate_tokens(&serialized);
+        let budget = 64;
+        let preserved = TokenCounter::estimate_tokens(&payload.working_directory);
+        let framing_overhead = 64;
         assert!(
-            TokenCounter::estimate_tokens(&serialized) <= 64
-                || serialized.len() < 4 * 64 + payload.working_directory.len() + 64,
-            "payload still too large: {} chars",
-            serialized.len()
+            actual <= budget + preserved + framing_overhead,
+            "post-truncation token count {actual} exceeds budget {budget} + \
+             working_directory {preserved} + framing {framing_overhead}; \
+             serialized len {} bytes",
+            serialized.len(),
+        );
+    }
+
+    /// `bootstrap_max_tokens = 0` is documented as "no truncation":
+    /// even when the payload would normally be over budget, every
+    /// session is preserved and `truncated` stays `false`.
+    #[tokio::test]
+    async fn zero_budget_disables_truncation() {
+        let (_tmp, runner) = make_runner();
+
+        // Same fat seed as `truncates_when_over_budget`, but with the
+        // budget pinned to 0.
+        {
+            let mut guard = runner.lock().await;
+            guard.set_bootstrap_max_tokens(0);
+            let scope = RunScope::AdHoc;
+            let ts = Utc::now();
+            for i in 1..=10_u32 {
+                guard
+                    .progress_log()
+                    .append_session_header(i, &scope, ts)
+                    .unwrap_or_else(|e| panic!("{e}"));
+                for _ in 0..50 {
+                    guard
+                        .progress_log()
+                        .append_entry(&"x".repeat(80))
+                        .unwrap_or_else(|e| panic!("{e}"));
+                }
+            }
+        }
+
+        let tool = SessionBootstrapTool::new(Arc::clone(&runner));
+        let payload = tool.run_once().await.unwrap_or_else(|e| panic!("{e}"));
+        assert!(!payload.truncated, "zero budget must skip truncation");
+        // The full progress.md (5 sessions ish) survives.
+        assert!(
+            payload.progress_summary.contains("Session #6"),
+            "older sessions should be preserved when budget is 0"
         );
     }
 

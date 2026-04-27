@@ -73,6 +73,25 @@ pub enum HarnessError {
         /// Underlying deserialization error.
         source: serde_json::Error,
     },
+
+    /// `RunRunner::end_session` was called with a [`SessionHandle`] that
+    /// does not match the currently-active [`Session`]. This typically
+    /// indicates a bug in the caller (e.g. an out-of-order
+    /// `begin_session` / `end_session` pairing); we refuse to persist
+    /// rather than silently overwriting the active session with the
+    /// wrong index.
+    ///
+    /// [`SessionHandle`]: crate::session::SessionHandle
+    /// [`Session`]: crate::session::Session
+    #[error(
+        "session handle mismatch: end_session called with index {actual} but active session is index {expected}"
+    )]
+    SessionMismatch {
+        /// Index of the session that is actually active.
+        expected: u32,
+        /// Index carried by the handle the caller passed in.
+        actual: u32,
+    },
 }
 
 impl HarnessError {

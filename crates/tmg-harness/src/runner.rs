@@ -28,7 +28,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
-use tmg_core::TokenCounter;
 
 use crate::artifacts::{ProgressLog, SessionLog};
 use crate::error::HarnessError;
@@ -59,11 +58,10 @@ pub struct RunRunner {
     /// Token budget for `session_bootstrap` output.
     ///
     /// Reads from `[harness] bootstrap_max_tokens` in `tsumugi.toml`.
+    /// `0` disables truncation entirely; see
+    /// [`set_bootstrap_max_tokens`](Self::set_bootstrap_max_tokens) for
+    /// the full semantics.
     bootstrap_max_tokens: usize,
-    /// Optional token counter used by `session_bootstrap` to budget its
-    /// output. When `None`, falls back to
-    /// [`TokenCounter::estimate_tokens`].
-    token_counter: Option<Arc<TokenCounter>>,
 }
 
 impl RunRunner {
@@ -80,32 +78,33 @@ impl RunRunner {
             session_log,
             active_session: None,
             bootstrap_max_tokens: DEFAULT_BOOTSTRAP_MAX_TOKENS,
-            token_counter: None,
         }
     }
 
-    /// Set the `bootstrap_max_tokens` budget. Defaults to
-    /// [`DEFAULT_BOOTSTRAP_MAX_TOKENS`].
+    /// Set the `bootstrap_max_tokens` budget.
+    ///
+    /// **Semantics:**
+    /// - `0` means **no truncation** — the bootstrap payload is emitted
+    ///   in full regardless of size. Use this only when you trust the
+    ///   inputs (e.g. tests or short-lived projects).
+    /// - any value `>= 1` is treated as a hard budget; older
+    ///   `progress.md` sessions and tail-end git log lines are shed
+    ///   until the serialized payload's estimated token count fits.
+    ///
+    /// Defaults to [`DEFAULT_BOOTSTRAP_MAX_TOKENS`].
     pub fn set_bootstrap_max_tokens(&mut self, n: usize) {
         self.bootstrap_max_tokens = n;
     }
 
     /// Return the current `bootstrap_max_tokens` budget.
+    ///
+    /// A return value of `0` indicates "no truncation"; any value
+    /// `>= 1` is the hard token budget enforced by `session_bootstrap`.
+    /// See [`set_bootstrap_max_tokens`](Self::set_bootstrap_max_tokens)
+    /// for full semantics.
     #[must_use]
     pub fn bootstrap_max_tokens(&self) -> usize {
         self.bootstrap_max_tokens
-    }
-
-    /// Attach a [`TokenCounter`] for accurate output sizing in
-    /// `session_bootstrap`.
-    pub fn set_token_counter(&mut self, counter: Arc<TokenCounter>) {
-        self.token_counter = Some(counter);
-    }
-
-    /// Borrow the optional [`TokenCounter`].
-    #[must_use]
-    pub fn token_counter(&self) -> Option<&Arc<TokenCounter>> {
-        self.token_counter.as_ref()
     }
 
     /// Borrow the active run.
@@ -205,26 +204,43 @@ impl RunRunner {
 
     /// End the given session, marking the trigger, persisting the final
     /// `session_NNN.json` and the run record.
+    ///
+    /// If `handle.index` does not match the currently-active session,
+    /// returns [`HarnessError::SessionMismatch`] **without** mutating
+    /// the active session or persisting any state. This avoids silently
+    /// overwriting the active session with an incorrect index, which
+    /// would corrupt `session_NNN.json` for the real active session.
+    ///
+    /// The active session is also left untouched (not consumed) so the
+    /// caller can recover by retrying with the correct handle, e.g.
+    /// the one returned by [`begin_session`](Self::begin_session).
     pub fn end_session(
         &mut self,
         handle: &SessionHandle,
         trigger: SessionEndTrigger,
     ) -> Result<(), HarnessError> {
-        if let Some(mut session) = self.active_session.take() {
-            if session.index != handle.index {
-                tracing::warn!(
-                    handle_index = handle.index,
-                    active_index = session.index,
-                    "end_session handle does not match active session; persisting active session anyway"
-                );
-            }
-            session.end(trigger);
-            self.session_log.save(&session)?;
-        } else {
+        // Validate the handle against the active session before taking
+        // it out of `self`, so a mismatched handle is rejected without
+        // disturbing in-memory state.
+        let Some(session_ref) = self.active_session.as_ref() else {
             tracing::warn!(
                 handle_index = handle.index,
                 "end_session called without an active session"
             );
+            self.store.save(&self.run)?;
+            return Ok(());
+        };
+        if session_ref.index != handle.index {
+            return Err(HarnessError::SessionMismatch {
+                expected: session_ref.index,
+                actual: handle.index,
+            });
+        }
+
+        // Indices match — take the session out and finalize it.
+        if let Some(mut session) = self.active_session.take() {
+            session.end(trigger);
+            self.session_log.save(&session)?;
         }
         self.store.save(&self.run)?;
         Ok(())
@@ -312,6 +328,35 @@ mod tests {
         assert_eq!(loaded.session_count, 1);
         assert_eq!(loaded.workspace_path, runner.run().workspace_path);
         assert_eq!(loaded.id, id);
+    }
+
+    #[test]
+    fn end_session_mismatched_handle_returns_error_without_persisting() {
+        let (_tmp, mut runner) = make_runner();
+        let real_handle = runner.begin_session().unwrap_or_else(|e| panic!("{e}"));
+        let bad_handle = SessionHandle {
+            index: real_handle.index + 7,
+        };
+
+        let result = runner.end_session(&bad_handle, SessionEndTrigger::Completed);
+        assert!(
+            matches!(
+                result,
+                Err(HarnessError::SessionMismatch { expected, actual })
+                    if expected == real_handle.index && actual == bad_handle.index
+            ),
+            "expected SessionMismatch, got {result:?}",
+        );
+
+        // Active session still alive: the real handle still works.
+        assert!(
+            runner.active_session().is_some(),
+            "active session must not be dropped on mismatch",
+        );
+        runner
+            .end_session(&real_handle, SessionEndTrigger::Completed)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(runner.active_session().is_none());
     }
 
     #[test]

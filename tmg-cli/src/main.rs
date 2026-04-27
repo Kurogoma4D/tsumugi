@@ -337,6 +337,7 @@ fn run_tui(
             custom_agent_defs,
             event_log,
             Some(run_summary),
+            Some(Arc::clone(&runner)),
         )
         .await;
 
@@ -359,14 +360,31 @@ fn run_tui(
             guard.end_session(&session_handle, trigger)
         };
         if let Err(e) = end_result {
-            // Persisting on shutdown is best-effort; surface as a
-            // warning rather than masking the original TUI result.
-            eprintln_warning(&format!("failed to persist run state on shutdown: {e}"));
+            log_end_session_error(&e);
         }
 
         tui_result?;
         Ok::<(), anyhow::Error>(())
     })
+}
+
+/// Surface a non-fatal error from `RunRunner::end_session` to the
+/// operator. Persisting on shutdown is best-effort, so we never abort
+/// the process — but a `SessionMismatch` here would indicate a
+/// programming error (the handle threaded through `run_tui` should
+/// always match the active session) and is called out explicitly.
+fn log_end_session_error(err: &tmg_harness::HarnessError) {
+    match err {
+        tmg_harness::HarnessError::SessionMismatch { expected, actual } => {
+            eprintln_warning(&format!(
+                "internal error: end_session handle mismatch (expected {expected}, got {actual}); \
+                 active session not persisted",
+            ));
+        }
+        other => {
+            eprintln_warning(&format!("failed to persist run state on shutdown: {other}",));
+        }
+    }
 }
 
 /// Print a warning to stderr without violating the workspace
@@ -391,7 +409,11 @@ async fn inject_bootstrap(agent: &mut tmg_core::AgentLoop, runner: Arc<Mutex<Run
         Ok(payload) => match serde_json::to_string_pretty(&payload) {
             Ok(json) => {
                 let injected = format!("[session_bootstrap]\n{json}\n[/session_bootstrap]");
-                agent.push_system_message(injected);
+                // Insert immediately after `history[0]` (the initial
+                // system prompt) so chat templates that reject system
+                // messages following a user turn (Mistral / Qwen /
+                // Gemma) accept the bootstrap.
+                agent.insert_bootstrap_system_message(injected);
             }
             Err(e) => eprintln_warning(&format!("failed to serialize bootstrap payload: {e}")),
         },

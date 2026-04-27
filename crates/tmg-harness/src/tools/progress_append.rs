@@ -71,6 +71,13 @@ impl Tool for ProgressAppendTool {
             }
 
             let guard = runner.lock().await;
+            // Mirror `session_summary_save`: refuse to append if there
+            // is no active session. Without this guard the entry is
+            // written under whatever session header happens to be
+            // newest in `progress.md`, which is misleading.
+            if guard.active_session().is_none() {
+                return Err(ToolError::invalid_params("no active session"));
+            }
             guard
                 .progress_log()
                 .append_entry(trimmed)
@@ -137,6 +144,31 @@ mod tests {
         let tool = ProgressAppendTool::new(runner);
         let res = tool.execute(serde_json::json!({ "entry": "   \n" })).await;
         assert!(matches!(res, Err(ToolError::InvalidParams { .. })));
+    }
+
+    /// `progress_append` mirrors `session_summary_save` in refusing to
+    /// run when there is no active session. This catches mis-wirings
+    /// where the tool is registered before `begin_session()` is called.
+    #[tokio::test]
+    async fn no_active_session_is_error() {
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap_or_else(|e| panic!("{e}"));
+        let run = store
+            .create_ad_hoc(workspace, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        // Note: no `begin_session()` call.
+        let runner = Arc::new(Mutex::new(RunRunner::new(run, store)));
+
+        let tool = ProgressAppendTool::new(runner);
+        let res = tool
+            .execute(serde_json::json!({ "entry": "should fail" }))
+            .await;
+        assert!(
+            matches!(res, Err(ToolError::InvalidParams { ref message }) if message.contains("no active session")),
+            "expected `no active session` error, got {res:?}",
+        );
     }
 
     /// API-level append-only: the tool exposes only `execute` with an
