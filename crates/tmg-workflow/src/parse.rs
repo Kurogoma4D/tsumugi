@@ -43,6 +43,13 @@ fn is_valid_id(id: &str) -> bool {
 }
 
 /// Permissive serde mirror for the top-level workflow YAML object.
+///
+/// The pipeline form (issue #41) uses `stages:` instead of `steps:` —
+/// each stage is a [`StepDef::Workflow`]. We accept either key (but
+/// not both at once) and translate `stages:` into the canonical
+/// internal `steps:` representation downstream. This keeps the engine
+/// driver loop oblivious to whether it's running a flat workflow or
+/// a pipeline of workflow refs.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawWorkflow {
@@ -54,9 +61,41 @@ struct RawWorkflow {
     #[serde(default)]
     inputs: BTreeMap<String, RawInput>,
     #[serde(default)]
-    steps: Vec<RawStepOrRef>,
+    steps: Option<Vec<RawStepOrRef>>,
+    #[serde(default)]
+    stages: Option<Vec<RawPipelineStage>>,
     #[serde(default)]
     outputs: BTreeMap<String, String>,
+}
+
+/// One entry in a pipeline's `stages:` list.
+///
+/// Each stage references a workflow by id and supplies templated
+/// inputs. `loop` is an optional in-line iterator. The `type` field is
+/// `Option` so the canonical sugar form (`{ id, workflow, inputs }`)
+/// works without ceremony; an explicit `type: workflow` is also
+/// accepted for symmetry with the rest of the grammar.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPipelineStage {
+    id: String,
+    #[serde(default, rename = "type")]
+    stage_type: Option<String>,
+    /// Target workflow id.
+    workflow: String,
+    /// Templated inputs (each value is a `${{ ... }}` template).
+    #[serde(default)]
+    inputs: BTreeMap<String, String>,
+    /// Optional `loop:` block (`max_iterations` + `until`).
+    #[serde(default, rename = "loop")]
+    loop_spec: Option<RawLoopSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLoopSpec {
+    max_iterations: u32,
+    until: String,
 }
 
 /// Permissive serde mirror for an input definition.
@@ -279,6 +318,16 @@ fn finalize_workflow(raw: RawWorkflow, path: &Path) -> Result<WorkflowDef> {
         );
     }
 
+    // Reject double-declaration: `stages:` is the pipeline shape and
+    // `steps:` is the flat shape; mixing them would make `${{ stages.* }}`
+    // semantics ambiguous.
+    if raw.steps.is_some() && raw.stages.is_some() {
+        return Err(WorkflowError::invalid_workflow(
+            &path_display,
+            "workflow declares both `steps:` and `stages:`; pick one (use `stages:` for pipeline-style workflows that chain other workflows, `steps:` otherwise)",
+        ));
+    }
+
     // Convert top-level steps with id-uniqueness and `ref:`-availability checks.
     //
     // `registry` tracks every step id seen so far at the top level so a
@@ -286,18 +335,30 @@ fn finalize_workflow(raw: RawWorkflow, path: &Path) -> Result<WorkflowDef> {
     // registry (a loop's inner steps are loop-scoped).
     let mut registry: BTreeMap<String, StepDef> = BTreeMap::new();
     let mut seen_ids: BTreeSet<String> = BTreeSet::new();
-    let mut steps: Vec<StepDef> = Vec::with_capacity(raw.steps.len());
-    for entry in raw.steps {
-        let RawStepOrRef::Step(raw_step) = entry else {
-            return Err(WorkflowError::invalid_workflow(
-                &path_display,
-                "top-level `ref:` is not allowed; `ref:` may only appear inside a `loop` step's `steps:` block",
-            ));
-        };
-        let step = convert_step(*raw_step, &path_display, &mut seen_ids, &registry)?;
-        registry.insert(step.id().to_owned(), step.clone());
-        steps.push(step);
-    }
+    let steps: Vec<StepDef> = if let Some(stages) = raw.stages {
+        let mut out: Vec<StepDef> = Vec::with_capacity(stages.len());
+        for stage in stages {
+            let step = convert_pipeline_stage(stage, &path_display, &mut seen_ids)?;
+            registry.insert(step.id().to_owned(), step.clone());
+            out.push(step);
+        }
+        out
+    } else {
+        let raw_steps = raw.steps.unwrap_or_default();
+        let mut out: Vec<StepDef> = Vec::with_capacity(raw_steps.len());
+        for entry in raw_steps {
+            let RawStepOrRef::Step(raw_step) = entry else {
+                return Err(WorkflowError::invalid_workflow(
+                    &path_display,
+                    "top-level `ref:` is not allowed; `ref:` may only appear inside a `loop` step's `steps:` block",
+                ));
+            };
+            let step = convert_step(*raw_step, &path_display, &mut seen_ids, &registry)?;
+            registry.insert(step.id().to_owned(), step.clone());
+            out.push(step);
+        }
+        out
+    };
 
     Ok(WorkflowDef {
         id: raw.id,
@@ -306,6 +367,75 @@ fn finalize_workflow(raw: RawWorkflow, path: &Path) -> Result<WorkflowDef> {
         inputs,
         steps,
         outputs: raw.outputs,
+    })
+}
+
+/// Convert one `stages:` entry into a [`StepDef::Workflow`].
+///
+/// We do basic id validation (matching the parser's general
+/// `^[a-z][a-z0-9_]*$` rule) and a redundant `type:` check; everything
+/// else is delegated to the engine at run time (workflow id resolution
+/// against the index, input templating, loop iteration).
+fn convert_pipeline_stage(
+    raw: RawPipelineStage,
+    path_display: &str,
+    seen_ids: &mut BTreeSet<String>,
+) -> Result<StepDef> {
+    if raw.id.is_empty() {
+        return Err(WorkflowError::invalid_workflow(
+            path_display,
+            "stage ids must not be empty",
+        ));
+    }
+    if !is_valid_id(&raw.id) {
+        return Err(WorkflowError::invalid_workflow(
+            path_display,
+            format!("stage id '{}' must match {ID_PATTERN}", raw.id),
+        ));
+    }
+    if !seen_ids.insert(raw.id.clone()) {
+        return Err(WorkflowError::invalid_workflow(
+            path_display,
+            format!("duplicate stage id '{}'", raw.id),
+        ));
+    }
+    if let Some(t) = raw.stage_type.as_deref() {
+        if t != "workflow" {
+            return Err(WorkflowError::invalid_workflow(
+                path_display,
+                format!(
+                    "stage '{}' has unsupported type '{t}' (only 'workflow' is allowed in `stages:`)",
+                    raw.id
+                ),
+            ));
+        }
+    }
+    if raw.workflow.is_empty() {
+        return Err(WorkflowError::invalid_workflow(
+            path_display,
+            format!("stage '{}' is missing required field 'workflow'", raw.id),
+        ));
+    }
+    let loop_spec = raw.loop_spec.map(|raw| crate::def::LoopSpec {
+        max_iterations: raw.max_iterations,
+        until: raw.until,
+    });
+    if let Some(ls) = &loop_spec {
+        if ls.max_iterations == 0 {
+            return Err(WorkflowError::invalid_workflow(
+                path_display,
+                format!(
+                    "stage '{}' has loop.max_iterations == 0 (must be >= 1)",
+                    raw.id
+                ),
+            ));
+        }
+    }
+    Ok(StepDef::Workflow {
+        id: raw.id,
+        workflow_id: raw.workflow,
+        inputs: raw.inputs,
+        loop_spec,
     })
 }
 

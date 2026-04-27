@@ -31,15 +31,20 @@ pub mod expr;
 pub mod parse;
 pub mod progress;
 pub(crate) mod steps;
+pub mod tools;
 
 pub use config::WorkflowConfig;
 pub use def::{
-    FailurePolicy, InputDef, StepDef, StepResult, WorkflowDef, WorkflowMeta, WorkflowMode,
-    WorkflowOutputs,
+    FailurePolicy, InputDef, LoopSpec, StepDef, StepResult, WorkflowDef, WorkflowMeta,
+    WorkflowMode, WorkflowOutputs,
 };
 pub use discovery::discover_workflows;
-pub use engine::WorkflowEngine;
+pub use engine::{WorkflowEngine, WorkflowIndex};
 pub use error::{Result, WorkflowError};
 pub use expr::{ExprContext, eval_bool, eval_string, eval_value};
 pub use parse::{parse_workflow_file, parse_workflow_str};
 pub use progress::{HumanResponder, HumanResponse, HumanResponseKind, WorkflowProgress};
+pub use tools::{
+    BackgroundRunsHandle, RunWorkflowTool, WorkflowRunId, WorkflowStatusTool,
+    register_workflow_tools,
+};

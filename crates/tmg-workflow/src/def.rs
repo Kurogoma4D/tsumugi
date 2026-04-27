@@ -177,6 +177,60 @@ pub enum StepDef {
         /// when `revise` is in `options`.
         revise_target: Option<String>,
     },
+
+    /// Run another discovered workflow as a step. Used by the
+    /// declarative-pipeline form (issue #41) where each `stages:` entry
+    /// references a workflow id and may template its inputs against
+    /// `${{ inputs.* }}` and `${{ stages.<id>.outputs.<key> }}`.
+    ///
+    /// ## Trade-off: separate variant vs. a `Pipeline` workflow type
+    ///
+    /// We add this as a new `StepDef` variant rather than introducing a
+    /// dedicated top-level `Pipeline` type because:
+    ///
+    /// 1. The engine driver loop and snapshot/revise machinery are
+    ///    already step-shaped — a pipeline just *is* a workflow whose
+    ///    leaves are workflow refs.
+    /// 2. It keeps `WorkflowDef` as the single canonical run target so
+    ///    `run_workflow` can dispatch pipelines and ordinary workflows
+    ///    uniformly without branching.
+    /// 3. `loop_spec` slots into the existing iteration engine; a
+    ///    separate type would have to re-implement looping.
+    ///
+    /// The cost is that `StepDef` grows another arm. The variant is
+    /// `#[non_exhaustive]` (the parent enum already is) so future
+    /// pipeline-only fields don't break callers.
+    Workflow {
+        /// Step identifier (the stage id in a pipeline).
+        id: String,
+        /// Target workflow id; resolved against the engine's
+        /// workflow index at dispatch time.
+        workflow_id: String,
+        /// Templated inputs (each value is a `${{ ... }}` template
+        /// string evaluated at dispatch time).
+        inputs: BTreeMap<String, String>,
+        /// Optional in-line loop wrapper. When present, the engine
+        /// iterates the workflow step up to `max_iterations` times,
+        /// evaluating `until` after each iteration and exiting early
+        /// when the expression becomes truthy.
+        loop_spec: Option<LoopSpec>,
+    },
+}
+
+/// Inline loop specification for a [`StepDef::Workflow`] step.
+///
+/// Mirrors the shape of a [`StepDef::Loop`] body, but applies to a
+/// single workflow invocation rather than an arbitrary inner step
+/// list. We keep the two forms distinct so the pipeline grammar
+/// (`stages: [{ workflow:..., loop:{ ... } }]`) reads naturally without
+/// nesting an extra `loop` step type around every workflow step.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoopSpec {
+    /// Maximum iterations.
+    pub max_iterations: u32,
+    /// `${{ ... }}` boolean expression evaluated *after* each
+    /// iteration. Iteration stops on truthy.
+    pub until: String,
 }
 
 /// Failure handling policy for a [`StepDef::Group`].
@@ -205,7 +259,8 @@ impl StepDef {
             | Self::Branch { id, .. }
             | Self::Parallel { id, .. }
             | Self::Group { id, .. }
-            | Self::Human { id, .. } => id,
+            | Self::Human { id, .. }
+            | Self::Workflow { id, .. } => id,
         }
     }
 
@@ -221,6 +276,7 @@ impl StepDef {
             Self::Parallel { .. } => "parallel",
             Self::Group { .. } => "group",
             Self::Human { .. } => "human",
+            Self::Workflow { .. } => "workflow",
         }
     }
 
@@ -229,17 +285,20 @@ impl StepDef {
     pub fn when(&self) -> Option<&str> {
         match self {
             Self::Agent { when, .. } | Self::Shell { when, .. } => when.as_deref(),
-            // write_file / control-flow steps do not currently expose
-            // a `when` clause at the outer level — control flow steps
-            // express conditional execution via their own grammar
-            // (`until`, `conditions`, etc.), and `write_file` is
-            // intentionally always-on per SPEC §8.4.
+            // write_file / control-flow / workflow steps do not
+            // currently expose a `when` clause at the outer level —
+            // control flow steps express conditional execution via
+            // their own grammar (`until`, `conditions`, etc.),
+            // `write_file` is intentionally always-on per SPEC §8.4,
+            // and pipeline `workflow` steps wrap their conditional
+            // logic via `loop_spec` or upstream `branch` stages.
             Self::WriteFile { .. }
             | Self::Loop { .. }
             | Self::Branch { .. }
             | Self::Parallel { .. }
             | Self::Group { .. }
-            | Self::Human { .. } => None,
+            | Self::Human { .. }
+            | Self::Workflow { .. } => None,
         }
     }
 
@@ -258,7 +317,8 @@ impl StepDef {
             | Self::Branch { id, .. }
             | Self::Parallel { id, .. }
             | Self::Group { id, .. }
-            | Self::Human { id, .. } => {
+            | Self::Human { id, .. }
+            | Self::Workflow { id, .. } => {
                 *id = f(id);
             }
         }
@@ -287,7 +347,8 @@ impl StepDef {
             Self::Agent { .. }
             | Self::Shell { .. }
             | Self::WriteFile { .. }
-            | Self::Human { .. } => {}
+            | Self::Human { .. }
+            | Self::Workflow { .. } => {}
         }
     }
 }

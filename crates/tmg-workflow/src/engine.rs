@@ -40,11 +40,11 @@
 //! the engine fires when any child fails so siblings observe the
 //! cancellation deterministically.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use serde_json::Value;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use tmg_agents::SubagentManager;
@@ -58,6 +58,15 @@ use crate::error::{Result, WorkflowError};
 use crate::expr;
 use crate::progress::WorkflowProgress;
 use crate::steps;
+
+/// Shared index of discovered workflows, keyed by id.
+///
+/// Owned by the [`WorkflowEngine`] and shared with the workflow tools
+/// (`run_workflow`, `workflow_status`). The CLI populates the map once
+/// after discovery; runtime additions are not required for the
+/// pipeline form but the `RwLock` leaves the door open without a
+/// breaking API change.
+pub type WorkflowIndex = Arc<RwLock<HashMap<String, WorkflowDef>>>;
 
 /// Shared, cheaply-cloned engine resources passed down through every
 /// recursive dispatch.
@@ -89,6 +98,19 @@ pub(crate) struct EngineCtx {
     /// for a UI response that never comes). Reserved for broader
     /// graceful-shutdown plumbing in #42.
     pub(crate) cancel: CancellationToken,
+    /// Shared workflow index (issue #41). The pipeline `workflow:`
+    /// step looks up its target workflow here; `None` for engines that
+    /// were built before workflow discovery (in which case any
+    /// `workflow:` step fails with a clear error).
+    pub(crate) workflow_index: Option<WorkflowIndex>,
+    /// Per-stage outputs collected during a pipeline run. Populated
+    /// only when the outer workflow uses `stages:`. Each completed
+    /// `Workflow` step adds an entry keyed by its stage id.
+    pub(crate) stages: Arc<RwLock<BTreeMap<String, WorkflowOutputs>>>,
+    /// Recursion depth for `Workflow` step dispatch. Bumped on every
+    /// nested `WorkflowEngine::run` call to prevent runaway recursion
+    /// when a pipeline misconfigures stage references.
+    pub(crate) workflow_depth: u32,
 }
 
 /// Workflow executor.
@@ -104,16 +126,22 @@ pub struct WorkflowEngine {
     )]
     llm_pool: Arc<LlmPool>,
     sandbox: Arc<SandboxContext>,
-    /// Tool registry. Reserved: built-in tool calls *from the engine*
-    /// (e.g. `run_workflow`) will land in #41.
+    /// Tool registry. Reserved for built-in tool calls *from the engine*
+    /// (currently unused; the `run_workflow` tool sits at the LLM
+    /// surface, not inside the engine).
     #[expect(
         dead_code,
-        reason = "kept on the struct so the engine API matches SPEC §8.10 and so the run_workflow tool (#41) can hook in without an API break"
+        reason = "kept on the struct so the engine API matches SPEC §8.10 and so future built-in tool dispatches from inside the engine remain a non-breaking change"
     )]
     tool_registry: Arc<ToolRegistry>,
     subagent_manager: Arc<Mutex<SubagentManager>>,
     config: WorkflowConfig,
     config_json: Value,
+    /// Optional workflow index — populated by the CLI after
+    /// discovery. The pipeline `workflow:` step reads from here to
+    /// resolve its target. Engines built without an index reject any
+    /// `workflow:` step with a clear error.
+    workflow_index: Option<WorkflowIndex>,
 }
 
 /// Outcome of executing a single step (leaf or control-flow).
@@ -128,6 +156,141 @@ pub(crate) enum StepOutcome {
     Completed,
     /// Step is requesting a workflow-wide rewind to `target`.
     Revise { target: String },
+}
+
+/// Recursion depth ceiling for nested `Workflow` step dispatch.
+///
+/// Pipelines that reference each other in a cycle would loop forever
+/// without this guard. The bound is intentionally loose (32) — real
+/// pipelines compose at most a handful of layers in practice; anything
+/// deeper than this is almost certainly a misconfiguration.
+pub(crate) const MAX_WORKFLOW_DEPTH: u32 = 32;
+
+/// Run a workflow as a *nested* invocation from inside a `Workflow`
+/// step. Returns the final [`WorkflowOutputs`].
+///
+/// This re-implements the `WorkflowEngine::run` body inline (modulo
+/// argument plumbing) so the nested call can:
+///
+/// - Inherit the *parent's* progress channel — the LLM and TUI see one
+///   continuous event stream regardless of pipeline depth.
+/// - Inherit the parent's cancellation token (cancelling the outer
+///   workflow cancels every nested one).
+/// - Bump `workflow_depth` so the recursion guard fires.
+///
+/// The nested call still gets its own `step_results` and `snapshots`
+/// maps — stage isolation is the whole point of the pipeline form.
+pub(crate) async fn run_nested_workflow(
+    parent_ctx: &EngineCtx,
+    workflow: &WorkflowDef,
+    inputs: BTreeMap<String, Value>,
+) -> Result<WorkflowOutputs> {
+    if parent_ctx.workflow_depth >= MAX_WORKFLOW_DEPTH {
+        return Err(WorkflowError::StepFailed {
+            step_id: workflow.id.clone(),
+            message: format!(
+                "workflow recursion too deep (>{MAX_WORKFLOW_DEPTH} nested calls); check for cyclic pipeline references"
+            ),
+        });
+    }
+
+    let resolved_inputs = resolve_inputs(&workflow.inputs, inputs)?;
+    let inputs_value = Value::Object(resolved_inputs);
+
+    let nested_ctx = EngineCtx {
+        sandbox: Arc::clone(&parent_ctx.sandbox),
+        subagent_manager: Arc::clone(&parent_ctx.subagent_manager),
+        config: parent_ctx.config.clone(),
+        config_json: parent_ctx.config_json.clone(),
+        env: Arc::clone(&parent_ctx.env),
+        inputs: Arc::new(inputs_value),
+        progress_tx: parent_ctx.progress_tx.clone(),
+        agent_semaphore: Arc::clone(&parent_ctx.agent_semaphore),
+        cancel: parent_ctx.cancel.clone(),
+        workflow_index: parent_ctx.workflow_index.clone(),
+        // Each nested run gets its own stages map. Pipeline outputs
+        // visibility flows top-down via the parent's stages map (the
+        // outer workflow renders its outputs after inner pipelines
+        // complete); a nested run does not see its parent's stages
+        // because the parent stages would change semantics
+        // mid-iteration in the pipeline form. If we ever need
+        // cross-level stage visibility we'll add it explicitly with a
+        // borrow rather than a clone.
+        stages: Arc::new(RwLock::new(BTreeMap::new())),
+        workflow_depth: parent_ctx.workflow_depth + 1,
+    };
+
+    let mut step_results: BTreeMap<String, StepResult> = BTreeMap::new();
+    let mut snapshots: BTreeMap<String, BTreeMap<String, StepResult>> = BTreeMap::new();
+    let total_steps = workflow.steps.len();
+    let mut idx: usize = 0;
+    let mut rewind_budget: u32 = 64;
+    while idx < total_steps {
+        let step = &workflow.steps[idx];
+        let step_id = step.id().to_owned();
+        snapshots.insert(step_id.clone(), step_results.clone());
+        let outcome = dispatch_step(&nested_ctx, step, &mut step_results).await?;
+        match outcome {
+            StepOutcome::Completed => idx += 1,
+            StepOutcome::Revise { target } => {
+                if rewind_budget == 0 {
+                    return Err(WorkflowError::StepFailed {
+                        step_id,
+                        message: "revise rewind budget exhausted (>64 rewinds in one run)"
+                            .to_owned(),
+                    });
+                }
+                rewind_budget -= 1;
+                let Some(target_idx) = workflow.steps.iter().position(|s| s.id() == target) else {
+                    return Err(WorkflowError::StepFailed {
+                        step_id,
+                        message: format!("revise target '{target}' is not a top-level step"),
+                    });
+                };
+                let Some(snap) = snapshots.get(&target).cloned() else {
+                    return Err(WorkflowError::StepFailed {
+                        step_id,
+                        message: format!("no snapshot recorded for revise target '{target}'"),
+                    });
+                };
+                step_results = snap;
+                let stale: Vec<String> = workflow
+                    .steps
+                    .iter()
+                    .skip(target_idx)
+                    .map(|s| s.id().to_owned())
+                    .collect();
+                for sid in stale {
+                    snapshots.remove(&sid);
+                }
+                idx = target_idx;
+            }
+        }
+    }
+
+    let stages_snapshot = nested_ctx.stages.read().await.clone();
+    let mut output_values: BTreeMap<String, String> = BTreeMap::new();
+    for (name, template) in &workflow.outputs {
+        let inner_ctx = expr::ExprContext::new(
+            &nested_ctx.inputs,
+            &step_results,
+            &nested_ctx.config_json,
+            &nested_ctx.env,
+        )
+        .with_stages(&stages_snapshot);
+        let rendered = expr::eval_string(template, &inner_ctx)?;
+        output_values.insert(name.clone(), rendered);
+    }
+    let outputs = WorkflowOutputs {
+        values: output_values,
+    };
+    let _ = nested_ctx
+        .progress_tx
+        .send(WorkflowProgress::WorkflowCompleted {
+            outputs: outputs.clone(),
+        })
+        .await;
+    Ok(outputs)
 }
 
 impl WorkflowEngine {
@@ -153,7 +316,25 @@ impl WorkflowEngine {
             subagent_manager,
             config,
             config_json,
+            workflow_index: None,
         }
+    }
+
+    /// Attach a [`WorkflowIndex`] so pipeline `workflow:` steps can
+    /// resolve their targets. Returns `self` for builder-style chaining
+    /// at construction time.
+    #[must_use]
+    pub fn with_workflow_index(mut self, index: WorkflowIndex) -> Self {
+        self.workflow_index = Some(index);
+        self
+    }
+
+    /// Return a clone of the workflow index handle, if any. Used by
+    /// the workflow tools (`run_workflow`) to share the same map the
+    /// engine uses internally.
+    #[must_use]
+    pub fn workflow_index_handle(&self) -> Option<WorkflowIndex> {
+        self.workflow_index.clone()
     }
 
     /// Run the given workflow with the given input map.
@@ -174,6 +355,28 @@ impl WorkflowEngine {
         workflow: &WorkflowDef,
         inputs: BTreeMap<String, Value>,
         progress_tx: mpsc::Sender<WorkflowProgress>,
+    ) -> Result<WorkflowOutputs> {
+        // No external cancel token supplied: each run gets its own
+        // private token. Firing it from outside is impossible by
+        // construction.
+        self.run_with_cancel(workflow, inputs, progress_tx, CancellationToken::new())
+            .await
+    }
+
+    /// Like [`Self::run`] but accepts an externally-owned
+    /// [`CancellationToken`] so callers (e.g. the `run_workflow`
+    /// background spawn) can request prompt termination.
+    ///
+    /// The supplied token is *cloned* into the engine context: firing
+    /// it propagates to every step handler that observes
+    /// `EngineCtx::cancel`. Currently that is the `human` step and
+    /// any `parallel` siblings (see `EngineCtx::cancel` docs).
+    pub async fn run_with_cancel(
+        &self,
+        workflow: &WorkflowDef,
+        inputs: BTreeMap<String, Value>,
+        progress_tx: mpsc::Sender<WorkflowProgress>,
+        cancel: CancellationToken,
     ) -> Result<WorkflowOutputs> {
         // Resolve inputs (apply defaults / required check).
         let resolved_inputs = resolve_inputs(&workflow.inputs, inputs)?;
@@ -204,7 +407,10 @@ impl WorkflowEngine {
             inputs: Arc::new(inputs_value),
             progress_tx,
             agent_semaphore,
-            cancel: CancellationToken::new(),
+            cancel,
+            workflow_index: self.workflow_index.clone(),
+            stages: Arc::new(RwLock::new(BTreeMap::new())),
+            workflow_depth: 0,
         };
 
         let mut step_results: BTreeMap<String, StepResult> = BTreeMap::new();
@@ -277,11 +483,15 @@ impl WorkflowEngine {
             }
         }
 
-        // Render outputs.
+        // Render outputs. Pipeline workflows (those that completed
+        // `Workflow` steps) need the `stages` scope visible here so
+        // `outputs:` templates can pick stage outputs back out.
+        let stages_snapshot = ctx.stages.read().await.clone();
         let mut output_values: BTreeMap<String, String> = BTreeMap::new();
         for (name, template) in &workflow.outputs {
             let inner_ctx =
-                expr::ExprContext::new(&ctx.inputs, &step_results, &ctx.config_json, &ctx.env);
+                expr::ExprContext::new(&ctx.inputs, &step_results, &ctx.config_json, &ctx.env)
+                    .with_stages(&stages_snapshot);
             let rendered = expr::eval_string(template, &inner_ctx)?;
             output_values.insert(name.clone(), rendered);
         }
@@ -328,8 +538,10 @@ async fn dispatch_step_inner(
 
     // Evaluate `when` clause for leaf steps that support it.
     if let Some(expr_src) = step.when() {
+        let stages_snapshot = ctx.stages.read().await.clone();
         let eval_ctx =
-            expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env);
+            expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env)
+                .with_stages(&stages_snapshot);
         let cond = expr::eval_bool(expr_src, &eval_ctx).map_err(|e| WorkflowError::StepFailed {
             step_id: step_id.clone(),
             message: format!("when-expression error: {e}"),
@@ -373,8 +585,10 @@ async fn dispatch_step_inner(
                     step_id: step_id.clone(),
                     message: "agent semaphore was closed".to_owned(),
                 })?;
+            let stages_snapshot = ctx.stages.read().await.clone();
             let eval_ctx =
-                expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env);
+                expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env)
+                    .with_stages(&stages_snapshot);
             let result = steps::agent::execute(steps::agent::AgentStepArgs {
                 subagent_manager: &ctx.subagent_manager,
                 sandbox: &ctx.sandbox,
@@ -395,8 +609,10 @@ async fn dispatch_step_inner(
             timeout,
             when: _,
         } => {
+            let stages_snapshot = ctx.stages.read().await.clone();
             let eval_ctx =
-                expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env);
+                expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env)
+                    .with_stages(&stages_snapshot);
             steps::shell::execute(
                 &ctx.sandbox,
                 ctx.config.default_shell_timeout,
@@ -411,8 +627,10 @@ async fn dispatch_step_inner(
             path,
             content,
         } => {
+            let stages_snapshot = ctx.stages.read().await.clone();
             let eval_ctx =
-                expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env);
+                expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env)
+                    .with_stages(&stages_snapshot);
             steps::write_file::execute(&ctx.sandbox, path, content, &eval_ctx).await
         }
         StepDef::Loop { .. } => {
@@ -442,6 +660,12 @@ async fn dispatch_step_inner(
         StepDef::Human { .. } => {
             return retag_control_flow_error(
                 steps::human::execute(ctx, step, step_results).await,
+                &step_id,
+            );
+        }
+        StepDef::Workflow { .. } => {
+            return retag_control_flow_error(
+                steps::workflow::execute(ctx, step, step_results).await,
                 &step_id,
             );
         }

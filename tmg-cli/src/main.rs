@@ -128,6 +128,7 @@ fn main() -> anyhow::Result<()> {
             cli.event_log,
             &config.harness,
             &config.sandbox,
+            &config.workflow,
         )?;
     }
 
@@ -231,6 +232,10 @@ fn run_prompt(
     clippy::too_many_lines,
     reason = "linear startup wiring (config -> store -> manager -> registry -> agent loop); splitting obscures the single-shot launch sequence"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "startup helper takes the merged config sections as discrete refs; bundling into a struct would need the same fields"
+)]
 fn run_tui(
     endpoint: &str,
     model: &str,
@@ -239,6 +244,7 @@ fn run_tui(
     event_log: Option<PathBuf>,
     harness_config: &HarnessConfig,
     sandbox_config: &SandboxConfigSection,
+    workflow_config: &tmg_workflow::WorkflowConfig,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -383,6 +389,87 @@ fn run_tui(
         ));
         register_run_tools(&mut registry, Arc::clone(&runner)).await;
 
+        // Workflow discovery + `run_workflow` / `workflow_status` tool
+        // registration (issue #41). When at least one workflow is
+        // discovered we build a [`WorkflowEngine`], install its
+        // [`tmg_workflow::WorkflowIndex`], and register both tools.
+        // When no workflows are present we skip registration entirely
+        // so the LLM tool catalogue stays minimal.
+        let workflow_metas = match tmg_workflow::discover_workflows(&project_root, workflow_config)
+            .await
+        {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(error = %e, "workflow discovery failed; tools not registered");
+                Vec::new()
+            }
+        };
+        // Background-runs handle. `Some` only if we actually
+        // registered the workflow tools below; the TUI shutdown path
+        // fires `cancel_all_background_runs` on it so in-flight
+        // workflows terminate promptly instead of being aborted at the
+        // runtime boundary.
+        let mut background_runs: Option<tmg_workflow::BackgroundRunsHandle> = None;
+        if !workflow_metas.is_empty() {
+            // Eagerly parse each discovered workflow into a
+            // canonical [`tmg_workflow::WorkflowDef`]. Parse errors
+            // are non-fatal: a single bad workflow file should not
+            // prevent the rest from loading. We log per-file failures
+            // and skip them.
+            let mut index_map: std::collections::HashMap<String, tmg_workflow::WorkflowDef> =
+                std::collections::HashMap::new();
+            for meta in &workflow_metas {
+                match tmg_workflow::parse_workflow_file(&meta.source_path).await {
+                    Ok(def) => {
+                        index_map.insert(def.id.clone(), def);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %meta.source_path.display(),
+                            error = %e,
+                            "skipping workflow that failed to parse",
+                        );
+                    }
+                }
+            }
+            if !index_map.is_empty() {
+                let workflow_index = Arc::new(tokio::sync::RwLock::new(index_map));
+                let llm_pool_for_engine = Arc::new(tmg_llm::LlmPool::new(
+                    &tmg_llm::PoolConfig::single(endpoint),
+                    model,
+                )?);
+                // The engine's sandbox uses the same `WorkspaceWrite`
+                // policy as the rest of the run for now; future work
+                // (#42) will wire per-workflow sandbox overrides.
+                let workflow_sandbox = Arc::new(tmg_sandbox::SandboxContext::new(
+                    tmg_sandbox::SandboxConfig::new(&canonical_cwd)
+                        .with_mode(tmg_sandbox::SandboxMode::WorkspaceWrite),
+                ));
+                let workflow_tool_registry = Arc::new(tmg_tools::ToolRegistry::new());
+                let engine = Arc::new(
+                    tmg_workflow::WorkflowEngine::new(
+                        llm_pool_for_engine,
+                        workflow_sandbox,
+                        workflow_tool_registry,
+                        Arc::clone(&subagent_manager),
+                        workflow_config.clone(),
+                        serde_json::Value::Null,
+                    )
+                    .with_workflow_index(Arc::clone(&workflow_index)),
+                );
+                let bg_runs = tmg_workflow::tools::new_background_runs();
+                tmg_workflow::register_workflow_tools(&mut registry, &engine, &bg_runs);
+                // Stash a clone for the TUI shutdown path so we can
+                // fire the cancellation tokens on every still-running
+                // background workflow before the runtime tears down.
+                background_runs = Some(bg_runs);
+                tracing::info!(
+                    count = workflow_metas.len(),
+                    "registered run_workflow and workflow_status tools",
+                );
+            }
+        }
+
         let max_context_tokens = context_config.max_context_tokens;
         let mut agent = tmg_core::AgentLoop::with_context_config(
             client,
@@ -429,6 +516,20 @@ fn run_tui(
             Some(Arc::clone(&runner)),
         )
         .await;
+
+        // Fire cancellation tokens on every still-running background
+        // workflow so they observe the shutdown signal before the
+        // runtime drops them. This is best-effort: a workflow whose
+        // current await point does not consult `EngineCtx::cancel`
+        // will still finish on its own, but at least the spawn
+        // closure's `select!` loop sees the token in the next branch
+        // it visits.
+        if let Some(handle) = background_runs.as_ref() {
+            let n = tmg_workflow::tools::cancel_all_background_runs(handle).await;
+            if n > 0 {
+                tracing::info!(count = n, "fired cancellation on background workflow runs");
+            }
+        }
 
         // Close the harness session before propagating the TUI result so
         // that `last_session_at` / `session_count` are persisted even on

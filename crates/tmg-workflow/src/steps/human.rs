@@ -58,7 +58,9 @@ pub(crate) async fn execute(
 
     // Render the prompt and `show:` payload eagerly so the receiver
     // sees the substituted values, not the raw template.
-    let inner_ctx = expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env);
+    let stages_snapshot = ctx.stages.read().await.clone();
+    let inner_ctx = expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env)
+        .with_stages(&stages_snapshot);
     let rendered_message = expr::eval_string(message, &inner_ctx)?;
     let rendered_show = match show {
         Some(template) => Some(expr::eval_string(template, &inner_ctx)?),

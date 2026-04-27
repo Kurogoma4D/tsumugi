@@ -38,9 +38,11 @@ pub(crate) async fn execute(
 
     let mut chosen_arm: Option<usize> = None;
 
+    let stages_snapshot = ctx.stages.read().await.clone();
     for (idx, (when_expr, _)) in conditions.iter().enumerate() {
         let inner_ctx =
-            expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env);
+            expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env)
+                .with_stages(&stages_snapshot);
         let cond =
             expr::eval_bool(when_expr, &inner_ctx).map_err(|e| WorkflowError::StepFailed {
                 step_id: id.clone(),
