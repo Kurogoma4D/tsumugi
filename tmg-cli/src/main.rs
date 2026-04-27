@@ -120,11 +120,19 @@ enum RunCommand {
         run_id: Option<String>,
     },
     /// Mark a run as paused without launching the TUI.
+    ///
+    /// Best-effort outside an active TUI: when a tmg TUI is currently
+    /// attached to the run (`.tsumugi/runs/<id>/.tui-pid` sentinel),
+    /// the command refuses with an error. Use the in-TUI `/run pause`
+    /// slash command (issue #46) to pause an attached run.
     Pause {
         /// Optional run id; defaults to current.
         run_id: Option<String>,
     },
     /// Mark a run as failed (`reason = "user aborted"`).
+    ///
+    /// Best-effort outside an active TUI: refuses while a tmg TUI is
+    /// attached to the run, for the same reason as `pause`.
     Abort {
         /// Optional run id; defaults to current.
         run_id: Option<String>,
@@ -200,6 +208,7 @@ fn main() -> anyhow::Result<()> {
                     &config.harness,
                     &config.sandbox,
                     &config.workflow,
+                    None,
                 )
             }
         }
@@ -223,10 +232,6 @@ fn resolve_runs_dir(harness_config: &HarnessConfig) -> anyhow::Result<(PathBuf, 
 /// Dispatch one `tmg run <op>` invocation. The TUI-bound operations
 /// (`Resume`, `NewSession`) delegate back into [`run_tui`] (or print
 /// an explanatory error). The rest mutate `run.toml` directly.
-#[expect(
-    clippy::print_stderr,
-    reason = "tmg run new-session must explain itself when invoked outside a TUI session"
-)]
 fn dispatch_run_command(op: RunCommand, config: &TsumugiConfig) -> anyhow::Result<()> {
     let (runs_dir, canonical_cwd) = resolve_runs_dir(&config.harness)?;
     let store = Arc::new(RunStore::new(runs_dir));
@@ -238,15 +243,25 @@ fn dispatch_run_command(op: RunCommand, config: &TsumugiConfig) -> anyhow::Resul
                 compression_threshold: config.llm.compression_threshold,
                 max_tool_result_tokens: config.llm.max_tool_result_tokens,
             };
+            // When the user supplied an explicit id, validate its
+            // shape at the boundary. We thread the validated id
+            // through to `run_tui` so the TUI loads exactly that run
+            // (bypassing `harness_init::resolve_startup_run`'s
+            // latest-resumable fallback). If no id was supplied, we
+            // try `current` as a hint and fall back to the resolver.
             let resolved = if let Some(id) = run_id {
-                Some(tmg_harness::RunId::from_string(id))
+                Some(
+                    tmg_harness::RunId::parse(id)
+                        .context("parsing explicit run id for `tmg run resume`")?,
+                )
             } else {
-                // Fall back through `current` → `latest_resumable`.
+                // Best-effort: prefer `current` so subsequent
+                // argument-less commands inherit the same target.
                 store.current().context("reading current run pointer")?
             };
-            // If we resolved an explicit id, point `current` at it
-            // before launching so subsequent argument-less commands
-            // inherit the same target.
+            // If we resolved a run, point `current` at it before
+            // launching so the TUI shutdown / re-open paths agree on
+            // the active id.
             if let Some(ref id) = resolved
                 && let Err(e) = store.set_current(id)
             {
@@ -261,6 +276,7 @@ fn dispatch_run_command(op: RunCommand, config: &TsumugiConfig) -> anyhow::Resul
                 &config.harness,
                 &config.sandbox,
                 &config.workflow,
+                resolved.as_ref(),
             )
         }
         RunCommand::List => run_commands::cmd_list(&store),
@@ -290,15 +306,16 @@ fn dispatch_run_command(op: RunCommand, config: &TsumugiConfig) -> anyhow::Resul
         }
         RunCommand::NewSession => {
             // `new-session` rotates the *active* TUI session. Outside
-            // a TUI we have no live runner, so we surface an explanatory
-            // error rather than silently writing the on-disk session.
-            // The TUI slash-command equivalent (`/run new-session`) is
-            // tracked in #46.
-            eprintln!(
-                "tmg run new-session must be invoked from inside an active TUI session.\n\
+            // a TUI we have no live runner, so we surface an
+            // explanatory error rather than silently writing the
+            // on-disk session. The TUI slash-command equivalent
+            // (`/run new-session`) is tracked in #46. The single
+            // `bail!` carries the entire message so anyhow's error
+            // chain is the sole source of truth.
+            anyhow::bail!(
+                "tmg run new-session must be invoked from inside an active TUI session. \
                  Use the `/run new-session` slash command from within `tmg` (see #46).",
             );
-            anyhow::bail!("new-session requires an active TUI session");
         }
     }
 }
@@ -413,6 +430,7 @@ fn run_tui(
     harness_config: &HarnessConfig,
     sandbox_config: &SandboxConfigSection,
     workflow_config: &tmg_workflow::WorkflowConfig,
+    explicit_run_id: Option<&tmg_harness::RunId>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -448,8 +466,35 @@ fn run_tui(
             canonical_cwd.join(&harness_config.runs_dir)
         };
         let store = Arc::new(RunStore::new(runs_dir));
-        let run = harness_init::resolve_startup_run(harness_config, &store, canonical_cwd.clone())
-            .context("resolving startup run")?;
+        // `select_startup_run` honours an explicit id from
+        // `tmg run resume <id>` before falling back to the
+        // auto-resume / create-fresh policy. The explicit-id path
+        // bypasses `latest_resumable` so the user genuinely resumes
+        // the run they typed, not "whatever was newest".
+        let run = harness_init::select_startup_run(
+            harness_config,
+            &store,
+            canonical_cwd.clone(),
+            explicit_run_id,
+        )
+        .context("resolving startup run")?;
+        // Whichever path we took, lock the resolved id into `current`
+        // so out-of-TUI CLI mutators agree with the live runner.
+        if let Err(e) = store.set_current(&run.id) {
+            tracing::warn!(error = %e, "failed to update current run pointer at startup");
+        }
+        // Stamp the TUI sentinel so `tmg run pause` / `tmg run abort`
+        // refuse to mutate `run.toml` while we hold the live runner.
+        // Failures here are best-effort (a permission glitch on the
+        // run dir should not abort startup); the worst case is the
+        // CLI mutators not refusing.
+        let sentinel_dir = store.run_dir(&run.id);
+        if let Err(e) = tmg_harness::tui_sentinel::write(&sentinel_dir) {
+            tracing::warn!(error = %e, "failed to write TUI sentinel; CLI mutators may race the live runner");
+        }
+        // Guard ensures the sentinel is removed on every exit path
+        // (including panic propagation through tokio::block_on).
+        let _sentinel_guard = TuiSentinelGuard::new(sentinel_dir);
         let mut runner = RunRunner::new(run, Arc::clone(&store));
         runner.set_bootstrap_max_tokens(harness_config.bootstrap_max_tokens);
         runner.set_default_session_timeout(harness_config.default_session_timeout);
@@ -724,6 +769,32 @@ fn run_tui(
         tui_result?;
         Ok::<(), anyhow::Error>(())
     })
+}
+
+/// RAII guard that clears the TUI-attached sentinel for a run on
+/// `Drop`.
+///
+/// Created right after the sentinel is written so every exit path
+/// from `run_tui` (clean return, error propagation, panic) removes
+/// the file. Without the guard, a panic during agent setup would
+/// leave a stale `.tui-pid` behind that would block CLI mutators
+/// until the recorded PID is reused or the file is manually removed.
+struct TuiSentinelGuard {
+    run_dir: PathBuf,
+}
+
+impl TuiSentinelGuard {
+    fn new(run_dir: PathBuf) -> Self {
+        Self { run_dir }
+    }
+}
+
+impl Drop for TuiSentinelGuard {
+    fn drop(&mut self) {
+        if let Err(e) = tmg_harness::tui_sentinel::clear(&self.run_dir) {
+            tracing::warn!(error = %e, "failed to clear TUI sentinel on shutdown");
+        }
+    }
 }
 
 /// Surface a non-fatal error from `RunRunner::end_session` to the

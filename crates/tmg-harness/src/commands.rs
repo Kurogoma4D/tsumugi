@@ -148,7 +148,21 @@ pub fn status(
 /// Flips `run.toml` status to [`RunStatus::Paused`]. The runner
 /// remains usable; a follow-up `tmg run resume` will pick it back up
 /// because [`RunStatus::Paused`] is treated as resumable.
+///
+/// **Refuses if a TUI is currently attached** to the same run (see
+/// [`crate::tui_sentinel`]): an in-memory runner inside the TUI would
+/// otherwise silently overwrite the `Paused` status on its next
+/// persist. Outside a TUI session the operation is best-effort — the
+/// CLI surfaces the in-TUI alternative in the returned error.
+///
+/// # Errors
+///
+/// - [`HarnessError::TuiAttached`] when a live TUI sentinel is
+///   detected for this run.
+/// - [`HarnessError::Io`] / [`HarnessError::Serialize`] when persisting
+///   `run.toml` fails.
 pub fn pause(runner: &mut RunRunner) -> Result<(), HarnessError> {
+    refuse_if_tui_attached(runner)?;
     runner.set_status(RunStatus::Paused)
 }
 
@@ -158,10 +172,36 @@ pub fn pause(runner: &mut RunRunner) -> Result<(), HarnessError> {
 /// message. The CLI's `tmg run abort` command uses
 /// `"user aborted"` as the reason; other call sites can pass a more
 /// specific string.
+///
+/// **Refuses if a TUI is currently attached** to the same run; see
+/// [`pause`] for the rationale and [`HarnessError::TuiAttached`] for
+/// the surfaced error.
+///
+/// # Errors
+///
+/// - [`HarnessError::TuiAttached`] when a live TUI sentinel is
+///   detected for this run.
+/// - [`HarnessError::Io`] / [`HarnessError::Serialize`] when persisting
+///   `run.toml` fails.
 pub fn abort(runner: &mut RunRunner, reason: impl Into<String>) -> Result<(), HarnessError> {
+    refuse_if_tui_attached(runner)?;
     runner.set_status(RunStatus::Failed {
         reason: reason.into(),
     })
+}
+
+/// Surface [`HarnessError::TuiAttached`] when the run's TUI sentinel
+/// reports a live process. Used by `pause` / `abort` to short-circuit
+/// before mutating `run.toml`.
+fn refuse_if_tui_attached(runner: &RunRunner) -> Result<(), HarnessError> {
+    let run_dir = runner.store().run_dir(runner.run_id());
+    if let Some(pid) = crate::tui_sentinel::read_live_pid(&run_dir)? {
+        return Err(HarnessError::TuiAttached {
+            run_id: runner.run_id().as_str().to_owned(),
+            pid,
+        });
+    }
+    Ok(())
 }
 
 /// Force the run to harnessed scope without going through the
@@ -175,11 +215,47 @@ pub fn abort(runner: &mut RunRunner, reason: impl Into<String>) -> Result<(), Ha
 /// re-installing a [`crate::tools::RunRunnerToolProvider`] so the
 /// LLM sees the harnessed-only tools.
 ///
-/// Idempotent: when the run is already harnessed, the call is a
-/// no-op (still re-saves `run.toml` for durability).
+/// **Pre-condition**: `features.json` must exist in the run's
+/// workspace. The doc invariant on
+/// [`crate::store::RunStore::upgrade_to_harnessed`] is that the
+/// initializer subagent has already populated the artifacts; this
+/// helper checks the file is on disk before flipping the on-disk
+/// scope so a typo'd `tmg run upgrade <id>` outside the TUI does not
+/// end up with a harnessed `run.toml` that points at non-existent
+/// artifacts.
+///
+/// **Idempotent**: when the run is already harnessed, the call
+/// returns `Ok(())` immediately without touching `run.toml` or the
+/// in-memory runner. This avoids re-stamping `upgraded_at` /
+/// `upgraded_from_session` / `upgrade_reason` every time the user
+/// re-runs `tmg run upgrade` against an already-harnessed run.
+///
+/// # Errors
+///
+/// - [`HarnessError::Precondition`] when `features.json` is missing
+///   from the run's workspace directory.
+/// - [`HarnessError::Io`] / [`HarnessError::Serialize`] for write
+///   failures on `run.toml`.
 pub fn upgrade(runner: &mut RunRunner) -> Result<(), HarnessError> {
+    if runner.is_harnessed() {
+        // True no-op: re-saving `run.toml` with the same scope would
+        // reset `upgraded_at` and the upgrade-reason metadata, which
+        // is misleading after a real prior promotion. Leave the
+        // record untouched.
+        return Ok(());
+    }
     let session_count = runner.run().session_count;
     let store = runner.store().clone();
+    let features_path = store.features_file(runner.run_id());
+    if !features_path.exists() {
+        return Err(HarnessError::Precondition {
+            message: format!(
+                "cannot upgrade: features.json not found at {}; \
+                 run the initializer first or upgrade from inside a TUI session",
+                features_path.display(),
+            ),
+        });
+    }
     let run = store.upgrade_to_harnessed(runner.run_id(), session_count, "manual /run upgrade")?;
     runner.replace_run(run);
     Ok(())
@@ -245,6 +321,17 @@ mod tests {
         (tmp, store, runner)
     }
 
+    /// Plant a minimal valid `features.json` so `upgrade` clears its
+    /// pre-condition check.
+    fn write_minimal_features(store: &RunStore, run_id: &crate::run::RunId) {
+        let path = store.features_file(run_id);
+        std::fs::write(
+            &path,
+            r#"{"features":[{"id":"f0","category":"test","description":"d","steps":[],"passes":false}]}"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    }
+
     #[test]
     fn pause_flips_status_to_paused() {
         let (_tmp, store, mut runner) = make_runner_ad_hoc();
@@ -266,10 +353,64 @@ mod tests {
         }
     }
 
+    /// `pause` refuses with [`HarnessError::TuiAttached`] when the
+    /// run's `.tui-pid` sentinel reports a live process. Use the
+    /// current process's PID so the liveness probe definitely
+    /// resolves to "alive".
+    #[test]
+    fn pause_refuses_when_tui_sentinel_is_live() {
+        let (_tmp, store, mut runner) = make_runner_ad_hoc();
+        let id = runner.run_id().clone();
+        let run_dir = store.run_dir(&id);
+        crate::tui_sentinel::write(&run_dir).unwrap_or_else(|e| panic!("{e}"));
+
+        match pause(&mut runner) {
+            Err(HarnessError::TuiAttached { run_id, pid }) => {
+                assert_eq!(run_id, id.as_str());
+                assert_eq!(pid, std::process::id());
+            }
+            other => panic!("expected TuiAttached, got {other:?}"),
+        }
+        // The on-disk status must NOT have been flipped to Paused.
+        let reloaded = store.load(&id).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(reloaded.status, RunStatus::Running);
+    }
+
+    /// Same guard for `abort`.
+    #[test]
+    fn abort_refuses_when_tui_sentinel_is_live() {
+        let (_tmp, store, mut runner) = make_runner_ad_hoc();
+        let id = runner.run_id().clone();
+        let run_dir = store.run_dir(&id);
+        crate::tui_sentinel::write(&run_dir).unwrap_or_else(|e| panic!("{e}"));
+
+        match abort(&mut runner, "user aborted") {
+            Err(HarnessError::TuiAttached { .. }) => {}
+            other => panic!("expected TuiAttached, got {other:?}"),
+        }
+        let reloaded = store.load(&id).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(reloaded.status, RunStatus::Running);
+    }
+
+    /// Once the sentinel is cleared, `pause` proceeds normally.
+    #[test]
+    fn pause_proceeds_after_tui_sentinel_cleared() {
+        let (_tmp, store, mut runner) = make_runner_ad_hoc();
+        let id = runner.run_id().clone();
+        let run_dir = store.run_dir(&id);
+        crate::tui_sentinel::write(&run_dir).unwrap_or_else(|e| panic!("{e}"));
+        crate::tui_sentinel::clear(&run_dir).unwrap_or_else(|e| panic!("{e}"));
+
+        pause(&mut runner).unwrap_or_else(|e| panic!("{e}"));
+        let reloaded = store.load(&id).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(reloaded.status, RunStatus::Paused);
+    }
+
     #[test]
     fn upgrade_flips_scope_to_harnessed() {
         let (_tmp, store, mut runner) = make_runner_ad_hoc();
         let id = runner.run_id().clone();
+        write_minimal_features(&store, &id);
         upgrade(&mut runner).unwrap_or_else(|e| panic!("{e}"));
         let reloaded = store.load(&id).unwrap_or_else(|e| panic!("{e}"));
         assert!(matches!(reloaded.scope, RunScope::Harnessed { .. }));
@@ -277,9 +418,55 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_without_features_file_returns_precondition_error() {
+        let (_tmp, _store, mut runner) = make_runner_ad_hoc();
+        let result = upgrade(&mut runner);
+        match result {
+            Err(HarnessError::Precondition { message }) => {
+                assert!(
+                    message.contains("features.json not found"),
+                    "expected precondition message about features.json, got {message:?}",
+                );
+            }
+            other => panic!("expected Precondition error, got {other:?}"),
+        }
+        assert!(
+            !runner.is_harnessed(),
+            "scope must remain ad-hoc when precondition fails",
+        );
+    }
+
+    #[test]
+    fn upgrade_already_harnessed_is_noop_and_preserves_metadata() {
+        let (_tmp, store, mut runner) = make_runner_ad_hoc();
+        let id = runner.run_id().clone();
+        write_minimal_features(&store, &id);
+
+        // First upgrade: stamps the upgrade metadata.
+        upgrade(&mut runner).unwrap_or_else(|e| panic!("{e}"));
+        let first = store.load(&id).unwrap_or_else(|e| panic!("{e}"));
+        let first_upgraded_at = match &first.scope {
+            RunScope::Harnessed { upgraded_at, .. } => *upgraded_at,
+            RunScope::AdHoc => panic!("expected harnessed after first upgrade"),
+        };
+        // Sleep so a subsequent re-stamp would observably differ.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // Second upgrade: must be a no-op. The on-disk record must
+        // not have its upgrade timestamp re-stamped.
+        upgrade(&mut runner).unwrap_or_else(|e| panic!("{e}"));
+        let second = store.load(&id).unwrap_or_else(|e| panic!("{e}"));
+        match &second.scope {
+            RunScope::Harnessed { upgraded_at, .. } => assert_eq!(*upgraded_at, first_upgraded_at),
+            RunScope::AdHoc => panic!("expected harnessed after second upgrade"),
+        }
+    }
+
+    #[test]
     fn downgrade_flips_scope_back_to_ad_hoc() {
         let (_tmp, store, mut runner) = make_runner_ad_hoc();
         let id = runner.run_id().clone();
+        write_minimal_features(&store, &id);
         upgrade(&mut runner).unwrap_or_else(|e| panic!("{e}"));
         assert!(runner.is_harnessed());
 
@@ -293,9 +480,11 @@ mod tests {
     fn downgrade_preserves_features_file_on_disk() {
         let (_tmp, store, mut runner) = make_runner_ad_hoc();
         let id = runner.run_id().clone();
+        write_minimal_features(&store, &id);
         upgrade(&mut runner).unwrap_or_else(|e| panic!("{e}"));
 
-        // Write a fake features.json so we can verify it is preserved.
+        // Overwrite the planted features.json with a richer payload so
+        // we can verify it's preserved across the downgrade.
         let features_path = store.features_file(&id);
         std::fs::write(
             &features_path,
@@ -342,8 +531,11 @@ mod tests {
     fn status_returns_feature_histogram_for_harnessed() {
         let (_tmp, store, mut runner) = make_runner_ad_hoc();
         let id = runner.run_id().clone();
+        write_minimal_features(&store, &id);
         upgrade(&mut runner).unwrap_or_else(|e| panic!("{e}"));
 
+        // Overwrite the planted features.json with the richer payload
+        // the histogram test wants to assert against.
         let features_path = store.features_file(&id);
         std::fs::write(
             &features_path,

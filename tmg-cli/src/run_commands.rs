@@ -28,22 +28,51 @@ use tmg_harness::{
 /// `run_id` argument.
 ///
 /// Resolution order:
-/// 1. CLI-supplied id (verbatim).
-/// 2. The `current` pointer in the runs-dir, when present.
+/// 1. CLI-supplied id (validated via [`RunId::parse`]).
+/// 2. The `current` pointer in the runs-dir, when present **and** its
+///    target run's stored `workspace_path` matches the canonical cwd.
+///    A mismatch falls through to the next step so a stale pointer
+///    from a different project does not silently route the command.
 /// 3. [`RunStore::latest_resumable`] for the supplied workspace, when
 ///    present.
 ///
-/// Returns an error when no run can be resolved.
+/// Returns an error when no run can be resolved or when the
+/// CLI-supplied id is malformed.
 pub(crate) fn resolve_run_id(
     store: &RunStore,
     explicit: Option<&str>,
     workspace_path: Option<&Path>,
 ) -> anyhow::Result<RunId> {
-    if let Some(id) = explicit {
-        return Ok(RunId::from_string(id.to_owned()));
+    if let Some(raw) = explicit {
+        return RunId::parse(raw.to_owned()).with_context(|| format!("invalid run id {raw:?}"));
     }
     if let Some(current) = store.current().context("reading current run pointer")? {
-        return Ok(current);
+        // Validate that the `current` pointer agrees with the cwd we
+        // were launched from. Without this, an out-of-date pointer
+        // (e.g. left over from a different project that shares the
+        // same `runs_dir`) would silently route mutations into an
+        // unrelated run. Mirror the safety net `latest_resumable`
+        // already provides.
+        let agrees = match (workspace_path, store.load(&current)) {
+            (Some(expected), Ok(loaded)) => loaded.workspace_path == expected,
+            // Without an expected workspace, accept the pointer as-is
+            // (caller did not opt in to the workspace check).
+            (None, Ok(_)) => true,
+            // Pointer is dangling (load failed). Fall through to the
+            // next step so we don't propagate a confusing error from
+            // a `current` pointer that should be self-healing.
+            (_, Err(e)) => {
+                tracing::debug!(
+                    run_id = current.as_str(),
+                    error = %e,
+                    "current pointer is dangling; falling back to latest_resumable",
+                );
+                false
+            }
+        };
+        if agrees {
+            return Ok(current);
+        }
     }
     if let Some(summary) = store
         .latest_resumable(workspace_path)
@@ -66,7 +95,7 @@ pub(crate) fn resolve_run_id(
     clippy::print_stdout,
     reason = "tmg run list prints to stdout by design"
 )]
-pub fn cmd_list(store: &RunStore) -> anyhow::Result<()> {
+pub(crate) fn cmd_list(store: &RunStore) -> anyhow::Result<()> {
     let summaries = harness_commands::list(store).context("listing runs")?;
     let now = Utc::now();
 
@@ -102,7 +131,7 @@ pub fn cmd_list(store: &RunStore) -> anyhow::Result<()> {
     clippy::print_stdout,
     reason = "tmg run status prints to stdout by design"
 )]
-pub fn cmd_status(store: &RunStore, run_id: &RunId) -> anyhow::Result<()> {
+pub(crate) fn cmd_status(store: &RunStore, run_id: &RunId) -> anyhow::Result<()> {
     let report: StatusReport =
         harness_commands::status(store, run_id, 20).context("building status report")?;
 
@@ -159,7 +188,7 @@ pub fn cmd_status(store: &RunStore, run_id: &RunId) -> anyhow::Result<()> {
     clippy::print_stdout,
     reason = "tmg run upgrade prints a one-line confirmation"
 )]
-pub fn cmd_upgrade(store: &Arc<RunStore>, run_id: &RunId) -> anyhow::Result<()> {
+pub(crate) fn cmd_upgrade(store: &Arc<RunStore>, run_id: &RunId) -> anyhow::Result<()> {
     let run = store.load(run_id).context("loading run")?;
     if matches!(run.scope, RunScope::Harnessed { .. }) {
         println!(
@@ -179,7 +208,7 @@ pub fn cmd_upgrade(store: &Arc<RunStore>, run_id: &RunId) -> anyhow::Result<()> 
     clippy::print_stdout,
     reason = "tmg run downgrade prints a one-line confirmation"
 )]
-pub fn cmd_downgrade(store: &Arc<RunStore>, run_id: &RunId) -> anyhow::Result<()> {
+pub(crate) fn cmd_downgrade(store: &Arc<RunStore>, run_id: &RunId) -> anyhow::Result<()> {
     let run = store.load(run_id).context("loading run")?;
     if matches!(run.scope, RunScope::AdHoc) {
         println!("Run {} is already ad-hoc; no action taken.", run.id.short());
@@ -196,7 +225,7 @@ pub fn cmd_downgrade(store: &Arc<RunStore>, run_id: &RunId) -> anyhow::Result<()
     clippy::print_stdout,
     reason = "tmg run pause prints a one-line confirmation"
 )]
-pub fn cmd_pause(store: &Arc<RunStore>, run_id: &RunId) -> anyhow::Result<()> {
+pub(crate) fn cmd_pause(store: &Arc<RunStore>, run_id: &RunId) -> anyhow::Result<()> {
     let run = store.load(run_id).context("loading run")?;
     let mut runner = RunRunner::new(run, Arc::clone(store));
     harness_commands::pause(&mut runner).context("pausing run")?;
@@ -209,7 +238,7 @@ pub fn cmd_pause(store: &Arc<RunStore>, run_id: &RunId) -> anyhow::Result<()> {
     clippy::print_stdout,
     reason = "tmg run abort prints a one-line confirmation"
 )]
-pub fn cmd_abort(store: &Arc<RunStore>, run_id: &RunId) -> anyhow::Result<()> {
+pub(crate) fn cmd_abort(store: &Arc<RunStore>, run_id: &RunId) -> anyhow::Result<()> {
     let run = store.load(run_id).context("loading run")?;
     let mut runner = RunRunner::new(run, Arc::clone(store));
     harness_commands::abort(&mut runner, "user aborted").context("aborting run")?;
@@ -222,7 +251,15 @@ pub fn cmd_abort(store: &Arc<RunStore>, run_id: &RunId) -> anyhow::Result<()> {
 /// The command does NOT apply any sandbox; this is an explicit
 /// operator action that should reach the workspace exactly as the
 /// user expects.
-pub fn cmd_shell(store: &RunStore, run_id: &RunId) -> anyhow::Result<()> {
+///
+/// **Exit code propagation**: the function exits the calling process
+/// with the shell's exit status (or `1` when the shell was killed by
+/// a signal and `code()` therefore returns `None`). Callers should
+/// treat the function as `-> !`-equivalent on success; we only
+/// return `Result` so failures *before* the shell starts (load /
+/// missing workspace / spawn) flow through `anyhow` to the
+/// top-level handler.
+pub(crate) fn cmd_shell(store: &RunStore, run_id: &RunId) -> anyhow::Result<()> {
     let run = store.load(run_id).context("loading run")?;
     let workspace = run.workspace_path.clone();
     if !workspace.exists() {
@@ -233,12 +270,11 @@ pub fn cmd_shell(store: &RunStore, run_id: &RunId) -> anyhow::Result<()> {
         .current_dir(&workspace)
         .status()
         .with_context(|| format!("spawning interactive shell {shell}"))?;
-    if !status.success() {
-        // Non-zero exit (including the user typing `exit 1`) is not
-        // a tsumugi error; surface it but do not propagate via `?`.
-        tracing::debug!(?status, "interactive shell exited with non-zero status");
-    }
-    Ok(())
+    // Propagate the shell's exit code so the user's `$?` reflects
+    // what they saw inside the shell. `code()` returns `None` when
+    // the process was killed by a signal; `1` is the conventional
+    // fallback in that case (mirrors `bash` exiting on SIGTERM).
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// Format the SESSIONS column: `count/max` when a max is set,
@@ -405,9 +441,64 @@ mod tests {
             .create_ad_hoc(workspace.clone(), None)
             .unwrap_or_else(|e| panic!("{e}"));
 
-        let resolved = resolve_run_id(&store, Some("abc123"), Some(&workspace))
+        let resolved = resolve_run_id(&store, Some("abc12345"), Some(&workspace))
             .unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(resolved.as_str(), "abc123");
+        assert_eq!(resolved.as_str(), "abc12345");
+    }
+
+    /// `tmg run status ../foo` must surface "invalid run id"; we
+    /// never construct a [`RunId`] from path-traversal-shaped input.
+    #[test]
+    fn resolve_run_id_rejects_malformed_explicit_id() {
+        let (tmp, store) = make_store();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap_or_else(|e| panic!("{e}"));
+        match resolve_run_id(&store, Some("../foo"), Some(&workspace)) {
+            Err(err) => {
+                let msg = format!("{err:#}");
+                assert!(
+                    msg.contains("invalid run id"),
+                    "expected error to mention `invalid run id`, got {msg:?}",
+                );
+            }
+            Ok(id) => panic!(
+                "expected error for malformed run id, got Ok({})",
+                id.as_str(),
+            ),
+        }
+    }
+
+    /// When the `current` pointer references a run whose workspace
+    /// disagrees with the cwd we were launched from, fall through to
+    /// `latest_resumable` instead of silently routing the command.
+    #[test]
+    fn resolve_run_id_falls_through_when_current_workspace_mismatch() {
+        let (tmp, store) = make_store();
+        let workspace_a = tmp.path().join("workspace-a");
+        let workspace_b = tmp.path().join("workspace-b");
+        std::fs::create_dir_all(&workspace_a).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::create_dir_all(&workspace_b).unwrap_or_else(|e| panic!("{e}"));
+
+        // Create one run for each workspace.
+        let run_a = store
+            .create_ad_hoc(workspace_a.clone(), None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let run_b = store
+            .create_ad_hoc(workspace_b.clone(), None)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        // After the second create_ad_hoc, `current` points at run_b.
+        // From cwd=workspace_a, the resolver should NOT return run_b
+        // via the `current` shortcut; instead it should fall through
+        // and pick run_a via `latest_resumable`.
+        let resolved =
+            resolve_run_id(&store, None, Some(&workspace_a)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(resolved, run_a.id);
+        // Sanity: from workspace_b, the same logic returns run_b.
+        let resolved_b =
+            resolve_run_id(&store, None, Some(&workspace_b)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(resolved_b, run_b.id);
     }
 
     #[test]
@@ -472,12 +563,8 @@ mod tests {
             .create_ad_hoc(workspace, None)
             .unwrap_or_else(|e| panic!("{e}"));
 
-        cmd_upgrade(&store, &run.id).unwrap_or_else(|e| panic!("{e}"));
-        let upgraded = store.load(&run.id).unwrap_or_else(|e| panic!("{e}"));
-        assert!(matches!(upgraded.scope, RunScope::Harnessed { .. }));
-
-        // Plant a fake features.json and verify downgrade does not
-        // delete it.
+        // Plant a fake features.json BEFORE calling cmd_upgrade so
+        // the precondition check passes.
         let features = store.features_file(&run.id);
         std::fs::write(
             &features,
@@ -485,10 +572,41 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("{e}"));
 
+        cmd_upgrade(&store, &run.id).unwrap_or_else(|e| panic!("{e}"));
+        let upgraded = store.load(&run.id).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(upgraded.scope, RunScope::Harnessed { .. }));
+
         cmd_downgrade(&store, &run.id).unwrap_or_else(|e| panic!("{e}"));
         let downgraded = store.load(&run.id).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(downgraded.scope, RunScope::AdHoc);
         assert!(features.exists(), "features.json must be preserved");
+    }
+
+    /// `cmd_upgrade` surfaces a clear precondition error when
+    /// `features.json` is missing. Mirror the harness-level test in
+    /// `commands.rs`; this one exercises the CLI wrapper.
+    #[test]
+    fn cmd_upgrade_without_features_returns_error() {
+        let (tmp, store) = make_store();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap_or_else(|e| panic!("{e}"));
+        let run = store
+            .create_ad_hoc(workspace, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        match cmd_upgrade(&store, &run.id) {
+            Err(err) => {
+                let msg = format!("{err:#}");
+                assert!(
+                    msg.contains("features.json not found"),
+                    "expected error to mention missing features.json, got {msg:?}",
+                );
+            }
+            Ok(()) => panic!("expected precondition failure but cmd_upgrade succeeded"),
+        }
+        // Scope must remain ad-hoc after the refused upgrade.
+        let reloaded = store.load(&run.id).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(reloaded.scope, RunScope::AdHoc);
     }
 
     #[test]

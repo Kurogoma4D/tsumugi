@@ -37,6 +37,7 @@ pub mod sink;
 pub mod state;
 pub mod store;
 pub mod tools;
+pub mod tui_sentinel;
 
 pub use artifacts::{
     Feature, FeatureList, Features, FeaturesSummary, FeaturesSummaryEntry, InitScript,
