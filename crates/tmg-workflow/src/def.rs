@@ -4,7 +4,7 @@
 //! by the engine. Raw YAML is parsed into these via [`crate::parse`].
 //!
 //! Control-flow steps (`Loop`, `Branch`, `Parallel`, `Group`, `Human`)
-//! are explicitly out of scope for this iteration; see issue #40.
+//! were added in issue #40 and dispatch through [`crate::engine`].
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -47,7 +47,9 @@ pub struct InputDef {
 
 /// A single workflow step.
 ///
-/// Only `Agent`, `Shell`, and `WriteFile` are supported in this iteration.
+/// Leaf step types (`Agent`, `Shell`, `WriteFile`) execute directly;
+/// control-flow types (`Loop`, `Branch`, `Parallel`, `Group`, `Human`)
+/// recursively dispatch their children through the engine.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum StepDef {
@@ -96,6 +98,99 @@ pub enum StepDef {
         /// File contents template.
         content: String,
     },
+
+    /// Iterate `steps` until `until` evaluates to `true` or
+    /// `max_iterations` is reached.
+    ///
+    /// The inner step ids are re-tagged per iteration as `id[1]`,
+    /// `id[2]`, ... so each iteration's `StepResult` is addressable
+    /// independently in `steps.<inner>[N]` lookups. The loop step's
+    /// own `StepResult` carries either `{"max_iterations_reached":
+    /// true}` (no `until` success) or `{"max_iterations_reached":
+    /// false, "iterations": N}` on a successful exit.
+    Loop {
+        /// Step identifier.
+        id: String,
+        /// Maximum number of iterations to run.
+        max_iterations: u32,
+        /// `${{ ... }}` boolean expression evaluated *after* each
+        /// iteration; iteration stops on `true`.
+        until: String,
+        /// Steps to execute on every iteration (in order).
+        steps: Vec<StepDef>,
+    },
+
+    /// Evaluate each `(when, steps)` pair in order; execute the steps
+    /// of the first pair whose `when` is truthy. If none match, run
+    /// `default` (or no-op when absent).
+    Branch {
+        /// Step identifier.
+        id: String,
+        /// `(when_expression, steps)` pairs. The first matching pair
+        /// wins; remaining pairs are not evaluated.
+        conditions: Vec<(String, Vec<StepDef>)>,
+        /// Optional fallback steps when no `conditions` match.
+        default: Option<Vec<StepDef>>,
+    },
+
+    /// Spawn each child step concurrently. Honours the
+    /// `[workflow] max_parallel_agents` cap (agent steps only); shell
+    /// and `write_file` steps are not capped.
+    Parallel {
+        /// Step identifier.
+        id: String,
+        /// Steps to execute concurrently.
+        steps: Vec<StepDef>,
+    },
+
+    /// Group multiple steps under a single failure policy.
+    Group {
+        /// Step identifier.
+        id: String,
+        /// What to do if any inner step fails.
+        on_failure: FailurePolicy,
+        /// Maximum retry count when `on_failure == Retry`. Ignored for
+        /// other policies.
+        max_retries: u32,
+        /// Steps to execute as a group.
+        steps: Vec<StepDef>,
+    },
+
+    /// Pause the workflow and ask the user (TUI / CLI) for a decision.
+    ///
+    /// The engine emits [`crate::progress::WorkflowProgress::HumanInputRequired`]
+    /// and awaits a [`crate::progress::HumanResponse`]. `revise`
+    /// rewinds workflow state to the snapshot taken before
+    /// `revise_target`'s execution and re-runs the workflow from that
+    /// step.
+    Human {
+        /// Step identifier.
+        id: String,
+        /// Prompt shown to the user.
+        message: String,
+        /// Optional `${{ ... }}` template rendered as additional
+        /// context (e.g. `${{ steps.ux_design.output }}`).
+        show: Option<String>,
+        /// Allowed response keywords (e.g. `["approve", "reject", "revise"]`).
+        options: Vec<String>,
+        /// Step id to rewind to when the user picks `revise`. Required
+        /// when `revise` is in `options`.
+        revise_target: Option<String>,
+    },
+}
+
+/// Failure handling policy for a [`StepDef::Group`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FailurePolicy {
+    /// Propagate the inner failure upward and abort the workflow.
+    #[default]
+    Abort,
+    /// Retry the entire group up to `max_retries` times before giving up.
+    Retry,
+    /// Log the failure but continue running subsequent steps.
+    Continue,
 }
 
 impl StepDef {
@@ -103,7 +198,14 @@ impl StepDef {
     #[must_use]
     pub fn id(&self) -> &str {
         match self {
-            Self::Agent { id, .. } | Self::Shell { id, .. } | Self::WriteFile { id, .. } => id,
+            Self::Agent { id, .. }
+            | Self::Shell { id, .. }
+            | Self::WriteFile { id, .. }
+            | Self::Loop { id, .. }
+            | Self::Branch { id, .. }
+            | Self::Parallel { id, .. }
+            | Self::Group { id, .. }
+            | Self::Human { id, .. } => id,
         }
     }
 
@@ -114,6 +216,11 @@ impl StepDef {
             Self::Agent { .. } => "agent",
             Self::Shell { .. } => "shell",
             Self::WriteFile { .. } => "write_file",
+            Self::Loop { .. } => "loop",
+            Self::Branch { .. } => "branch",
+            Self::Parallel { .. } => "parallel",
+            Self::Group { .. } => "group",
+            Self::Human { .. } => "human",
         }
     }
 
@@ -122,8 +229,65 @@ impl StepDef {
     pub fn when(&self) -> Option<&str> {
         match self {
             Self::Agent { when, .. } | Self::Shell { when, .. } => when.as_deref(),
-            // write_file does not currently support `when` per SPEC §8.4.
-            Self::WriteFile { .. } => None,
+            // write_file / control-flow steps do not currently expose
+            // a `when` clause at the outer level — control flow steps
+            // express conditional execution via their own grammar
+            // (`until`, `conditions`, etc.), and `write_file` is
+            // intentionally always-on per SPEC §8.4.
+            Self::WriteFile { .. }
+            | Self::Loop { .. }
+            | Self::Branch { .. }
+            | Self::Parallel { .. }
+            | Self::Group { .. }
+            | Self::Human { .. } => None,
+        }
+    }
+
+    /// Re-tag this step's id (and recursively, child step ids) by
+    /// rewriting `id` to `f(id)`. Used by the loop runner to suffix
+    /// inner steps as `id[1]`, `id[2]`, ... per iteration.
+    ///
+    /// The function is applied once per step node visited; child step
+    /// ids are independent (each child sees its own original id).
+    pub(crate) fn retag_ids(&mut self, f: &impl Fn(&str) -> String) {
+        match self {
+            Self::Agent { id, .. }
+            | Self::Shell { id, .. }
+            | Self::WriteFile { id, .. }
+            | Self::Loop { id, .. }
+            | Self::Branch { id, .. }
+            | Self::Parallel { id, .. }
+            | Self::Group { id, .. }
+            | Self::Human { id, .. } => {
+                *id = f(id);
+            }
+        }
+        match self {
+            Self::Loop { steps, .. } | Self::Parallel { steps, .. } | Self::Group { steps, .. } => {
+                for s in steps {
+                    s.retag_ids(f);
+                }
+            }
+            Self::Branch {
+                conditions,
+                default,
+                ..
+            } => {
+                for (_, steps) in conditions {
+                    for s in steps {
+                        s.retag_ids(f);
+                    }
+                }
+                if let Some(default_steps) = default {
+                    for s in default_steps {
+                        s.retag_ids(f);
+                    }
+                }
+            }
+            Self::Agent { .. }
+            | Self::Shell { .. }
+            | Self::WriteFile { .. }
+            | Self::Human { .. } => {}
         }
     }
 }

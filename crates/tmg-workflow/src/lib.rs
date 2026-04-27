@@ -10,16 +10,17 @@
 //!   (priority-ordered, deduplicated by id).
 //! - [`expr`]: minimal `${{ ... }}` template / boolean / value
 //!   evaluator scoped over `inputs`, `steps`, `config`, and `env`.
-//! - [`engine::WorkflowEngine`]: sequential executor for the
-//!   `agent`, `shell`, and `write_file` step types.
+//! - [`engine::WorkflowEngine`]: workflow executor with full
+//!   control-flow dispatch (`agent`, `shell`, `write_file`, `loop`,
+//!   `branch`, `parallel`, `group`, `human`).
 //! - [`progress`]: progress events emitted during execution.
 //!
 //! ## Out of scope (this iteration)
 //!
-//! Control-flow steps (`loop`, `branch`, `parallel`, `group`, `human`)
-//! and the `run_workflow` tool are tracked separately in issues #40 and
-//! #41. The `WorkflowMode::LongRunning` placeholder parses correctly
-//! but executes identically to `Normal` until issue #42 lands.
+//! The `run_workflow` tool is tracked separately in issue #41. The
+//! `WorkflowMode::LongRunning` placeholder parses correctly but
+//! executes identically to `Normal` until issue #42 lands. TUI
+//! integration for `human` steps is tracked in issue #46.
 
 pub mod config;
 pub mod def;
@@ -33,11 +34,12 @@ pub(crate) mod steps;
 
 pub use config::WorkflowConfig;
 pub use def::{
-    InputDef, StepDef, StepResult, WorkflowDef, WorkflowMeta, WorkflowMode, WorkflowOutputs,
+    FailurePolicy, InputDef, StepDef, StepResult, WorkflowDef, WorkflowMeta, WorkflowMode,
+    WorkflowOutputs,
 };
 pub use discovery::discover_workflows;
 pub use engine::WorkflowEngine;
 pub use error::{Result, WorkflowError};
 pub use expr::{ExprContext, eval_bool, eval_string, eval_value};
 pub use parse::{parse_workflow_file, parse_workflow_str};
-pub use progress::WorkflowProgress;
+pub use progress::{HumanResponder, HumanResponse, HumanResponseKind, WorkflowProgress};
