@@ -5,13 +5,15 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+    Block, Borders, Gauge, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use unicode_width::UnicodeWidthStr;
 
 use tmg_agents::truncate_str;
 
+use crate::activity::{RunProgressSection, WorkflowProgressSection};
 use crate::app::App;
+use crate::diff::DiffPreview;
 
 /// Render the full application UI into the given frame.
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -37,20 +39,25 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-/// Draw the header bar: model name, context usage, optional run id,
-/// and subagent count.
+/// Draw the header bar: model name, context usage, run header
+/// (`[run: <id> <scope> [N/M]] [session: #N]`, SPEC §7.1), and
+/// subagent count.
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let running_count = app.running_subagent_count();
-    let has_run = app.current_run().is_some();
+    let has_run = app.run_header().is_some();
     let has_agents = running_count > 0;
 
-    // Build constraints dynamically: Model, Context are always present;
-    // Run is added when a run is active; Agents when subagents are running.
+    // Build constraints dynamically. The run pane is allocated more
+    // space than the others when present because the SPEC §7.1
+    // header string can be long (id + scope + features + session).
     let mut constraints: Vec<Constraint> = Vec::with_capacity(4);
-    let total_panes: u16 = 2 + u16::from(has_run) + u16::from(has_agents);
-    let pane_pct: u16 = 100 / total_panes;
-    for _ in 0..total_panes {
-        constraints.push(Constraint::Percentage(pane_pct));
+    constraints.push(Constraint::Min(20)); // Model
+    constraints.push(Constraint::Min(18)); // Context
+    if has_run {
+        constraints.push(Constraint::Min(36)); // Run header
+    }
+    if has_agents {
+        constraints.push(Constraint::Min(14)); // Agents
     }
 
     let header_layout = Layout::default()
@@ -80,18 +87,24 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(context_text, header_layout[idx]);
     idx += 1;
 
-    if let Some(run) = app.current_run() {
+    if let Some(header) = app.run_header() {
+        // Refresh the header's feature counters from the activity
+        // pane's `RunProgressSection` so harnessed runs always
+        // reflect the latest counters even when they were not part
+        // of a `RunProgressEvent` (e.g. a feature_list_mark_passing
+        // tool call).
+        let mut header_str = header.clone();
+        let progress = app.run_progress();
+        if progress.is_harnessed() {
+            header_str.features = Some((progress.features_done, progress.features_total));
+        }
         let run_block = Block::default().borders(Borders::ALL).title(" Run ");
-        let run_text = Paragraph::new(Line::from(vec![
-            Span::styled(
-                run.short_id(),
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(run.scope_label, Style::default().fg(Color::DarkGray)),
-        ]))
+        let run_text = Paragraph::new(Line::from(vec![Span::styled(
+            header_str.format(),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )]))
         .block(run_block);
         frame.render_widget(run_text, header_layout[idx]);
         idx += 1;
@@ -226,24 +239,295 @@ fn draw_chat_pane(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Draw the tool activity pane showing tool call logs and subagent status.
+/// Draw the structured Activity Pane (SPEC §7.1 / §7.2).
+///
+/// Sections, top-to-bottom:
+///   1. Run progress  (always present; thicker for harnessed runs)
+///   2. Workflow progress  (present only while a workflow is running)
+///   3. Subagents  (present only when subagents are active)
+///   4. Tool log
+///   5. Diff preview  (present after a `file_write`/`file_patch` /
+///      `git diff` shell call)
 fn draw_tool_pane(frame: &mut Frame, app: &App, area: Rect) {
     let subagent_summaries = app.subagent_summaries();
     let has_subagents = !subagent_summaries.is_empty();
+    let has_workflow = app.workflow_progress().is_some();
+    let has_diff = app.diff_preview().is_some();
+    let progress = app.run_progress();
+    let harnessed = progress.is_harnessed();
 
-    if has_subagents {
-        // Split the tool pane vertically: tool activity on top, subagent
-        // status on bottom.
-        let vertical = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(area);
+    // Build adaptive constraints. The numbers below are deliberately
+    // empirical: the activity pane sits in the right column of the
+    // main area, so each section needs to be thick enough to look
+    // settled but not so thick that it pushes the tool log off
+    // screen.
+    let mut constraints: Vec<Constraint> = Vec::new();
+    let mut sections: Vec<Section> = Vec::new();
 
-        draw_tool_activity(frame, app, vertical[0]);
-        draw_subagent_pane(frame, subagent_summaries, vertical[1]);
+    // Run progress.
+    let run_height: u16 = if harnessed {
+        // Header + bar + session line + current + 2 upcoming + borders.
+        // Cap at 9 so very small terminals don't lose the tool log.
+        9
     } else {
-        draw_tool_activity(frame, app, area);
+        // Header + 2 lines + borders.
+        5
+    };
+    constraints.push(Constraint::Length(run_height));
+    sections.push(Section::RunProgress);
+
+    if has_workflow {
+        constraints.push(Constraint::Length(5));
+        sections.push(Section::Workflow);
     }
+    if has_subagents {
+        // Cap subagents to ~30 % of remaining space; 6 lines is enough
+        // for ~2 entries.
+        constraints.push(Constraint::Length(8));
+        sections.push(Section::Subagents);
+    }
+    // Tool log always gets the leftover space.
+    constraints.push(Constraint::Min(5));
+    sections.push(Section::ToolLog);
+
+    if has_diff {
+        // Diff preview gets a fixed slice at the bottom.
+        constraints.push(Constraint::Length(12));
+        sections.push(Section::DiffPreview);
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    for (section, chunk) in sections.into_iter().zip(chunks.iter()) {
+        match section {
+            Section::RunProgress => draw_run_progress(frame, progress, *chunk),
+            Section::Workflow => {
+                if let Some(wf) = app.workflow_progress() {
+                    draw_workflow_progress(frame, wf, *chunk);
+                }
+            }
+            Section::Subagents => draw_subagent_pane(frame, subagent_summaries, *chunk),
+            Section::ToolLog => draw_tool_activity(frame, app, *chunk),
+            Section::DiffPreview => {
+                if let Some(diff) = app.diff_preview() {
+                    draw_diff_preview(frame, diff, *chunk);
+                }
+            }
+        }
+    }
+}
+
+/// Activity-pane section discriminator. Used to pair `Layout`
+/// constraints with their renderer in `draw_tool_pane`.
+enum Section {
+    RunProgress,
+    Workflow,
+    Subagents,
+    ToolLog,
+    DiffPreview,
+}
+
+/// Draw the run-progress section. Two layouts:
+///   * Harnessed: scope label + features `Gauge` + session counter +
+///     current/next features.
+///   * Ad-hoc: scope label + session/turn line + commit count.
+#[expect(
+    clippy::too_many_lines,
+    reason = "two scope variants share the function; splitting harnessed/ad-hoc into separate fns would obscure the shared `block` setup"
+)]
+fn draw_run_progress(frame: &mut Frame, progress: &RunProgressSection, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Run progress ");
+
+    if progress.is_harnessed() {
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let gauge_height: u16 = 1;
+        let body_height = inner.height.saturating_sub(gauge_height + 2);
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),            // scope label
+                Constraint::Length(gauge_height), // gauge
+                Constraint::Length(1),            // session line
+                Constraint::Min(body_height.max(1)),
+            ])
+            .split(inner);
+
+        // 1. Scope label.
+        let scope_line = Paragraph::new(Line::from(vec![
+            Span::styled("scope: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "harnessed",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        frame.render_widget(scope_line, split[0]);
+
+        // 2. Gauge.
+        let total = u16::try_from(progress.features_total).unwrap_or(u16::MAX);
+        let done = u16::try_from(progress.features_done).unwrap_or(u16::MAX);
+        let ratio = if total == 0 {
+            0.0
+        } else {
+            f64::from(done) / f64::from(total)
+        };
+        let gauge_label = format!("{done}/{total}");
+        let gauge = Gauge::default()
+            .gauge_style(Style::default().fg(Color::Green).bg(Color::Black))
+            .ratio(ratio.clamp(0.0, 1.0))
+            .label(gauge_label);
+        frame.render_widget(gauge, split[1]);
+
+        // 3. Session line.
+        let session_line = match progress.session_max {
+            Some(max) => format!("session {}/{}", progress.session_num, max),
+            None => format!("session {}", progress.session_num),
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                session_line,
+                Style::default().fg(Color::Yellow),
+            ))),
+            split[2],
+        );
+
+        // 4. Current / upcoming features.
+        let mut body: Vec<Line<'_>> = Vec::new();
+        if let Some(current) = &progress.current_feature {
+            body.push(Line::from(vec![
+                Span::styled("current: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(current.clone(), Style::default().fg(Color::Cyan)),
+            ]));
+        }
+        if !progress.upcoming_features.is_empty() {
+            let upcoming = progress
+                .upcoming_features
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            body.push(Line::from(vec![
+                Span::styled("next: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(upcoming, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+        if body.is_empty() {
+            body.push(Line::from(Span::styled(
+                "(features not loaded yet)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        frame.render_widget(
+            Paragraph::new(Text::from(body)).wrap(Wrap { trim: true }),
+            split[3],
+        );
+    } else {
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("scope: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "ad-hoc",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    format!("session {}", progress.session_num),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(", "),
+                Span::styled(
+                    format!("{} turns", progress.turns),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("commits: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    progress.commits.to_string(),
+                    Style::default().fg(Color::Green),
+                ),
+            ]),
+        ];
+        let p = Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: true });
+        frame.render_widget(p, area);
+    }
+}
+
+/// Draw the workflow-progress section. A single block with the
+/// current step id, optional iteration counter, and elapsed time.
+fn draw_workflow_progress(frame: &mut Frame, wf: &WorkflowProgressSection, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Workflow progress ");
+    let elapsed = wf.elapsed();
+    let elapsed_text = format!(
+        "{}.{:01}s",
+        elapsed.as_secs(),
+        elapsed.subsec_millis() / 100
+    );
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    if !wf.workflow_id.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("workflow: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                wf.workflow_id.clone(),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    let step_label = if wf.current_step.is_empty() {
+        "(starting)".to_owned()
+    } else {
+        wf.current_step.clone()
+    };
+    lines.push(Line::from(vec![
+        Span::styled("step: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(step_label, Style::default().fg(Color::Cyan)),
+    ]));
+    if let Some((iter, max)) = wf.iteration {
+        lines.push(Line::from(vec![
+            Span::styled("loop: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{iter}/{max}"), Style::default().fg(Color::Yellow)),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("elapsed: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(elapsed_text, Style::default().fg(Color::Yellow)),
+    ]));
+    let p = Paragraph::new(Text::from(lines))
+        .block(block)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(p, area);
+}
+
+/// Draw the diff preview at the bottom of the activity pane.
+fn draw_diff_preview(frame: &mut Frame, diff: &DiffPreview, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Diff preview ");
+    let inner = block.inner(area);
+    let max_lines = inner.height.saturating_sub(1) as usize;
+    let lines = diff.render_lines(max_lines);
+    let p = Paragraph::new(Text::from(lines))
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(p, area);
 }
 
 /// Draw the tool activity log.

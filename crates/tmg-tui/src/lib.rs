@@ -3,12 +3,18 @@
 //! Provides a chat interface for interactive conversations with a
 //! local LLM via the tsumugi agent loop.
 
+pub mod activity;
 pub mod app;
+pub mod diff;
 pub mod error;
 pub mod event;
 pub mod ui;
 
-pub use app::App;
+pub use activity::{
+    ActivityPane, RunHeader, RunProgressSection, ToolActivityEntry, WorkflowProgressSection,
+};
+pub use app::{App, AppEvent};
+pub use diff::DiffPreview;
 pub use error::TuiError;
 
 use std::path::PathBuf;
@@ -21,7 +27,7 @@ use crossterm::event::{
 use crossterm::execute;
 use tmg_agents::{CustomAgentDef, SubagentManager};
 use tmg_core::AgentLoop;
-use tmg_harness::{RunRunner, RunSummary};
+use tmg_harness::{RunProgressReceiver, RunRunner, RunSummary};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -46,6 +52,9 @@ use tokio_util::sync::CancellationToken;
 ///   sink with [`HarnessStreamSink`](tmg_harness::HarnessStreamSink) so
 ///   the active session's `tool_calls_count` and `files_modified` are
 ///   updated as the LLM drives the conversation.
+/// * `run_progress_rx` - Optional [`RunProgressReceiver`] subscribed
+///   to the runner's progress channel; the activity pane drains it on
+///   every tick to refresh the run header / progress section.
 ///
 /// # Errors
 ///
@@ -65,6 +74,7 @@ pub async fn run(
     event_log: Option<PathBuf>,
     current_run: Option<RunSummary>,
     runner: Option<Arc<Mutex<RunRunner>>>,
+    run_progress_rx: Option<RunProgressReceiver>,
 ) -> Result<(), TuiError> {
     let mut terminal = ratatui::init();
 
@@ -112,6 +122,10 @@ pub async fn run(
 
     if let Some(r) = runner {
         app.set_runner(r);
+    }
+
+    if let Some(rx) = run_progress_rx {
+        app.set_run_progress_rx(rx);
     }
 
     let result = event::run_event_loop(&mut terminal, &mut app, cancel).await;

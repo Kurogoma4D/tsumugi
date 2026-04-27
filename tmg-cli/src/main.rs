@@ -779,6 +779,15 @@ fn run_tui(
         // without the auto-injected bundle.
         inject_bootstrap(&mut agent, Arc::clone(&runner)).await;
 
+        // Subscribe to the runner's progress channel before handing
+        // ownership of the runner mutex to the TUI. The channel is
+        // bounded (16); the activity pane drains it every tick so
+        // back-pressure on the runner is bounded by one TUI frame.
+        let run_progress_rx = {
+            let mut guard = runner.lock().await;
+            Some(guard.progress_channel())
+        };
+
         let tui_cancel = cancel.clone();
         let tui_result = tmg_tui::run(
             agent,
@@ -791,6 +800,7 @@ fn run_tui(
             event_log,
             Some(run_summary),
             Some(Arc::clone(&runner)),
+            run_progress_rx,
         )
         .await;
 
