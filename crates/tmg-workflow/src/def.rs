@@ -368,6 +368,93 @@ pub struct WorkflowDef {
     pub steps: Vec<StepDef>,
     /// Output expressions (each value is a `${{ ... }}` template).
     pub outputs: BTreeMap<String, String>,
+    /// Optional `init` phase (only valid for `mode: long_running`).
+    ///
+    /// SPEC §8.12: the `init` phase runs once per long-running run on
+    /// the first attach. It typically invokes the `initializer` builtin
+    /// subagent through an `agent` step to produce `features.json` /
+    /// `init.sh` / `progress.md`. After [`InitPhase::steps`] complete,
+    /// the executor flips the run to harnessed scope.
+    pub init: Option<InitPhase>,
+    /// Optional `iterate` phase (required for `mode: long_running`).
+    ///
+    /// SPEC §8.12: the `iterate` phase is the per-session loop. Each
+    /// iteration begins a new harnessed session, resolves the
+    /// [`IteratePhase::bootstrap`] items into a context block, runs
+    /// [`IteratePhase::steps`], and evaluates [`IteratePhase::until`]
+    /// to decide whether to stop.
+    pub iterate: Option<IteratePhase>,
+}
+
+/// `init:` phase configuration for a `mode: long_running` workflow.
+///
+/// Runs once per run, on the first attach (i.e. when the run is still
+/// ad-hoc). The phase typically produces `features.json` / `init.sh` /
+/// `progress.md` via the `initializer` builtin subagent and then the
+/// executor escalates the run to harnessed scope.
+#[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
+pub struct InitPhase {
+    /// Optional named artifact paths exposed to expressions as
+    /// `${{ artifacts.<name> }}`. The path is rendered as a string when
+    /// referenced from a template.
+    ///
+    /// Example: `progress_file: ".tsumugi/runs/<id>/progress.md"`.
+    pub artifacts: BTreeMap<String, PathBuf>,
+    /// Steps to execute during initialisation.
+    ///
+    /// Step types are the standard set
+    /// (`agent` / `shell` / `write_file` / `loop` / `branch` /
+    /// `parallel` / `group` / `human`).
+    pub steps: Vec<StepDef>,
+}
+
+/// `iterate:` phase configuration for a `mode: long_running` workflow.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct IteratePhase {
+    /// Bootstrap items resolved at the start of each session and
+    /// concatenated into the iterate step context.
+    ///
+    /// See [`BootstrapItem`] for the supported entry kinds.
+    pub bootstrap: Vec<BootstrapItem>,
+    /// Steps to execute every session.
+    pub steps: Vec<StepDef>,
+    /// `${{ ... }}` boolean expression evaluated after every session;
+    /// when truthy the executor stops with [`crate::long_running::RunStatus::Completed`].
+    pub until: String,
+    /// Maximum number of sessions before the executor stops with
+    /// [`crate::long_running::RunStatus::Exhausted`]. Must be `>= 1`.
+    pub max_sessions: u32,
+    /// Wall-clock budget for one session. When exceeded, the executor
+    /// fires [`tmg_harness::SessionEndTrigger::Timeout`] via the
+    /// existing watchdog path and continues with the next iteration.
+    pub session_timeout: Duration,
+}
+
+/// One entry in a `bootstrap:` list.
+///
+/// Parsed from the YAML shorthand:
+///
+/// ```yaml
+/// bootstrap:
+///   - run: "ls -la"            # BootstrapItem::Run
+///   - read: "src/lib.rs"       # BootstrapItem::Read
+///   - smoke_test:              # BootstrapItem::SmokeTest
+///       id: smoke
+///       type: shell
+///       command: "cargo test --lib"
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum BootstrapItem {
+    /// Run a shell command via the sandbox; capture stdout.
+    Run(String),
+    /// Read a file (path may use `${{ artifacts.* }}` references).
+    Read(String),
+    /// Execute a single step (typically a shell smoke test) and capture
+    /// its stdout/stderr summary.
+    SmokeTest(Box<StepDef>),
 }
 
 /// Result of executing a single step.

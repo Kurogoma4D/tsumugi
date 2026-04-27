@@ -10,6 +10,7 @@ tmg-llm = { workspace = true }
 tmg-tools = { workspace = true }
 tmg-agents = { workspace = true }
 tmg-sandbox = { workspace = true }
+tmg-harness = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
