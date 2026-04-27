@@ -225,7 +225,9 @@ impl SubagentManager {
             // registered as well; without one, those names are
             // silently dropped.
             let registry = match &run_tool_provider {
-                Some(provider) => registry_for_agent_kind_with_run_provider(&agent_kind, provider),
+                Some(provider) => {
+                    registry_for_agent_kind_with_run_provider(&agent_kind, &**provider)
+                }
                 None => registry_for_agent_kind(&agent_kind),
             };
             let mut runner = SubagentRunner::new(client, registry, &agent_kind, cancel);

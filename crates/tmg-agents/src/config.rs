@@ -133,6 +133,17 @@ impl AgentType {
     ///   `feature_list_mark_passing`.
     /// - `Explore` / `Plan`: [`SandboxMode::ReadOnly`].
     /// - `Worker`: [`SandboxMode::WorkspaceWrite`].
+    ///
+    /// # Advisory only
+    ///
+    /// The returned value is **advisory** at present: subagents inherit
+    /// the harness-level sandbox mode at runtime, and per-agent sandbox
+    /// enforcement is a follow-up. Callers should treat this as the
+    /// agent's *expected* sandbox profile (useful for documentation,
+    /// configuration UIs, and future per-agent enforcement) rather than
+    /// a guaranteed runtime constraint. This mirrors the same advisory
+    /// semantics documented on
+    /// [`CustomAgentDef::sandbox_mode`](crate::custom::CustomAgentDef::sandbox_mode).
     #[must_use]
     pub fn sandbox_mode(&self) -> SandboxMode {
         match self {

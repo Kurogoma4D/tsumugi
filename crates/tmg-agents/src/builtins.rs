@@ -31,8 +31,6 @@
 //! tools simply receive a registry without those tools and the LLM is
 //! told (via the system prompt) that the harnessed gates do not apply.
 
-use std::sync::Arc;
-
 use tmg_tools::ToolRegistry;
 
 use crate::config::{AgentKind, AgentType};
@@ -98,7 +96,7 @@ pub fn registry_for_agent_kind(agent_kind: &AgentKind) -> ToolRegistry {
 #[must_use]
 pub fn registry_for_agent_kind_with_run_provider(
     agent_kind: &AgentKind,
-    provider: &Arc<dyn RunToolProvider>,
+    provider: &dyn RunToolProvider,
 ) -> ToolRegistry {
     let allowed = agent_kind.allowed_tool_names();
     build_registry(&allowed, Some(provider))
@@ -107,7 +105,7 @@ pub fn registry_for_agent_kind_with_run_provider(
 /// Build a registry containing only the named tools, drawing first from
 /// the stateless default registry and then from the optional
 /// [`RunToolProvider`].
-fn build_registry(allowed: &[&str], provider: Option<&Arc<dyn RunToolProvider>>) -> ToolRegistry {
+fn build_registry(allowed: &[&str], provider: Option<&dyn RunToolProvider>) -> ToolRegistry {
     let full_registry = tmg_tools::default_registry();
     let mut filtered = ToolRegistry::new();
 
@@ -137,18 +135,15 @@ fn register_stateless_tool_by_name(registry: &mut ToolRegistry, name: &str) {
         "grep_search" => registry.register(tmg_tools::tools::GrepSearchTool),
         "list_dir" => registry.register(tmg_tools::tools::ListDirTool),
         "shell_exec" => registry.register(tmg_tools::tools::ShellExecTool),
-        _ => {
-            debug_assert!(
-                false,
-                "register_stateless_tool_by_name: unknown tool name: {name}",
-            );
-        }
+        _ => unreachable!("caller guarantees presence in default_registry"),
     }
 }
 
 #[cfg(test)]
 #[expect(clippy::panic, reason = "test assertions")]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -300,7 +295,7 @@ allow = ["file_read", "grep_search"]
             ],
         });
         let kind = AgentKind::Builtin(AgentType::Qa);
-        let registry = registry_for_agent_kind_with_run_provider(&kind, &provider);
+        let registry = registry_for_agent_kind_with_run_provider(&kind, &*provider);
 
         assert!(registry.get("feature_list_read").is_some());
         assert!(registry.get("feature_list_mark_passing").is_some());
@@ -324,7 +319,7 @@ allow = ["file_read", "grep_search"]
         });
 
         let positive = AgentKind::Builtin(AgentType::Qa);
-        let qa_registry = registry_for_agent_kind_with_run_provider(&positive, &provider);
+        let qa_registry = registry_for_agent_kind_with_run_provider(&positive, &*provider);
         assert!(
             qa_registry.get("feature_list_mark_passing").is_some(),
             "qa registry MUST contain feature_list_mark_passing",
@@ -338,7 +333,7 @@ allow = ["file_read", "grep_search"]
             AgentType::Plan,
         ] {
             let kind = AgentKind::Builtin(agent_type);
-            let registry = registry_for_agent_kind_with_run_provider(&kind, &provider);
+            let registry = registry_for_agent_kind_with_run_provider(&kind, &*provider);
             assert!(
                 registry.get("feature_list_mark_passing").is_none(),
                 "{} registry MUST NOT contain feature_list_mark_passing",
@@ -384,7 +379,7 @@ allow = ["file_read", "grep_search"]
         // consulted at all.
         let _ = registry_for_agent_kind_with_run_provider(
             &AgentKind::Builtin(AgentType::Worker),
-            &provider,
+            &*provider,
         );
         assert!(
             calls.lock().map(|c| c.is_empty()).unwrap_or(true),
@@ -396,7 +391,7 @@ allow = ["file_read", "grep_search"]
         // be consulted for that one name (and only that one).
         let _ = registry_for_agent_kind_with_run_provider(
             &AgentKind::Builtin(AgentType::Initializer),
-            &provider,
+            &*provider,
         );
         let recorded = calls.lock().map(|c| c.clone()).unwrap_or_default();
         assert_eq!(

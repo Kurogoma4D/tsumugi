@@ -35,6 +35,25 @@ use crate::tools::{FeatureListMarkPassingTool, FeatureListReadTool, ProgressAppe
 /// runs. This mirrors the behaviour of
 /// [`crate::tools::register_run_tools`] so the main agent and any
 /// spawned subagents see the same scope-gated tool set.
+///
+/// # Invariants
+///
+/// [`RunScope`] is treated as **immutable** for the lifetime of this
+/// provider. The `is_harnessed` flag is sampled once at construction
+/// (in [`Self::new`] / [`Self::with_scope`]) and is never re-read from
+/// the underlying [`RunRunner`]. This is an intentional design choice:
+/// `register_run_tool` is synchronous and on the hot path, so it must
+/// avoid acquiring the runner's async lock.
+///
+/// As a consequence, **mutating `Run::scope` on a live provider would
+/// cause stale gating**: a subagent spawned after a runtime
+/// scope-promotion (ad-hoc → harnessed) would still see the registry
+/// shape from the original scope, and vice versa. In practice
+/// `RunScope` is set when the [`RunRunner`] is constructed and is not
+/// modified afterwards, so this restriction is observed by
+/// construction. If you ever need to support scope mutation, build a
+/// fresh `RunRunnerToolProvider` and re-install it via
+/// [`SubagentManager::set_run_tool_provider`](tmg_agents::SubagentManager::set_run_tool_provider).
 #[derive(Clone)]
 pub struct RunRunnerToolProvider {
     runner: Arc<Mutex<RunRunner>>,
