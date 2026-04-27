@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tmg_harness::{
     RunRunner, RunRunnerToolProvider, RunStore, RunSummary, SessionBootstrapTool,
     SessionEndTrigger, register_run_tools,
@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 mod config;
 mod error;
 mod harness_init;
+mod run_commands;
 
 use config::{HarnessConfig, SandboxConfigSection, TsumugiConfig};
 
@@ -22,34 +23,34 @@ use config::{HarnessConfig, SandboxConfigSection, TsumugiConfig};
 struct Cli {
     /// Send a one-shot prompt to the LLM server and stream the response
     /// to stdout.
-    #[arg(long)]
+    #[arg(long, global = true)]
     prompt: Option<String>,
 
     /// LLM server endpoint URL. Overrides config file and environment.
-    #[arg(long)]
+    #[arg(long, global = true)]
     endpoint: Option<String>,
 
     /// Model name to use. Overrides config file and environment.
-    #[arg(long)]
+    #[arg(long, global = true)]
     model: Option<String>,
 
     /// Path to a `tsumugi.toml` configuration file.
     /// When specified, only this file is loaded (no global/project-local
     /// discovery).
-    #[arg(long)]
+    #[arg(long, global = true)]
     config: Option<PathBuf>,
 
     /// Maximum context window tokens.
-    #[arg(long)]
+    #[arg(long, global = true)]
     max_context_tokens: Option<usize>,
 
     /// Context compression threshold (0.0-1.0). Compression auto-triggers
     /// when context usage exceeds this fraction of `max_context_tokens`.
-    #[arg(long)]
+    #[arg(long, global = true)]
     context_compression_threshold: Option<f64>,
 
     /// Maximum tokens for a single tool result before truncation.
-    #[arg(long)]
+    #[arg(long, global = true)]
     max_tool_result_tokens: Option<usize>,
 
     /// Tool calling mode: "native", "prompt_based", or "auto".
@@ -61,14 +62,89 @@ struct Cli {
         clippy::doc_markdown,
         reason = "clap renders doc comments as --help text; backticks would show literally"
     )]
-    #[arg(long)]
+    #[arg(long, global = true)]
     tool_calling: Option<ToolCallingMode>,
 
     /// Path to write structured event log (JSON Lines format).
     /// Enables diagnostics by recording every agent event (tokens,
     /// tool calls, results) to the specified file.
-    #[arg(long)]
+    #[arg(long, global = true)]
     event_log: Option<PathBuf>,
+
+    /// Top-level subcommand. When omitted, `tmg` launches the
+    /// interactive TUI (or runs one-shot mode if `--prompt` was
+    /// supplied).
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Top-level subcommand surface. Workflow / Init are scoped to #44 /
+/// #46 and intentionally omitted here.
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run management (`tmg run <op>`). See SPEC §9.8.
+    Run {
+        /// Sub-operation on the active or specified run.
+        #[command(subcommand)]
+        op: RunCommand,
+    },
+}
+
+/// Operations under `tmg run`. SPEC §9.8.
+#[derive(Subcommand, Debug)]
+enum RunCommand {
+    /// Resume a run in the interactive TUI.
+    ///
+    /// With no argument, resumes the run pointed at by
+    /// `.tsumugi/runs/current` (or the most recent resumable run as a
+    /// backwards-compat fallback).
+    Resume {
+        /// Optional explicit run id.
+        run_id: Option<String>,
+    },
+    /// List all runs as a fixed-width table on stdout.
+    List,
+    /// Pretty-print detailed status for one run.
+    Status {
+        /// Optional run id; defaults to current.
+        run_id: Option<String>,
+    },
+    /// Force-promote a run to harnessed scope.
+    Upgrade {
+        /// Optional run id; defaults to current.
+        run_id: Option<String>,
+    },
+    /// Demote a run back to ad-hoc scope (preserves features.json).
+    Downgrade {
+        /// Optional run id; defaults to current.
+        run_id: Option<String>,
+    },
+    /// Mark a run as paused without launching the TUI.
+    ///
+    /// Best-effort outside an active TUI: when a tmg TUI is currently
+    /// attached to the run (`.tsumugi/runs/<id>/.tui-pid` sentinel),
+    /// the command refuses with an error. Use the in-TUI `/run pause`
+    /// slash command (issue #46) to pause an attached run.
+    Pause {
+        /// Optional run id; defaults to current.
+        run_id: Option<String>,
+    },
+    /// Mark a run as failed (`reason = "user aborted"`).
+    ///
+    /// Best-effort outside an active TUI: refuses while a tmg TUI is
+    /// attached to the run, for the same reason as `pause`.
+    Abort {
+        /// Optional run id; defaults to current.
+        run_id: Option<String>,
+    },
+    /// Open an interactive shell rooted at the run's workspace path.
+    Shell {
+        /// Optional run id; defaults to current.
+        run_id: Option<String>,
+    },
+    /// Force-rotate to a new session. Must be issued from inside an
+    /// active TUI session; outside, prints an explanatory error.
+    NewSession,
 }
 
 impl Cli {
@@ -112,27 +188,136 @@ fn main() -> anyhow::Result<()> {
         max_tool_result_tokens: config.llm.max_tool_result_tokens,
     };
 
-    if let Some(prompt) = cli.prompt {
-        run_prompt(
-            &config.llm.endpoint,
-            &config.llm.model,
-            &prompt,
-            cli.event_log.as_deref(),
-        )?;
-    } else {
-        run_tui(
-            &config.llm.endpoint,
-            &config.llm.model,
-            context_config,
-            config.llm.tool_calling,
-            cli.event_log,
-            &config.harness,
-            &config.sandbox,
-            &config.workflow,
-        )?;
+    match cli.command {
+        Some(Command::Run { op }) => dispatch_run_command(op, &config),
+        None => {
+            if let Some(prompt) = cli.prompt {
+                run_prompt(
+                    &config.llm.endpoint,
+                    &config.llm.model,
+                    &prompt,
+                    cli.event_log.as_deref(),
+                )
+            } else {
+                run_tui(
+                    &config.llm.endpoint,
+                    &config.llm.model,
+                    context_config,
+                    config.llm.tool_calling,
+                    cli.event_log,
+                    &config.harness,
+                    &config.sandbox,
+                    &config.workflow,
+                    None,
+                )
+            }
+        }
     }
+}
 
-    Ok(())
+/// Resolve the runs-dir against the canonical cwd, mirroring the
+/// logic used by [`run_tui`] so the CLI surfaces and the live TUI
+/// agree on which `.tsumugi/runs/` they target.
+fn resolve_runs_dir(harness_config: &HarnessConfig) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let cwd = std::env::current_dir().context("reading current working directory")?;
+    let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+    let runs_dir = if harness_config.runs_dir.is_absolute() {
+        harness_config.runs_dir.clone()
+    } else {
+        canonical_cwd.join(&harness_config.runs_dir)
+    };
+    Ok((runs_dir, canonical_cwd))
+}
+
+/// Dispatch one `tmg run <op>` invocation. The TUI-bound operations
+/// (`Resume`, `NewSession`) delegate back into [`run_tui`] (or print
+/// an explanatory error). The rest mutate `run.toml` directly.
+fn dispatch_run_command(op: RunCommand, config: &TsumugiConfig) -> anyhow::Result<()> {
+    let (runs_dir, canonical_cwd) = resolve_runs_dir(&config.harness)?;
+    let store = Arc::new(RunStore::new(runs_dir));
+
+    match op {
+        RunCommand::Resume { run_id } => {
+            let context_config = tmg_core::ContextConfig {
+                max_context_tokens: config.llm.max_context_tokens,
+                compression_threshold: config.llm.compression_threshold,
+                max_tool_result_tokens: config.llm.max_tool_result_tokens,
+            };
+            // When the user supplied an explicit id, validate its
+            // shape at the boundary. We thread the validated id
+            // through to `run_tui` so the TUI loads exactly that run
+            // (bypassing `harness_init::resolve_startup_run`'s
+            // latest-resumable fallback). If no id was supplied, we
+            // try `current` as a hint and fall back to the resolver.
+            let resolved = if let Some(id) = run_id {
+                Some(
+                    tmg_harness::RunId::parse(id)
+                        .context("parsing explicit run id for `tmg run resume`")?,
+                )
+            } else {
+                // Best-effort: prefer `current` so subsequent
+                // argument-less commands inherit the same target.
+                store.current().context("reading current run pointer")?
+            };
+            // If we resolved a run, point `current` at it before
+            // launching so the TUI shutdown / re-open paths agree on
+            // the active id.
+            if let Some(ref id) = resolved
+                && let Err(e) = store.set_current(id)
+            {
+                tracing::warn!(error = %e, "failed to update current run pointer");
+            }
+            run_tui(
+                &config.llm.endpoint,
+                &config.llm.model,
+                context_config,
+                config.llm.tool_calling,
+                None,
+                &config.harness,
+                &config.sandbox,
+                &config.workflow,
+                resolved.as_ref(),
+            )
+        }
+        RunCommand::List => run_commands::cmd_list(&store),
+        RunCommand::Status { run_id } => {
+            let id = run_commands::resolve_run_id(&store, run_id.as_deref(), Some(&canonical_cwd))?;
+            run_commands::cmd_status(&store, &id)
+        }
+        RunCommand::Upgrade { run_id } => {
+            let id = run_commands::resolve_run_id(&store, run_id.as_deref(), Some(&canonical_cwd))?;
+            run_commands::cmd_upgrade(&store, &id)
+        }
+        RunCommand::Downgrade { run_id } => {
+            let id = run_commands::resolve_run_id(&store, run_id.as_deref(), Some(&canonical_cwd))?;
+            run_commands::cmd_downgrade(&store, &id)
+        }
+        RunCommand::Pause { run_id } => {
+            let id = run_commands::resolve_run_id(&store, run_id.as_deref(), Some(&canonical_cwd))?;
+            run_commands::cmd_pause(&store, &id)
+        }
+        RunCommand::Abort { run_id } => {
+            let id = run_commands::resolve_run_id(&store, run_id.as_deref(), Some(&canonical_cwd))?;
+            run_commands::cmd_abort(&store, &id)
+        }
+        RunCommand::Shell { run_id } => {
+            let id = run_commands::resolve_run_id(&store, run_id.as_deref(), Some(&canonical_cwd))?;
+            run_commands::cmd_shell(&store, &id)
+        }
+        RunCommand::NewSession => {
+            // `new-session` rotates the *active* TUI session. Outside
+            // a TUI we have no live runner, so we surface an
+            // explanatory error rather than silently writing the
+            // on-disk session. The TUI slash-command equivalent
+            // (`/run new-session`) is tracked in #46. The single
+            // `bail!` carries the entire message so anyhow's error
+            // chain is the sole source of truth.
+            anyhow::bail!(
+                "tmg run new-session must be invoked from inside an active TUI session. \
+                 Use the `/run new-session` slash command from within `tmg` (see #46).",
+            );
+        }
+    }
 }
 
 /// Run a one-shot streaming prompt against the LLM server.
@@ -245,6 +430,7 @@ fn run_tui(
     harness_config: &HarnessConfig,
     sandbox_config: &SandboxConfigSection,
     workflow_config: &tmg_workflow::WorkflowConfig,
+    explicit_run_id: Option<&tmg_harness::RunId>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -280,8 +466,35 @@ fn run_tui(
             canonical_cwd.join(&harness_config.runs_dir)
         };
         let store = Arc::new(RunStore::new(runs_dir));
-        let run = harness_init::resolve_startup_run(harness_config, &store, canonical_cwd.clone())
-            .context("resolving startup run")?;
+        // `select_startup_run` honours an explicit id from
+        // `tmg run resume <id>` before falling back to the
+        // auto-resume / create-fresh policy. The explicit-id path
+        // bypasses `latest_resumable` so the user genuinely resumes
+        // the run they typed, not "whatever was newest".
+        let run = harness_init::select_startup_run(
+            harness_config,
+            &store,
+            canonical_cwd.clone(),
+            explicit_run_id,
+        )
+        .context("resolving startup run")?;
+        // Whichever path we took, lock the resolved id into `current`
+        // so out-of-TUI CLI mutators agree with the live runner.
+        if let Err(e) = store.set_current(&run.id) {
+            tracing::warn!(error = %e, "failed to update current run pointer at startup");
+        }
+        // Stamp the TUI sentinel so `tmg run pause` / `tmg run abort`
+        // refuse to mutate `run.toml` while we hold the live runner.
+        // Failures here are best-effort (a permission glitch on the
+        // run dir should not abort startup); the worst case is the
+        // CLI mutators not refusing.
+        let sentinel_dir = store.run_dir(&run.id);
+        if let Err(e) = tmg_harness::tui_sentinel::write(&sentinel_dir) {
+            tracing::warn!(error = %e, "failed to write TUI sentinel; CLI mutators may race the live runner");
+        }
+        // Guard ensures the sentinel is removed on every exit path
+        // (including panic propagation through tokio::block_on).
+        let _sentinel_guard = TuiSentinelGuard::new(sentinel_dir);
         let mut runner = RunRunner::new(run, Arc::clone(&store));
         runner.set_bootstrap_max_tokens(harness_config.bootstrap_max_tokens);
         runner.set_default_session_timeout(harness_config.default_session_timeout);
@@ -556,6 +769,32 @@ fn run_tui(
         tui_result?;
         Ok::<(), anyhow::Error>(())
     })
+}
+
+/// RAII guard that clears the TUI-attached sentinel for a run on
+/// `Drop`.
+///
+/// Created right after the sentinel is written so every exit path
+/// from `run_tui` (clean return, error propagation, panic) removes
+/// the file. Without the guard, a panic during agent setup would
+/// leave a stale `.tui-pid` behind that would block CLI mutators
+/// until the recorded PID is reused or the file is manually removed.
+struct TuiSentinelGuard {
+    run_dir: PathBuf,
+}
+
+impl TuiSentinelGuard {
+    fn new(run_dir: PathBuf) -> Self {
+        Self { run_dir }
+    }
+}
+
+impl Drop for TuiSentinelGuard {
+    fn drop(&mut self) {
+        if let Err(e) = tmg_harness::tui_sentinel::clear(&self.run_dir) {
+            tracing::warn!(error = %e, "failed to clear TUI sentinel on shutdown");
+        }
+    }
 }
 
 /// Surface a non-fatal error from `RunRunner::end_session` to the
@@ -871,6 +1110,125 @@ async fn inject_bootstrap(agent: &mut tmg_core::AgentLoop, runner: Arc<Mutex<Run
 #[expect(clippy::panic, reason = "test assertions use panic-based macros")]
 mod tests {
     use super::*;
+    use clap::CommandFactory as _;
+
+    // ---------------------------------------------------------------
+    // CLI subcommand parsing (issue #43)
+    // ---------------------------------------------------------------
+
+    /// `clap` macro hygiene: the derive output should compile and
+    /// validate without `debug_assert` failing.
+    #[test]
+    fn cli_definition_validates() {
+        Cli::command().debug_assert();
+    }
+
+    /// `tmg` with no arguments parses to no subcommand and no prompt;
+    /// this is the legacy "launch the TUI" code path.
+    #[test]
+    fn cli_no_args_launches_tui() {
+        let cli = Cli::try_parse_from(["tmg"]).unwrap_or_else(|e| panic!("{e}"));
+        assert!(cli.command.is_none());
+        assert!(cli.prompt.is_none());
+    }
+
+    /// `tmg --prompt "hello"` parses with `prompt` set and no
+    /// subcommand — the legacy one-shot mode.
+    #[test]
+    fn cli_prompt_only_runs_one_shot() {
+        let cli =
+            Cli::try_parse_from(["tmg", "--prompt", "hello"]).unwrap_or_else(|e| panic!("{e}"));
+        assert!(cli.command.is_none());
+        assert_eq!(cli.prompt.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn cli_run_list_parses() {
+        let cli = Cli::try_parse_from(["tmg", "run", "list"]).unwrap_or_else(|e| panic!("{e}"));
+        match cli.command {
+            Some(Command::Run {
+                op: RunCommand::List,
+            }) => {}
+            other => panic!("expected Run(List), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_run_status_with_id_parses() {
+        let cli = Cli::try_parse_from(["tmg", "run", "status", "abc12345"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match cli.command {
+            Some(Command::Run {
+                op: RunCommand::Status { run_id },
+            }) => {
+                assert_eq!(run_id.as_deref(), Some("abc12345"));
+            }
+            other => panic!("expected Run(Status), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_run_resume_without_id_parses() {
+        let cli = Cli::try_parse_from(["tmg", "run", "resume"]).unwrap_or_else(|e| panic!("{e}"));
+        match cli.command {
+            Some(Command::Run {
+                op: RunCommand::Resume { run_id },
+            }) => {
+                assert!(run_id.is_none());
+            }
+            other => panic!("expected Run(Resume), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_run_upgrade_parses() {
+        let cli = Cli::try_parse_from(["tmg", "run", "upgrade"]).unwrap_or_else(|e| panic!("{e}"));
+        match cli.command {
+            Some(Command::Run {
+                op: RunCommand::Upgrade { run_id },
+            }) => {
+                assert!(run_id.is_none());
+            }
+            other => panic!("expected Run(Upgrade), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_run_pause_abort_downgrade_parse() {
+        for sub in ["pause", "abort", "downgrade", "shell"] {
+            let cli = Cli::try_parse_from(["tmg", "run", sub]).unwrap_or_else(|e| panic!("{e}"));
+            assert!(matches!(cli.command, Some(Command::Run { .. })));
+        }
+    }
+
+    #[test]
+    fn cli_run_new_session_parses() {
+        let cli =
+            Cli::try_parse_from(["tmg", "run", "new-session"]).unwrap_or_else(|e| panic!("{e}"));
+        match cli.command {
+            Some(Command::Run {
+                op: RunCommand::NewSession,
+            }) => {}
+            other => panic!("expected Run(NewSession), got {other:?}"),
+        }
+    }
+
+    /// `--prompt` is `global = true` so it can be provided either
+    /// before or after the subcommand. We only need the legacy
+    /// "before any subcommand" form to keep working; this asserts
+    /// global-flag plumbing didn't accidentally break it.
+    #[test]
+    fn cli_global_prompt_with_subcommand_parses() {
+        let cli = Cli::try_parse_from(["tmg", "--prompt", "hi", "run", "list"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(cli.prompt.as_deref(), Some("hi"));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run {
+                op: RunCommand::List
+            })
+        ));
+    }
 
     /// Parse the standard `git diff --shortstat` line shape.
     #[test]

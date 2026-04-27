@@ -35,6 +35,10 @@ use crate::config::{HarnessConfig, SandboxConfigSection};
 /// In both cases the run's `last_session_at` and `session_count` are
 /// updated and persisted via the [`RunRunner`](tmg_harness::RunRunner)
 /// elsewhere; this function only handles the load-vs-create choice.
+///
+/// **Note**: this function ignores `tmg run resume <id>`'s explicit
+/// run id. Callers that want to honour an explicit id must short-
+/// circuit the call themselves (see [`select_startup_run`]).
 pub fn resolve_startup_run(
     harness: &HarnessConfig,
     store: &Arc<RunStore>,
@@ -46,6 +50,42 @@ pub fn resolve_startup_run(
         return store.load(&summary.id);
     }
     store.create_ad_hoc(workspace_path, None)
+}
+
+/// Select the run for a startup, honouring an explicit id when one
+/// was supplied via `tmg run resume <id>`.
+///
+/// When `explicit_id` is `Some`, the run is loaded directly; the
+/// load fails if the id has no on-disk record, and a workspace
+/// mismatch surfaces as [`HarnessError::Precondition`] so the caller
+/// can route the message through `anyhow::Error::context`. When
+/// `explicit_id` is `None`, falls through to [`resolve_startup_run`]
+/// (i.e. the legacy auto-resume / create-fresh policy).
+///
+/// Factoring this out of `run_tui` keeps the explicit-id branch
+/// unit-testable without spinning up an `AgentLoop` or a TUI.
+pub fn select_startup_run(
+    harness: &HarnessConfig,
+    store: &Arc<RunStore>,
+    workspace_path: std::path::PathBuf,
+    explicit_id: Option<&tmg_harness::RunId>,
+) -> Result<Run, HarnessError> {
+    if let Some(id) = explicit_id {
+        let loaded = store.load(id)?;
+        if loaded.workspace_path != workspace_path {
+            return Err(HarnessError::Precondition {
+                message: format!(
+                    "run {} belongs to workspace {} but startup cwd is {}; \
+                     change directory or pick a workspace-matching run id",
+                    id.as_str(),
+                    loaded.workspace_path.display(),
+                    workspace_path.display(),
+                ),
+            });
+        }
+        return Ok(loaded);
+    }
+    resolve_startup_run(harness, store, workspace_path)
 }
 
 /// Emit a one-time warning when the user has configured a stricter
@@ -219,6 +259,87 @@ mod tests {
         // Both runs should exist now.
         let listed = store.list().unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(listed.len(), 2);
+    }
+
+    /// `select_startup_run` with an explicit id must load *that*
+    /// run, even when a newer resumable run exists in the same
+    /// workspace. This is the regression test for `tmg run resume
+    /// <older-id>` previously falling back to `latest_resumable`.
+    #[test]
+    fn select_startup_run_honours_explicit_older_id() {
+        let (tmp, store) = make_store();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap_or_else(|e| panic!("{e}"));
+
+        // Create the older run first.
+        let older = store
+            .create_ad_hoc(workspace.clone(), None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        // Force a later created_at on the second run so
+        // `latest_resumable` would prefer it.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let newer = store
+            .create_ad_hoc(workspace.clone(), None)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let cfg = HarnessConfig {
+            runs_dir: store.runs_dir().to_path_buf(),
+            auto_resume_on_start: true,
+            bootstrap_max_tokens: tmg_harness::DEFAULT_BOOTSTRAP_MAX_TOKENS,
+            ..HarnessConfig::default()
+        };
+
+        // Sanity: with no explicit id, the resolver picks the newer
+        // run.
+        let resolved_default = select_startup_run(&cfg, &store, workspace.clone(), None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(resolved_default.id, newer.id);
+
+        // With the older id passed explicitly, we must get the
+        // older run back.
+        let resolved_explicit =
+            select_startup_run(&cfg, &store, workspace.clone(), Some(&older.id))
+                .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            resolved_explicit.id, older.id,
+            "explicit id must override latest_resumable",
+        );
+    }
+
+    /// `select_startup_run` rejects an explicit id whose stored
+    /// workspace disagrees with the current cwd.
+    #[test]
+    fn select_startup_run_rejects_workspace_mismatch() {
+        let (tmp, store) = make_store();
+        let workspace_a = tmp.path().join("workspace-a");
+        let workspace_b = tmp.path().join("workspace-b");
+        std::fs::create_dir_all(&workspace_a).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::create_dir_all(&workspace_b).unwrap_or_else(|e| panic!("{e}"));
+
+        let run_a = store
+            .create_ad_hoc(workspace_a.clone(), None)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let cfg = HarnessConfig {
+            runs_dir: store.runs_dir().to_path_buf(),
+            auto_resume_on_start: true,
+            bootstrap_max_tokens: tmg_harness::DEFAULT_BOOTSTRAP_MAX_TOKENS,
+            ..HarnessConfig::default()
+        };
+
+        match select_startup_run(&cfg, &store, workspace_b, Some(&run_a.id)) {
+            Err(HarnessError::Precondition { message }) => {
+                assert!(
+                    message.contains("belongs to workspace"),
+                    "expected workspace-mismatch message, got {message:?}",
+                );
+            }
+            Ok(run) => panic!(
+                "expected Precondition error, got Ok with id {}",
+                run.id.as_str(),
+            ),
+            Err(other) => panic!("expected Precondition, got {other:?}"),
+        }
     }
 
     /// Integration-style test exercising the resume flow end-to-end:

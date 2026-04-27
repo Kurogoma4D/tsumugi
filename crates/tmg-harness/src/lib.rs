@@ -27,6 +27,7 @@
 //! - `tester` subagent for the harnessed `smoke_test_result` field
 
 pub mod artifacts;
+pub mod commands;
 pub mod error;
 pub mod escalation;
 pub mod run;
@@ -36,12 +37,14 @@ pub mod sink;
 pub mod state;
 pub mod store;
 pub mod tools;
+pub mod tui_sentinel;
 
 pub use artifacts::{
     Feature, FeatureList, Features, FeaturesSummary, FeaturesSummaryEntry, InitScript,
     InitScriptError, InitScriptOutput, ProgressLog, SUMMARY_AGGREGATE_FILENAME, SessionLog,
     SessionLogEntry, SessionSummaryAggregate, SessionSummaryEntry,
 };
+pub use commands::{FeatureHistogram, StatusReport};
 pub use error::HarnessError;
 pub use escalation::{
     EscalationConfig, EscalationConfigError, EscalationDecision, EscalationError,
@@ -57,8 +60,8 @@ pub use session::{Session, SessionEndTrigger, SessionHandle};
 pub use sink::HarnessStreamSink;
 pub use state::{SessionState, TurnSummary};
 pub use store::{
-    FEATURES_FILENAME, INIT_SCRIPT_FILENAME, PROGRESS_FILENAME, RUN_FILENAME, RunStore,
-    SESSION_LOG_DIRNAME, WORKSPACE_LINK,
+    CURRENT_FILENAME, CURRENT_POINTER_FILENAME, FEATURES_FILENAME, INIT_SCRIPT_FILENAME,
+    PROGRESS_FILENAME, RUN_FILENAME, RunStore, SESSION_LOG_DIRNAME, WORKSPACE_LINK,
 };
 pub use tools::{
     BootstrapPayload, FeatureListMarkPassingTool, FeatureListReadTool, InitScriptStatus,

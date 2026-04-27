@@ -130,6 +130,48 @@ pub enum HarnessError {
     /// so we bail out and leave the runner untouched.
     #[error("end_session_with_rotation called without an active session")]
     NoActiveSession,
+
+    /// A user-supplied run id did not match the canonical 8-character
+    /// hexadecimal shape ([`crate::run::RunId::is_valid_shape`]).
+    ///
+    /// Surfaced from [`crate::run::RunId::parse`] when the CLI / TUI
+    /// receives an id that could otherwise be used to construct an
+    /// arbitrary path under the runs-dir (e.g. `"../foo"`).
+    #[error("invalid run id {run_id:?}: expected 8 lowercase hex characters")]
+    InvalidRunId {
+        /// The rejected raw input.
+        run_id: String,
+    },
+
+    /// A precondition for a run operation was not satisfied.
+    ///
+    /// Used by run-mutation commands that need a specific on-disk file
+    /// (e.g. `tmg run upgrade` requires `features.json`) to bail out
+    /// with a clear, actionable message instead of silently proceeding.
+    #[error("{message}")]
+    Precondition {
+        /// Human-readable explanation; surfaced verbatim by the CLI.
+        message: String,
+    },
+
+    /// A run operation was refused because a TUI is currently attached
+    /// to the same run.
+    ///
+    /// Surfaced by `tmg run pause` / `tmg run abort` when the TUI
+    /// sentinel (`.tsumugi/runs/<id>/.tui-pid`) is present and the
+    /// recorded process is still alive: the in-memory runner inside
+    /// the TUI would silently overwrite our `run.toml` mutation,
+    /// so we refuse rather than racing.
+    #[error(
+        "a tmg TUI is currently attached to run {run_id} (pid {pid}); \
+         use the in-TUI /run pause command instead, or kill the tmg process first"
+    )]
+    TuiAttached {
+        /// The run id whose `.tui-pid` sentinel is live.
+        run_id: String,
+        /// The PID recorded in the sentinel.
+        pid: u32,
+    },
 }
 
 impl HarnessError {

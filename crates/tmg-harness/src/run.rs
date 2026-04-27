@@ -17,6 +17,8 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::error::HarnessError;
+
 /// Short hex identifier for a run, e.g. `"a3f1e2b9"`.
 ///
 /// Generated from a UUID v4 by taking the first 8 hex characters of the
@@ -37,10 +39,52 @@ impl RunId {
         Self(simple[..8].to_owned())
     }
 
-    /// Construct a run id from a raw string (e.g. when loading from disk).
+    /// Parse a user-supplied run id, validating that it matches the
+    /// canonical 8-character hexadecimal shape produced by [`Self::new`].
+    ///
+    /// Returns [`HarnessError::InvalidRunId`] when `s` does not match
+    /// `^[0-9a-f]{8}$`. This is the only constructor that should be used
+    /// at trust boundaries (CLI arguments, network input, etc.) so we
+    /// never construct paths from caller-controlled values that escape
+    /// the runs-dir.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarnessError::InvalidRunId`] when `s` is not exactly
+    /// eight ASCII hex digits (lowercase a-f).
+    pub fn parse(s: impl Into<String>) -> Result<Self, HarnessError> {
+        let raw = s.into();
+        if Self::is_valid_shape(&raw) {
+            Ok(Self(raw))
+        } else {
+            Err(HarnessError::InvalidRunId { run_id: raw })
+        }
+    }
+
+    /// Construct a run id from a raw string without validating its
+    /// shape.
+    ///
+    /// Internal-only escape hatch for callers that have already
+    /// validated the input by other means — primarily
+    /// [`crate::store::RunStore::list`] (the directory name on disk
+    /// stands in for validation; a hand-edited directory with a bogus
+    /// name will simply fail to load `run.toml`) and the JSON-pointer
+    /// fallback inside [`crate::store::RunStore::current`] (the
+    /// pointer's payload is also self-validated when the run is loaded).
+    /// **Do not** use this for CLI arguments or any other untrusted
+    /// input — call [`Self::parse`] instead.
     #[must_use]
-    pub fn from_string(s: impl Into<String>) -> Self {
+    pub(crate) fn from_string_unchecked(s: impl Into<String>) -> Self {
         Self(s.into())
+    }
+
+    /// Return `true` when `s` matches the canonical 8-char hex shape
+    /// produced by [`Self::new`].
+    #[must_use]
+    pub fn is_valid_shape(s: &str) -> bool {
+        s.len() == 8
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     }
 
     /// Return the run id as a string slice.
@@ -322,14 +366,61 @@ mod tests {
 
     #[test]
     fn run_id_short_handles_long_strings() {
-        let id = RunId::from_string("abcdef0123456789");
+        let id = RunId::from_string_unchecked("abcdef0123456789");
         assert_eq!(id.short(), "abcdef01");
     }
 
     #[test]
     fn run_id_short_handles_short_strings() {
-        let id = RunId::from_string("abc");
+        let id = RunId::from_string_unchecked("abc");
         assert_eq!(id.short(), "abc");
+    }
+
+    #[test]
+    fn run_id_parse_accepts_canonical_shape() {
+        let id = RunId::parse("abc12345").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(id.as_str(), "abc12345");
+    }
+
+    #[test]
+    fn run_id_parse_rejects_uppercase() {
+        match RunId::parse("ABC12345") {
+            Err(HarnessError::InvalidRunId { run_id }) => assert_eq!(run_id, "ABC12345"),
+            Ok(id) => panic!("expected InvalidRunId, got Ok({})", id.as_str()),
+            Err(other) => panic!("expected InvalidRunId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_id_parse_rejects_wrong_length() {
+        assert!(matches!(
+            RunId::parse("abc"),
+            Err(HarnessError::InvalidRunId { .. })
+        ));
+        assert!(matches!(
+            RunId::parse("abc1234567"),
+            Err(HarnessError::InvalidRunId { .. })
+        ));
+    }
+
+    #[test]
+    fn run_id_parse_rejects_non_hex() {
+        assert!(matches!(
+            RunId::parse("../foo12"),
+            Err(HarnessError::InvalidRunId { .. })
+        ));
+        assert!(matches!(
+            RunId::parse("zzzzzzzz"),
+            Err(HarnessError::InvalidRunId { .. })
+        ));
+    }
+
+    #[test]
+    fn run_id_new_passes_parse_validation() {
+        let generated = RunId::new();
+        let raw = generated.as_str().to_owned();
+        let reparsed = RunId::parse(raw.clone()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(reparsed.as_str(), raw);
     }
 
     #[test]

@@ -1091,6 +1091,41 @@ impl RunRunner {
     pub fn run_id(&self) -> &crate::run::RunId {
         &self.run.id
     }
+
+    /// Borrow the [`RunStore`] backing this runner.
+    ///
+    /// Used by the CLI's `tmg run upgrade` / `downgrade` paths to
+    /// drive the underlying store mutations from a shared runner
+    /// without having to thread an extra `Arc<RunStore>` through every
+    /// command.
+    #[must_use]
+    pub fn store(&self) -> &Arc<RunStore> {
+        &self.store
+    }
+
+    /// Replace the in-memory [`Run`] record after the underlying
+    /// `run.toml` has been mutated out-of-band (e.g. by
+    /// [`RunStore::upgrade_to_harnessed`] /
+    /// [`RunStore::downgrade_to_ad_hoc`] /
+    /// [`Self::set_status`]).
+    ///
+    /// Also keeps the [`SessionState`] scope flag in sync so escalator
+    /// signals continue to fire against the current scope.
+    pub fn replace_run(&mut self, run: Run) {
+        self.session_state.set_scope(run.scope.clone());
+        self.run = run;
+    }
+
+    /// Update the run's [`RunStatus`](crate::run::RunStatus) and
+    /// persist `run.toml`.
+    ///
+    /// Used by the CLI's `tmg run pause` / `abort` commands. The
+    /// runner does not enforce a state machine; the caller decides
+    /// whether the new status is reachable from the current one.
+    pub fn set_status(&mut self, status: crate::run::RunStatus) -> Result<(), HarnessError> {
+        self.run.status = status;
+        self.store.save(&self.run)
+    }
 }
 
 impl Drop for RunRunner {
