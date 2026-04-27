@@ -32,13 +32,9 @@ pub(crate) async fn execute(
         });
     };
 
-    let _ = ctx
-        .progress_tx
-        .send(WorkflowProgress::StepStarted {
-            step_id: id.clone(),
-            step_type: "branch",
-        })
-        .await;
+    // NOTE: `StepStarted` is emitted by `engine::dispatch_step_inner`
+    // for every step before delegating to the per-type handler;
+    // emitting it again here would deliver duplicates.
 
     let mut chosen_arm: Option<usize> = None;
 
@@ -69,7 +65,23 @@ pub(crate) async fn execute(
 
     if let Some(steps) = body {
         for inner in steps {
-            let outcome = dispatch_step(ctx, inner, step_results).await?;
+            // On failure, the inner leaf has already emitted its own
+            // `StepFailed`; we additionally emit a `StepFailed` for
+            // the *branch* so a consumer can render the branch as
+            // failed and not just the leaf.
+            let outcome = match dispatch_step(ctx, inner, step_results).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    let _ = ctx
+                        .progress_tx
+                        .send(WorkflowProgress::StepFailed {
+                            step_id: id.clone(),
+                            error: err.to_string(),
+                        })
+                        .await;
+                    return Err(err);
+                }
+            };
             if let StepOutcome::Revise { target } = outcome {
                 return Ok(StepOutcome::Revise { target });
             }

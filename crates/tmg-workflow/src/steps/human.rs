@@ -52,13 +52,9 @@ pub(crate) async fn execute(
         });
     };
 
-    let _ = ctx
-        .progress_tx
-        .send(WorkflowProgress::StepStarted {
-            step_id: id.clone(),
-            step_type: "human",
-        })
-        .await;
+    // NOTE: `StepStarted` is emitted by `engine::dispatch_step_inner`
+    // for every step before delegating to the per-type handler;
+    // emitting it again here would deliver duplicates.
 
     // Render the prompt and `show:` payload eagerly so the receiver
     // sees the substituted values, not the raw template.
@@ -84,11 +80,33 @@ pub(crate) async fn execute(
         .await;
 
     // Await the response. `recv` errors when the sender is dropped
-    // without a value — surface that as a clear `StepFailed`.
-    let response = rx.await.map_err(|_| WorkflowError::StepFailed {
-        step_id: id.clone(),
-        message: "human input channel was dropped before a response arrived".to_owned(),
-    })?;
+    // without a value — surface that as a clear `StepFailed`. We also
+    // honour the engine-level cancellation token so a workflow
+    // never blocks forever when the UI consumer goes away without
+    // responding.
+    let response = tokio::select! {
+        biased;
+        () = ctx.cancel.cancelled() => {
+            let err = WorkflowError::StepFailed {
+                step_id: id.clone(),
+                message: "human step cancelled".to_owned(),
+            };
+            let _ = ctx
+                .progress_tx
+                .send(WorkflowProgress::StepFailed {
+                    step_id: id.clone(),
+                    error: err.to_string(),
+                })
+                .await;
+            return Err(err);
+        }
+        recv = rx => {
+            recv.map_err(|_| WorkflowError::StepFailed {
+                step_id: id.clone(),
+                message: "human input channel was dropped before a response arrived".to_owned(),
+            })?
+        }
+    };
 
     match response.kind {
         HumanResponseKind::Approve => {

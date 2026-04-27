@@ -27,10 +27,6 @@ use crate::engine::{EngineCtx, StepOutcome, dispatch_step};
 use crate::error::{Result, WorkflowError};
 use crate::progress::WorkflowProgress;
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "linear retry/abort/continue dispatch; splitting would scatter the per-policy match arms across helpers"
-)]
 pub(crate) async fn execute(
     ctx: &EngineCtx,
     step: &StepDef,
@@ -49,13 +45,9 @@ pub(crate) async fn execute(
         });
     };
 
-    let _ = ctx
-        .progress_tx
-        .send(WorkflowProgress::StepStarted {
-            step_id: id.clone(),
-            step_type: "group",
-        })
-        .await;
+    // NOTE: `StepStarted` is emitted by `engine::dispatch_step_inner`
+    // for every step before delegating to the per-type handler;
+    // emitting it again here would deliver duplicates.
 
     let pre_snapshot = step_results.clone();
 

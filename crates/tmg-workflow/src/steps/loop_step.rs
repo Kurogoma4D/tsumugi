@@ -51,13 +51,10 @@ pub(crate) async fn execute(
         });
     };
 
-    let _ = ctx
-        .progress_tx
-        .send(WorkflowProgress::StepStarted {
-            step_id: id.clone(),
-            step_type: "loop",
-        })
-        .await;
+    // NOTE: `StepStarted` is emitted for *every* step (including
+    // control-flow steps) by `engine::dispatch_step_inner` before this
+    // handler is invoked. Emitting again here would surface as a
+    // duplicate event to consumers. See engine.rs.
 
     let mut completed = 0u32;
     let mut hit_until = false;
@@ -85,8 +82,23 @@ pub(crate) async fn execute(
             // Dispatch the iteration-tagged step. Its result is stored
             // under the tagged id; we then mirror it under the bare
             // id (without the suffix) so the loop's `until:` can refer
-            // to it naturally.
-            let outcome = dispatch_step(ctx, &tagged, step_results).await?;
+            // to it naturally. On failure, the inner leaf has already
+            // emitted its own `StepFailed`; we additionally emit a
+            // `StepFailed` for the *loop* so a TUI consumer can show
+            // the loop as failed and not just the leaf.
+            let outcome = match dispatch_step(ctx, &tagged, step_results).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    let _ = ctx
+                        .progress_tx
+                        .send(WorkflowProgress::StepFailed {
+                            step_id: id.clone(),
+                            error: err.to_string(),
+                        })
+                        .await;
+                    return Err(err);
+                }
+            };
             // Loop bodies don't propagate Revise through to the engine
             // — a `human` inside a loop body that asks for revise
             // tries to rewind to a target outside the loop, which we
@@ -107,6 +119,12 @@ pub(crate) async fn execute(
             // already write their own ids into `step_results` and the
             // parser forbids `ref:`-ing them, so they cannot reach
             // this branch in practice. Guard defensively anyway.
+            //
+            // When the tagged id was *not* written this iteration
+            // (e.g. the inner leaf was skipped via `when=false`), we
+            // remove the bare id rather than preserving iteration
+            // N-1's value. Otherwise `until:` (which reads the bare
+            // id) would observe stale data and could exit early.
             if matches!(
                 inner,
                 StepDef::Agent { .. } | StepDef::Shell { .. } | StepDef::WriteFile { .. }
@@ -115,6 +133,8 @@ pub(crate) async fn execute(
                 let tagged_id = format!("{bare_id}{suffix}");
                 if let Some(latest) = step_results.get(&tagged_id).cloned() {
                     step_results.insert(bare_id.to_owned(), latest);
+                } else {
+                    step_results.remove(bare_id);
                 }
             }
         }

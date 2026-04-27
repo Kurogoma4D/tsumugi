@@ -11,17 +11,25 @@
 //!
 //! ## Snapshot map for `revise` rewinds
 //!
-//! Before running every leaf step the engine snapshots the *current*
-//! `step_results` map (a `BTreeMap<String, StepResult>`) and stores it
-//! by step id in a side `snapshots` map. When a `human` step returns
-//! `revise { target: <step_id> }`, the engine restores
+//! Before running every top-level step the engine snapshots the
+//! *current* `step_results` map (a `BTreeMap<String, StepResult>`) and
+//! stores it by step id in a side `snapshots` map. When a `human` step
+//! returns `revise { target: <step_id> }`, the engine restores
 //! `step_results = snapshots[<step_id>]` and re-enters dispatch from
 //! the matching outer step.
 //!
-//! The memory cost is `O(steps × leaf_results_so_far)`. For typical
-//! workflows (≤ tens of steps with small JSON outputs) this is well
-//! under a megabyte and is *not* released until the engine returns.
-//! Long-running workflows that emit large step outputs should
+//! On every revise rewind we also *prune* `snapshots` of any entries
+//! belonging to indices `>= target_idx`. Those steps are about to
+//! re-run and will re-insert their own entries, so the prior snapshots
+//! would otherwise pile up across rewinds. With the
+//! pruning the snapshot map is bounded by `top_level_steps`
+//! independent of how many rewinds happen — the safety budget of 64
+//! rewinds is purely a runaway-revise guard, not a memory bound.
+//!
+//! The per-snapshot memory cost is `O(leaf_results_so_far)`. For
+//! typical workflows (≤ tens of steps with small JSON outputs) this is
+//! well under a megabyte and is *not* released until the engine
+//! returns. Long-running workflows that emit large step outputs should
 //! prefer placing `human` steps near the start so the snapshots stay
 //! small.
 //!
@@ -37,6 +45,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use tmg_agents::SubagentManager;
 use tmg_llm::LlmPool;
@@ -75,6 +84,11 @@ pub(crate) struct EngineCtx {
     /// agent-type leaves; `shell`/`write_file` run uncapped (issue #40
     /// SPEC: "agent ステップだけがカウント対象").
     pub(crate) agent_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Workflow-level cancellation token. Currently only observed by
+    /// the `human` step (which would otherwise block forever waiting
+    /// for a UI response that never comes). Reserved for broader
+    /// graceful-shutdown plumbing in #42.
+    pub(crate) cancel: CancellationToken,
 }
 
 /// Workflow executor.
@@ -190,6 +204,7 @@ impl WorkflowEngine {
             inputs: Arc::new(inputs_value),
             progress_tx,
             agent_semaphore,
+            cancel: CancellationToken::new(),
         };
 
         let mut step_results: BTreeMap<String, StepResult> = BTreeMap::new();
@@ -242,6 +257,21 @@ impl WorkflowEngine {
                         });
                     };
                     step_results = snap;
+                    // Drop snapshots for steps at or beyond
+                    // `target_idx`; they are about to re-run and will
+                    // re-insert their own entries on the next loop
+                    // turn. Without this, repeated revises across a
+                    // long workflow would let `snapshots` grow
+                    // unbounded.
+                    let stale_ids: Vec<String> = workflow
+                        .steps
+                        .iter()
+                        .skip(target_idx)
+                        .map(|s| s.id().to_owned())
+                        .collect();
+                    for sid in stale_ids {
+                        snapshots.remove(&sid);
+                    }
                     idx = target_idx;
                 }
             }
@@ -386,19 +416,34 @@ async fn dispatch_step_inner(
             steps::write_file::execute(&ctx.sandbox, path, content, &eval_ctx).await
         }
         StepDef::Loop { .. } => {
-            return steps::loop_step::execute(ctx, step, step_results).await;
+            return retag_control_flow_error(
+                steps::loop_step::execute(ctx, step, step_results).await,
+                &step_id,
+            );
         }
         StepDef::Branch { .. } => {
-            return steps::branch::execute(ctx, step, step_results).await;
+            return retag_control_flow_error(
+                steps::branch::execute(ctx, step, step_results).await,
+                &step_id,
+            );
         }
         StepDef::Parallel { .. } => {
-            return steps::parallel::execute(ctx, step, step_results).await;
+            return retag_control_flow_error(
+                steps::parallel::execute(ctx, step, step_results).await,
+                &step_id,
+            );
         }
         StepDef::Group { .. } => {
-            return steps::group::execute(ctx, step, step_results).await;
+            return retag_control_flow_error(
+                steps::group::execute(ctx, step, step_results).await,
+                &step_id,
+            );
         }
         StepDef::Human { .. } => {
-            return steps::human::execute(ctx, step, step_results).await;
+            return retag_control_flow_error(
+                steps::human::execute(ctx, step, step_results).await,
+                &step_id,
+            );
         }
     };
 
@@ -439,6 +484,27 @@ async fn dispatch_step_inner(
             Err(err)
         }
     }
+}
+
+/// Re-tag an error returned by a control-flow handler so the propagated
+/// `WorkflowError` carries the control-flow step's own id (matching
+/// the `StepFailed` progress event the handler emitted on the same id
+/// — see fix #2 in PR review for #64). This keeps the error stream and
+/// the progress stream in agreement: the deepest leaf's `StepFailed`
+/// already named the leaf, and the outer control-flow's `StepFailed`
+/// names the outer step; the returned `WorkflowError` follows the
+/// outer name.
+fn retag_control_flow_error(result: Result<StepOutcome>, outer_id: &str) -> Result<StepOutcome> {
+    result.map_err(|e| match e {
+        WorkflowError::StepFailed { message, .. } => WorkflowError::StepFailed {
+            step_id: outer_id.to_owned(),
+            message,
+        },
+        other => WorkflowError::StepFailed {
+            step_id: outer_id.to_owned(),
+            message: other.to_string(),
+        },
+    })
 }
 
 /// Validate caller-supplied inputs against the workflow's declared

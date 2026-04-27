@@ -571,6 +571,12 @@ fn convert_step(
                     format!("branch step '{id}' must declare at least one condition"),
                 ));
             }
+            if when.is_some() {
+                return Err(WorkflowError::invalid_workflow(
+                    path_display,
+                    format!("branch step '{id}' does not currently support 'when'"),
+                ));
+            }
             let mut converted = Vec::with_capacity(raw_conditions.len());
             for cond in raw_conditions {
                 let mut inner_seen: BTreeSet<String> = BTreeSet::new();
@@ -601,6 +607,12 @@ fn convert_step(
                 return Err(WorkflowError::invalid_workflow(
                     path_display,
                     format!("parallel step '{id}' must declare at least one inner step"),
+                ));
+            }
+            if when.is_some() {
+                return Err(WorkflowError::invalid_workflow(
+                    path_display,
+                    format!("parallel step '{id}' does not currently support 'when'"),
                 ));
             }
             let mut inner_seen: BTreeSet<String> = BTreeSet::new();
@@ -636,6 +648,12 @@ fn convert_step(
                     ),
                 ));
             }
+            if when.is_some() {
+                return Err(WorkflowError::invalid_workflow(
+                    path_display,
+                    format!("group step '{id}' does not currently support 'when'"),
+                ));
+            }
             let mut inner_seen: BTreeSet<String> = BTreeSet::new();
             let inner = resolve_steps(raw_steps, path_display, &mut inner_seen, registry)?;
             Ok(StepDef::Group {
@@ -661,6 +679,39 @@ fn convert_step(
                     format!(
                         "human step '{id}' lists 'revise' in options but is missing 'revise_target'"
                     ),
+                ));
+            }
+            // `revise_target`, when set, must reference a top-level
+            // step id declared *above* this human step. Nested ids (in
+            // groups, loops, parallels, branches) are not supported as
+            // rewind targets because the engine's snapshot map only
+            // tracks top-level steps. Rejecting this at parse time
+            // prevents a class of UI bugs that would surface only at
+            // run time. The human step's own id (already inserted in
+            // `seen_ids` above) is also rejected — a self-revise would
+            // never terminate.
+            if let Some(target) = &revise_target {
+                if target == &id {
+                    return Err(WorkflowError::invalid_workflow(
+                        path_display,
+                        format!(
+                            "human step '{id}' has revise_target pointing at itself; pick a step declared above this human step"
+                        ),
+                    ));
+                }
+                if !seen_ids.contains(target) {
+                    return Err(WorkflowError::invalid_workflow(
+                        path_display,
+                        format!(
+                            "human step '{id}' has revise_target '{target}' which is not a top-level step declared before this human step (nested ids in group/loop/parallel/branch are not supported as revise targets)"
+                        ),
+                    ));
+                }
+            }
+            if when.is_some() {
+                return Err(WorkflowError::invalid_workflow(
+                    path_display,
+                    format!("human step '{id}' does not currently support 'when'"),
                 ));
             }
             Ok(StepDef::Human {
@@ -1218,5 +1269,193 @@ steps:
 "#;
         let err = parse_workflow_str(yaml, p()).unwrap_err();
         assert!(err.to_string().contains("revise_target"), "{err}");
+    }
+
+    /// Fix #3: `revise_target` referencing a step nested inside a
+    /// group/loop/branch must be rejected at parse time, since the
+    /// engine snapshot map only tracks top-level steps.
+    #[test]
+    fn human_revise_target_nested_in_group_fails() {
+        let yaml = r#"
+id: bad_revise_nested
+steps:
+  - id: g
+    type: group
+    on_failure: abort
+    steps:
+      - id: inner
+        type: shell
+        command: "echo hi"
+  - id: r
+    type: human
+    message: "review"
+    options: [approve, revise]
+    revise_target: inner
+"#;
+        let err = parse_workflow_str(yaml, p()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("revise_target") && msg.contains("top-level"),
+            "expected top-level message, got: {msg}"
+        );
+    }
+
+    /// Fix #3: `revise_target` referencing an undeclared id must be
+    /// rejected at parse time.
+    #[test]
+    fn human_revise_target_undeclared_fails() {
+        let yaml = r#"
+id: bad_revise_undeclared
+steps:
+  - id: design
+    type: shell
+    command: "echo design"
+  - id: r
+    type: human
+    message: "review"
+    options: [approve, revise]
+    revise_target: phantom
+"#;
+        let err = parse_workflow_str(yaml, p()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("revise_target") && msg.contains("phantom"),
+            "expected phantom-not-declared message, got: {msg}"
+        );
+    }
+
+    /// Fix #3: `revise_target` referencing a top-level id declared
+    /// *above* the human step must succeed.
+    #[test]
+    fn human_revise_target_top_level_above_succeeds() {
+        let yaml = r#"
+id: ok_revise
+steps:
+  - id: design
+    type: shell
+    command: "echo design"
+  - id: r
+    type: human
+    message: "review"
+    options: [approve, revise]
+    revise_target: design
+"#;
+        let wf = parse_workflow_str(yaml, p()).unwrap();
+        match &wf.steps[1] {
+            StepDef::Human { revise_target, .. } => {
+                assert_eq!(revise_target.as_deref(), Some("design"));
+            }
+            _ => panic!("expected human"),
+        }
+    }
+
+    /// Fix #3: a self-referential `revise_target` should be rejected
+    /// since rewinding to the human step itself is meaningless.
+    #[test]
+    fn human_revise_target_self_fails() {
+        let yaml = r#"
+id: bad_self
+steps:
+  - id: r
+    type: human
+    message: "review"
+    options: [approve, revise]
+    revise_target: r
+"#;
+        let err = parse_workflow_str(yaml, p()).unwrap_err();
+        assert!(
+            err.to_string().contains("itself"),
+            "expected self-reference message, got: {err}"
+        );
+    }
+
+    /// Fix #4: `when:` on control-flow steps should be rejected
+    /// explicitly until we plumb evaluation through every variant.
+    #[test]
+    fn rejects_when_on_branch() {
+        let yaml = r#"
+id: br_when
+steps:
+  - id: b
+    type: branch
+    when: "true"
+    conditions:
+      - when: "true"
+        steps:
+          - id: a
+            type: shell
+            command: "true"
+"#;
+        let err = parse_workflow_str(yaml, p()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not currently support 'when'"),
+            "{err}"
+        );
+    }
+
+    /// Fix #4: `when:` on a parallel step should be rejected.
+    #[test]
+    fn rejects_when_on_parallel() {
+        let yaml = r#"
+id: par_when
+steps:
+  - id: p
+    type: parallel
+    when: "true"
+    steps:
+      - id: a
+        type: shell
+        command: "true"
+"#;
+        let err = parse_workflow_str(yaml, p()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not currently support 'when'"),
+            "{err}"
+        );
+    }
+
+    /// Fix #4: `when:` on a group step should be rejected.
+    #[test]
+    fn rejects_when_on_group() {
+        let yaml = r#"
+id: g_when
+steps:
+  - id: g
+    type: group
+    on_failure: abort
+    when: "true"
+    steps:
+      - id: a
+        type: shell
+        command: "true"
+"#;
+        let err = parse_workflow_str(yaml, p()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not currently support 'when'"),
+            "{err}"
+        );
+    }
+
+    /// Fix #4: `when:` on a human step should be rejected.
+    #[test]
+    fn rejects_when_on_human() {
+        let yaml = r#"
+id: h_when
+steps:
+  - id: r
+    type: human
+    message: "decide"
+    options: [approve, reject]
+    when: "true"
+"#;
+        let err = parse_workflow_str(yaml, p()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not currently support 'when'"),
+            "{err}"
+        );
     }
 }

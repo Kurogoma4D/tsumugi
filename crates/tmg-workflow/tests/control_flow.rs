@@ -680,14 +680,184 @@ steps:
         .iter()
         .filter(|e| matches!(e, WorkflowProgress::LoopIteration { .. }))
         .count();
-    // Counter starts at 0; first attempt outside the loop -> 1, then
-    // first loop iter -> 2 (verify exits 0), so we expect exactly one
-    // LoopIteration event.
-    assert!(iters >= 1);
+    // Counter starts at 0; first attempt outside the loop -> 1
+    // (verify exits 1), then first loop iter -> 2 (verify exits 0),
+    // so we expect exactly one LoopIteration event.
+    assert_eq!(iters, 1);
     let counter_final: i32 = std::fs::read_to_string(&counter)
         .unwrap()
         .trim()
         .parse()
         .unwrap();
-    assert!(counter_final >= 2, "verify ran at least twice");
+    assert_eq!(counter_final, 2, "verify ran exactly twice");
+}
+
+// ---------------------------------------------------------------------
+// Regression tests for PR #64 review fixes
+// ---------------------------------------------------------------------
+
+/// Fix #1: every step (leaf or control-flow) must produce exactly one
+/// `StepStarted` event. Pre-fix, control-flow handlers double-emitted.
+#[tokio::test]
+async fn each_step_emits_exactly_one_step_started_event() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = build_engine(tmp.path(), 2);
+    // Workflow exercises every control-flow variant + a leaf so we
+    // catch a regression in any handler.
+    let yaml = r#"
+id: one_started_per_step
+steps:
+  - id: g
+    type: group
+    on_failure: abort
+    steps:
+      - id: in_group
+        type: write_file
+        path: "g.txt"
+        content: "g"
+  - id: br
+    type: branch
+    conditions:
+      - when: "true"
+        steps:
+          - id: in_branch
+            type: write_file
+            path: "br.txt"
+            content: "br"
+  - id: par
+    type: parallel
+    steps:
+      - id: in_par
+        type: write_file
+        path: "par.txt"
+        content: "par"
+  - id: lp
+    type: loop
+    max_iterations: 1
+    until: "true"
+    steps:
+      - id: in_loop
+        type: write_file
+        path: "lp.txt"
+        content: "lp"
+"#;
+    let wf = parse_workflow_str(yaml, "<inline>").unwrap();
+    let (tx, mut rx) = mpsc::channel(64);
+    engine.run(&wf, BTreeMap::new(), tx).await.unwrap();
+    let events = drain(&mut rx);
+
+    let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+    for ev in &events {
+        if let WorkflowProgress::StepStarted { step_id, .. } = ev {
+            *counts.entry(step_id.clone()).or_default() += 1;
+        }
+    }
+    for (id, n) in &counts {
+        assert_eq!(
+            *n, 1,
+            "step '{id}' emitted {n} StepStarted events; expected exactly 1"
+        );
+    }
+    // Sanity: every control-flow step we declared above is in there.
+    for expected in [
+        "g",
+        "br",
+        "par",
+        "lp",
+        "in_group",
+        "in_branch",
+        "in_par",
+        "in_loop[1]",
+    ] {
+        assert!(
+            counts.contains_key(expected),
+            "missing StepStarted for '{expected}' (got: {counts:?})"
+        );
+    }
+}
+
+/// Fix #5: when iteration N skips its inner leaf via `when=false`, the
+/// loop must NOT preserve iteration N-1's value under the bare id.
+/// Otherwise `until:` (which reads the bare id) would observe stale
+/// data and could exit early on a stale truthy result.
+///
+/// Strategy:
+/// - The loop's `until` is `steps.bump.exit_code == 0`.
+/// - `guard` (always-running shell) toggles each iteration based on a
+///   counter file: iter 1 exits 0; iter 2 exits 1 (so bump skips).
+/// - `bump`'s `when: steps.guard.exit_code == 0` controls whether the
+///   inner step runs.
+///
+/// Pre-fix behavior: iter 1 sets `bump` (bare-id mirror) to a
+/// successful exit code (0). Iter 2 skips bump but the bare-id mirror
+/// stays as iter 1's result. After iter 2 the loop's
+/// `until="steps.bump.exit_code == 0"` is **true** because of the
+/// stale mirror, so the loop exits early at iter 2 with `until` hit.
+///
+/// Post-fix: at the end of iter 2 we *clear* the bare-id mirror
+/// because no `bump[2]` was written. `until="steps.bump.exit_code == 0"`
+/// then errors-out (`steps.bump` missing), which surfaces as a
+/// `WorkflowError::StepFailed` with `until-expression error:` in the
+/// message. This is the visible signal we assert.
+///
+/// (A nicer post-fix UX would be to treat a missing id as falsy; we
+/// keep the existing strict semantics here to avoid silently masking
+/// typos. The test pins the actual current behaviour.)
+#[tokio::test]
+async fn loop_skipped_inner_clears_bare_id_mirror() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = build_engine(tmp.path(), 2);
+    let counter = tmp.path().join("loop_skip_counter");
+    std::fs::write(&counter, "0").unwrap();
+    let counter_path = counter.to_string_lossy().to_string();
+    // The `until` requires BOTH bump.exit_code == 0 AND
+    // guard.exit_code != 0. Iter 1: guard exit 0 -> until false.
+    // Iter 2: guard exit 1, bump skipped. Pre-fix: stale bare-id
+    // mirror keeps bump.exit_code == 0, until evaluates true and the
+    // loop exits cleanly. Post-fix: mirror is cleared, until errors,
+    // and the engine returns Err.
+    let yaml = format!(
+        r#"
+id: skip_clears_mirror
+steps:
+  - id: lp
+    type: loop
+    max_iterations: 3
+    until: "steps.bump.exit_code == 0 && steps.guard.exit_code != 0"
+    steps:
+      - id: guard
+        type: shell
+        command: |
+          n=$(cat {counter_path})
+          n=$((n+1))
+          echo $n > {counter_path}
+          if [ $n -ge 2 ]; then exit 1; else exit 0; fi
+      - id: bump
+        type: shell
+        when: "steps.guard.exit_code == 0"
+        command: "true"
+"#
+    );
+    let wf = parse_workflow_str(&yaml, "<inline>").unwrap();
+    let (tx, mut rx) = mpsc::channel(64);
+    let res = engine.run(&wf, BTreeMap::new(), tx).await;
+    let _ = drain(&mut rx);
+
+    // Pre-fix: iter 1 runs guard (exit 0) and bump (exit 0). bare-id
+    // mirror has bump.exit_code=0. until evaluates: 0==0 (true) &&
+    // 0!=0 (false) -> false. Iter 2: guard exits 1; bump skipped.
+    // Pre-fix bare-id mirror still says exit_code=0. until: 0==0
+    // (true) && 1!=0 (true) -> true. Loop exits at iter 2 with `Ok`.
+    //
+    // Post-fix: iter 2 clears the bump bare-id mirror. until errors
+    // because `steps.bump` is missing. The loop returns Err.
+    //
+    // We assert post-fix behaviour: the run errored with an
+    // until-expression error mentioning bump.
+    let err = res.expect_err("post-fix #5: until must error on missing bump after skipped iter 2");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("until-expression") && msg.contains("bump"),
+        "expected an until-expression error referencing 'bump', got: {msg}"
+    );
 }

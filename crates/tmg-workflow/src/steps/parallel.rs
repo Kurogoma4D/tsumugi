@@ -31,7 +31,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::json;
-use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -61,13 +60,9 @@ pub(crate) async fn execute(
         });
     };
 
-    let _ = ctx
-        .progress_tx
-        .send(WorkflowProgress::StepStarted {
-            step_id: id.clone(),
-            step_type: "parallel",
-        })
-        .await;
+    // NOTE: `StepStarted` is emitted by `engine::dispatch_step_inner`
+    // for every step before delegating to the per-type handler;
+    // emitting it again here would deliver duplicates.
 
     let cancel = CancellationToken::new();
     let mut joinset: JoinSet<ChildJoin> = JoinSet::new();
@@ -84,9 +79,11 @@ pub(crate) async fn execute(
         let child_id = child.id().to_owned();
         joinset.spawn(async move {
             // Each child gets a private mutable map seeded from the
-            // baseline. Mutex lets us pass `&mut` into dispatch_step
-            // without lifetime contortions.
-            let local = Mutex::new((*baseline_clone).clone());
+            // baseline. Owned by the spawned task so we can pass
+            // `&mut local` straight into `dispatch_step` without a
+            // lock — no lock is needed because no other task touches
+            // this map.
+            let mut local = (*baseline_clone).clone();
             let result = tokio::select! {
                 biased;
                 () = cancel_clone.cancelled() => {
@@ -95,20 +92,18 @@ pub(crate) async fn execute(
                         message: "cancelled by sibling failure".to_owned(),
                     })
                 }
-                outcome = async {
-                    let mut guard = local.lock().await;
-                    dispatch_step(&ctx_clone, &child_clone, &mut guard).await
-                } => {
+                outcome = dispatch_step(&ctx_clone, &child_clone, &mut local) => {
                     outcome.map(|_| ())
                 }
             };
-            let map = local.into_inner();
-            (child_id, result.map(|()| map))
+            (child_id, result.map(|()| local))
         });
     }
 
     // Drain the join set, collecting per-child maps. On first failure
-    // fire the cancellation token and propagate.
+    // fire the cancellation token and explicitly `shutdown().await` the
+    // join set so remaining children are aborted promptly (rather than
+    // waiting for them to observe the cancel token).
     let mut child_maps: Vec<(String, BTreeMap<String, StepResult>)> =
         Vec::with_capacity(body.len());
     let mut first_error: Option<WorkflowError> = None;
@@ -119,6 +114,7 @@ pub(crate) async fn execute(
                 if first_error.is_none() {
                     first_error = Some(err);
                     cancel.cancel();
+                    joinset.shutdown().await;
                 }
                 tracing::debug!(child_id, "parallel child failed; siblings cancelled");
             }
@@ -129,6 +125,7 @@ pub(crate) async fn execute(
                         message: format!("parallel child task panicked: {join_err}"),
                     });
                     cancel.cancel();
+                    joinset.shutdown().await;
                 }
             }
         }
