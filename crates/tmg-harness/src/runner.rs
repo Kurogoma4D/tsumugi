@@ -24,7 +24,6 @@
 //! Workflow integration and escalation are out of scope for this issue
 //! and tracked separately.
 
-use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,6 +86,50 @@ pub type RunProgressReceiver = mpsc::Receiver<RunProgressEvent>;
 /// (`30m`); used as a fallback when the runner has not been
 /// configured with a value from `tsumugi.toml`.
 pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Marker substring written by [`RunRunner::escalate_to_harnessed`]
+/// into `progress.md` when promoting a run.
+///
+/// Used by the runner's own retry path to detect an existing upgrade
+/// block and skip a second append; the literal string is stable across
+/// versions because the SPEC §9.3 wording is part of the on-disk
+/// contract.
+const SCOPE_UPGRADE_MARKER: &str = "[SCOPE UPGRADE]";
+
+/// RAII guard that resets [`RunRunner::escalation_in_progress`] back
+/// to `false` on drop unless [`Self::disarm`] has been called.
+///
+/// The escalation path takes the gate via CAS, then constructs a
+/// guard pointing at the same atomic. Any early return — including
+/// `?` propagation on an I/O error — drops the guard and clears the
+/// flag, so a partial failure does not permanently lock out future
+/// retries. Only the explicit `disarm` call after the run has been
+/// durably promoted leaves the flag set, which then short-circuits
+/// future calls via the `is_ad_hoc()` check.
+struct EscalationGuard<'a> {
+    flag: &'a AtomicBool,
+    armed: bool,
+}
+
+impl<'a> EscalationGuard<'a> {
+    fn new(flag: &'a AtomicBool) -> Self {
+        Self { flag, armed: true }
+    }
+
+    /// Mark the guard as consumed: drop becomes a no-op so the
+    /// underlying flag stays set.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for EscalationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(false, Ordering::SeqCst);
+        }
+    }
+}
 
 /// Run runner wrapping a [`Run`] plus its artifacts.
 ///
@@ -154,6 +197,14 @@ pub struct RunRunner {
     /// SPEC §9.3 expects exactly one promotion per run; this atomic
     /// gate enforces that contract independently of the higher-level
     /// `Arc<Mutex<RunRunner>>` that wraps the runner.
+    ///
+    /// Failure-safety: a partial failure (any `?` early-return inside
+    /// `escalate_to_harnessed` before the promotion has been durably
+    /// committed) clears the flag back to `false` via the
+    /// [`EscalationGuard`] RAII guard, so a subsequent retry can
+    /// re-take the gate. The flag stays `true` only after a
+    /// successful upgrade has flipped `run.scope` to
+    /// [`RunScope::Harnessed`].
     escalation_in_progress: AtomicBool,
 }
 
@@ -427,13 +478,20 @@ impl RunRunner {
 
     /// Subscribe to [`RunProgressEvent`]s from this runner.
     ///
-    /// Lazily allocates the underlying `mpsc::channel`; the first
-    /// caller wins, subsequent calls return a fresh receiver while
-    /// the runner keeps publishing on the same sender. (Practically
-    /// only one consumer subscribes — the TUI banner pipeline — so
-    /// re-subscribing is a config error rather than a supported
-    /// case.)
+    /// Allocates a fresh `mpsc::channel` and **replaces** the active
+    /// sender on each call: the previous receiver, if any, will see
+    /// the channel close on its next `recv()` because the old sender
+    /// is dropped. Only one consumer is supported at a time
+    /// (practically only the TUI banner pipeline subscribes); a
+    /// `tracing::warn!` is emitted when an existing channel is being
+    /// replaced so the operator can investigate stray re-subscribes.
     pub fn progress_channel(&mut self) -> RunProgressReceiver {
+        if self.progress_tx.is_some() {
+            tracing::warn!(
+                "RunRunner::progress_channel called while a channel is already active; \
+                 replacing the sender — the previous receiver will see the channel close",
+            );
+        }
         let (tx, rx) = mpsc::channel(RUN_PROGRESS_CHANNEL_CAPACITY);
         self.progress_tx = Some(tx);
         rx
@@ -480,11 +538,21 @@ impl RunRunner {
     ///   defensive).
     ///
     /// **Atomicity:** the gate at [`Self::escalation_in_progress`]
-    /// prevents double-promotion when two escalation evaluations
-    /// fire in quick succession. The first caller takes the gate,
-    /// drives the flow, and on success leaves the gate set. The
-    /// second caller observes the existing harnessed scope and
-    /// returns `Ok(false)`.
+    /// prevents double-promotion. The flag is held by an RAII guard
+    /// that automatically clears it on any early-return path
+    /// (including `?` propagation), so a partial failure does **not**
+    /// permanently lock out subsequent retries. The flag becomes
+    /// "permanently consumed" only after
+    /// [`RunStore::upgrade_to_harnessed`] has succeeded **and**
+    /// `run.scope` has flipped to [`RunScope::Harnessed`]; from that
+    /// point on the guard is disarmed and any future call short-
+    /// circuits via the `is_ad_hoc()` check.
+    ///
+    /// **Idempotency:** the `[SCOPE UPGRADE]` block in `progress.md`
+    /// is only appended when the file does not already contain the
+    /// marker. A retry after a partial first attempt that managed to
+    /// append the block but errored on a later step will not double-
+    /// write it.
     ///
     /// Returns `Ok(true)` when the runner was promoted, `Ok(false)`
     /// when no action was needed, or an error when the I/O fails.
@@ -500,11 +568,15 @@ impl RunRunner {
         init_script: &str,
         decision: &EscalationDecision,
     ) -> Result<bool, HarnessError> {
-        // Gate: bail if another escalation is already in flight or has
-        // already completed. The CAS pattern is sufficient because the
-        // RunRunner sits behind an `Arc<Mutex<...>>` in production —
-        // the gate's job is to handle the rare double-call from the
-        // higher-level evaluator, not to be the primary lock.
+        // Gate: take the in-progress flag via CAS. The CAS pattern is
+        // sufficient because the RunRunner sits behind an
+        // `Arc<Mutex<...>>` in production — the gate's job is to
+        // handle the rare double-call from the higher-level
+        // evaluator, not to be the primary lock.
+        //
+        // The guard wraps the flag so that any early `?` return below
+        // resets it; only an explicit `disarm()` after the promotion
+        // is durably committed leaves the flag set.
         if self
             .escalation_in_progress
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -513,6 +585,7 @@ impl RunRunner {
             tracing::info!("auto-promotion already in progress / completed; skipping");
             return Ok(false);
         }
+        let mut guard = EscalationGuard::new(&self.escalation_in_progress);
 
         let EscalationDecision::Escalate {
             reason,
@@ -520,13 +593,15 @@ impl RunRunner {
         } = decision
         else {
             // Defensive: a Skip decision should never reach here.
-            self.escalation_in_progress.store(false, Ordering::SeqCst);
+            // Guard auto-resets on drop.
             return Ok(false);
         };
 
         if !self.run.scope.is_ad_hoc() {
             tracing::info!("run already harnessed; skipping auto-promotion");
-            // Leave the gate set so subsequent calls also short-circuit.
+            // Disarm: a previous successful promotion already flipped
+            // the scope, so the gate must remain "consumed".
+            guard.disarm();
             return Ok(false);
         }
 
@@ -536,6 +611,12 @@ impl RunRunner {
         // wants the runner itself to spawn the Initializer, that
         // wiring stays in `tmg-cli` so the runner remains
         // synchronous and crate-boundary clean.
+        //
+        // These writes are deliberately performed before the
+        // [`RunStore::upgrade_to_harnessed`] call. If the upgrade
+        // fails, the on-disk artifacts are simply re-written on the
+        // next retry — `std::fs::write` truncates so there is no
+        // partial-state hazard.
         let features_path = self.features.path().to_path_buf();
         let init_path = self.init_script.path().to_path_buf();
         if let Some(parent) = features_path.parent() {
@@ -558,47 +639,48 @@ impl RunRunner {
 
         // Step 2: flip `run.toml` to the harnessed scope, recording
         // upgrade metadata so a later resume can attribute the
-        // promotion correctly.
+        // promotion correctly. Once this succeeds the run is durably
+        // promoted; a guard reset after this point would re-allow a
+        // (now no-op) retry, but the rest of the work below is also
+        // idempotent so we keep the simple "guard stays armed until
+        // we explicitly disarm at end-of-function" shape.
         let upgraded_run =
             self.store
                 .upgrade_to_harnessed(&self.run.id, self.run.session_count, reason)?;
         self.run = upgraded_run;
         self.session_state.set_scope(self.run.scope.clone());
 
-        // Step 3: append the SPEC §9.3 marker to progress.md.
-        let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-        let count_label = estimated_features
-            .map(|n| format!("estimated_features={n}"))
-            .unwrap_or_else(|| "estimated_features=?".to_owned());
-        let upgrade_block = format!(
-            "\n## Session #{n} ({ts}) [SCOPE UPGRADE]\n\
-             - reason: {reason}\n\
-             - {count_label}\n",
-            n = self.run.session_count,
-            ts = timestamp,
-            reason = reason,
-            count_label = count_label,
-        );
-        // We use the path-level `OpenOptions::append` shape because
-        // `ProgressLog`'s public API does not yet have a generic
-        // multi-line append. This keeps the change minimal; a future
-        // refactor could move the helper into ProgressLog itself.
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(self.progress.path())
-            .map_err(|e| HarnessError::io(self.progress.path(), e))?;
-        file.write_all(upgrade_block.as_bytes())
-            .map_err(|e| HarnessError::io(self.progress.path(), e))?;
-        file.flush()
-            .map_err(|e| HarnessError::io(self.progress.path(), e))?;
+        // Step 3: append the SPEC §9.3 marker to progress.md, but only
+        // when no marker is already present. A retry after a partial
+        // first attempt will skip the append.
+        let already_marked = self.progress.read_all()?.contains(SCOPE_UPGRADE_MARKER);
+        if !already_marked {
+            let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+            let count_label = estimated_features
+                .map(|n| format!("estimated_features={n}"))
+                .unwrap_or_else(|| "estimated_features=?".to_owned());
+            let upgrade_block = format!(
+                "\n## Session #{n} ({ts}) [SCOPE UPGRADE]\n\
+                 - reason: {reason}\n\
+                 - {count_label}\n",
+                n = self.run.session_count,
+                ts = timestamp,
+                reason = reason,
+                count_label = count_label,
+            );
+            self.progress.append_raw_block(&upgrade_block)?;
 
-        // Step 4: emit the TUI-facing event. Banner UI is out of scope
-        // (#46), but the event channel is wired now so a consumer can
-        // subscribe via `progress_channel()`.
-        self.publish_progress(RunProgressEvent::ScopeUpgraded {
-            features_count: *estimated_features,
-        });
+            // Step 4: emit the TUI-facing event. Banner UI is out of
+            // scope (#46), but the event channel is wired now so a
+            // consumer can subscribe via `progress_channel()`.
+            //
+            // Publishing is gated on `!already_marked` so a retry
+            // after a partial success does not re-emit the event to
+            // any consumer that may have already observed it.
+            self.publish_progress(RunProgressEvent::ScopeUpgraded {
+                features_count: *estimated_features,
+            });
+        }
 
         // Step 5 (caller-side): re-register the harnessed-only tools
         // onto the live ToolRegistry. The runner does not hold the
@@ -610,9 +692,11 @@ impl RunRunner {
         // immediately re-trigger.
         self.session_state.reset_after_promotion();
 
-        // Leave `escalation_in_progress = true` permanently so a
-        // racing second call observes "already harnessed" and bails
-        // with `Ok(false)`. There is exactly one promotion per run.
+        // Disarm: leave `escalation_in_progress = true` permanently
+        // so a racing second call short-circuits via the
+        // `is_ad_hoc()` check above. There is exactly one promotion
+        // per run.
+        guard.disarm();
         Ok(true)
     }
 
@@ -914,10 +998,9 @@ mod tests {
         // Mock launcher returning a positive verdict; the evaluator
         // parses it and we feed the resulting decision into
         // `escalate_to_harnessed`.
-        let launcher = StdArc::new(MockLauncher {
-            response: r#"{"escalate":true,"reason":"large refactor","estimated_features":42}"#
-                .to_owned(),
-        });
+        let launcher = StdArc::new(MockLauncher::with_response(
+            r#"{"escalate":true,"reason":"large refactor","estimated_features":42}"#,
+        ));
         let evaluator = EscalationEvaluator::new(EscalationConfig::default(), Some(launcher));
 
         let decision = evaluator
@@ -958,5 +1041,115 @@ mod tests {
         assert!(provider.register_run_tool(&mut registry, "feature_list_mark_passing"));
         assert!(registry.get("feature_list_read").is_some());
         assert!(registry.get("feature_list_mark_passing").is_some());
+    }
+
+    /// Partial-failure idempotency: when
+    /// [`RunStore::upgrade_to_harnessed`] errors mid-call (here we
+    /// simulate by deleting the on-disk `run.toml` so `load` fails
+    /// with `RunNotFound`), the gate flag must reset so a subsequent
+    /// retry — once the underlying issue is fixed — can complete the
+    /// promotion.
+    #[test]
+    fn escalate_resets_gate_on_upgrade_failure_and_retries_succeed() {
+        let (_tmp, mut runner) = make_runner();
+        let decision = EscalationDecision::Escalate {
+            reason: "broken disk".to_owned(),
+            estimated_features: Some(3),
+        };
+
+        // Sabotage the on-disk run.toml so `upgrade_to_harnessed`
+        // errors with `RunNotFound`. The artifacts (`features.json` /
+        // `init.sh`) will already be written by the time the failure
+        // happens; that is fine — the retry below truncates them.
+        let store = Arc::clone(&runner.store);
+        let run_id = runner.run().id.clone();
+        let run_toml_path = store.run_file(&run_id);
+        std::fs::remove_file(&run_toml_path).unwrap_or_else(|e| panic!("{e}"));
+
+        // First call must error and leave the runner in its original
+        // ad-hoc state.
+        let err = match runner.escalate_to_harnessed("{\"features\":[]}", "#!/bin/sh\n", &decision)
+        {
+            Err(e) => e,
+            Ok(promoted) => {
+                panic!("upgrade_to_harnessed should fail without run.toml; got Ok({promoted})",)
+            }
+        };
+        assert!(
+            matches!(err, HarnessError::RunNotFound { .. }),
+            "expected RunNotFound, got {err:?}",
+        );
+        assert!(
+            runner.run().scope.is_ad_hoc(),
+            "scope must remain ad-hoc after a failed upgrade",
+        );
+        assert!(
+            !runner.escalation_in_progress.load(Ordering::SeqCst),
+            "gate must reset on upgrade failure so a retry is possible",
+        );
+
+        // Restore run.toml and retry.
+        store.save(runner.run()).unwrap_or_else(|e| panic!("{e}"));
+        let promoted = runner
+            .escalate_to_harnessed("{\"features\":[]}", "#!/bin/sh\n", &decision)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(promoted, "retry must complete the promotion");
+        assert!(matches!(runner.run().scope, RunScope::Harnessed { .. }));
+
+        // The on-disk progress.md carries exactly one [SCOPE UPGRADE]
+        // block — the retry's idempotency check must have suppressed
+        // a second append even if the first call had reached step 3
+        // (which it did not in this scenario, but the assertion still
+        // documents the contract).
+        let progress =
+            std::fs::read_to_string(runner.progress_log().path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            progress.matches(SCOPE_UPGRADE_MARKER).count(),
+            1,
+            "[SCOPE UPGRADE] must appear exactly once: {progress}",
+        );
+    }
+
+    /// Idempotency variant: pre-seed an existing `[SCOPE UPGRADE]`
+    /// block in `progress.md` (simulating a partial first attempt
+    /// that wrote the marker before erroring elsewhere) and confirm a
+    /// fresh `escalate_to_harnessed` call does **not** double-write
+    /// the block.
+    #[test]
+    fn escalate_does_not_double_write_existing_scope_upgrade_block() {
+        let (_tmp, mut runner) = make_runner();
+        // Pre-write a fake upgrade block so the runner's idempotency
+        // check trips.
+        let path = runner.progress_log().path().to_owned();
+        let preexisting = "\n## Session #1 (2025-01-01T00:00:00Z) [SCOPE UPGRADE]\n\
+             - reason: prior\n\
+             - estimated_features=?\n";
+        std::fs::write(&path, format!("# Progress Log\n{preexisting}"))
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let decision = EscalationDecision::Escalate {
+            reason: "second attempt".to_owned(),
+            estimated_features: Some(99),
+        };
+        let promoted = runner
+            .escalate_to_harnessed("{\"features\":[]}", "#!/bin/sh\n", &decision)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(promoted, "promotion still completes");
+        assert!(matches!(runner.run().scope, RunScope::Harnessed { .. }));
+
+        let progress = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            progress.matches(SCOPE_UPGRADE_MARKER).count(),
+            1,
+            "[SCOPE UPGRADE] must remain a single block: {progress}",
+        );
+        assert!(
+            progress.contains("reason: prior"),
+            "preexisting block must be preserved verbatim: {progress}",
+        );
+        assert!(
+            !progress.contains("reason: second attempt"),
+            "second-attempt block must NOT be appended: {progress}",
+        );
     }
 }

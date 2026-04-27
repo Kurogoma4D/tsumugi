@@ -831,6 +831,22 @@ pub struct HarnessConfig {
     /// (SPEC §9.10 / §10.1, issue #37). The validated
     /// [`tmg_harness::EscalationConfig`] enforces non-zero thresholds
     /// and `0.0 < context_pressure_threshold <= 1.0`.
+    ///
+    /// **Round-trip limitation:** this field is marked
+    /// `#[serde(default, skip)]` because
+    /// [`tmg_harness::EscalationConfig`] does not implement
+    /// `Serialize` / `Deserialize` directly — its construction goes
+    /// through `PartialEscalationGateConfig::into_final` for
+    /// validation. Consequently, **a fully-resolved `HarnessConfig`
+    /// cannot be serialized back to TOML without silently dropping
+    /// the user's `[harness.escalation]` thresholds.** This is
+    /// load-only today; any future feature that needs to round-trip
+    /// the resolved config (e.g. `tmg config show` rendering the
+    /// effective config) must derive `Serialize` / `Deserialize` on
+    /// `tmg_harness::EscalationConfig` and remove this `skip`.
+    ///
+    /// TODO: add `Serialize` / `Deserialize` to
+    /// `tmg_harness::EscalationConfig` once `tmg config show` lands.
     #[serde(default, skip)]
     pub escalation: tmg_harness::EscalationConfig,
 }

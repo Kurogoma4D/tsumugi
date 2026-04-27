@@ -12,9 +12,12 @@
 //! the goal is precision rather than recall, since the escalator
 //! subagent has the final say.
 //!
-//! ASCII keywords are matched case-insensitively. Japanese keywords are
-//! matched verbatim (Japanese has no case distinction, and our
-//! dictionary entries do not vary by script form).
+//! ASCII keywords are matched case-insensitively. Mixed
+//! Japanese-with-ASCII-prefix keywords (e.g. `OAuth対応`) are matched
+//! against the ASCII-folded haystack: `to_ascii_lowercase` leaves
+//! Japanese codepoints untouched but normalises the ASCII prefix, so a
+//! user typing `oauth対応` still matches `OAuth対応`. The dictionary
+//! itself is stored verbatim — only the haystack is folded.
 
 /// Bilingual scale-indicating phrases. Each entry is one keyword; a
 /// match counts toward the two-hit threshold.
@@ -76,19 +79,22 @@ pub fn detect_size_signal(user_message: &str) -> bool {
         return false;
     }
 
-    // ASCII-fold once for cheap case-insensitive matching of English
-    // keywords. Japanese characters pass through unchanged because
-    // `to_ascii_lowercase` only touches ASCII codepoints.
+    // ASCII-fold once for cheap case-insensitive matching. Japanese
+    // characters pass through `to_ascii_lowercase` unchanged because
+    // it only touches ASCII codepoints, so folding is also safe to
+    // use against mixed Japanese-with-ASCII-prefix keywords like
+    // `OAuth対応`.
     let folded = user_message.to_ascii_lowercase();
 
     let mut hits = 0_u32;
     for keyword in KEYWORDS {
-        let matches = if keyword.is_ascii() {
-            folded.contains(&keyword.to_ascii_lowercase())
-        } else {
-            user_message.contains(keyword)
-        };
-        if matches {
+        // Fold the keyword too so the comparison is symmetric. ASCII
+        // entries become lowercase; Japanese codepoints are
+        // unchanged. This makes `oauth対応` match the dictionary's
+        // `OAuth対応` entry while leaving pure-Japanese entries like
+        // `アプリ全体` unaffected.
+        let folded_keyword = keyword.to_ascii_lowercase();
+        if folded.contains(&folded_keyword) {
             hits = hits.saturating_add(1);
             if hits >= 2 {
                 return true;
@@ -154,5 +160,19 @@ mod tests {
         assert!(!detect_size_signal("hi"));
         assert!(!detect_size_signal("fix the typo"));
         assert!(!detect_size_signal("rename the variable"));
+    }
+
+    /// Japanese-with-ASCII-prefix keywords (`OAuth対応`) are matched
+    /// case-insensitively on their ASCII portion: a user typing
+    /// `oauth対応` (lowercase ASCII prefix) plus another keyword must
+    /// fire the size signal.
+    #[test]
+    fn mixed_prefix_keyword_is_case_insensitive_on_ascii_portion() {
+        // `oauth対応` (lowercase ASCII) + `アプリ全体` → 2 hits.
+        assert!(detect_size_signal("oauth対応 と アプリ全体 をやりたい"));
+        // Sanity: the original casing still matches.
+        assert!(detect_size_signal("OAuth対応 と アプリ全体 をやりたい"));
+        // Single keyword still does not fire even with case-insensitivity.
+        assert!(!detect_size_signal("oauth対応 だけ"));
     }
 }

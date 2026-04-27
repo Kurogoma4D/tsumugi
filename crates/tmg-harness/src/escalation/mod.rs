@@ -423,10 +423,9 @@ mod tests {
     /// and `estimated_features` through unchanged.
     #[tokio::test]
     async fn evaluate_escalate_branch() {
-        let launcher = Arc::new(launcher::testing::MockLauncher {
-            response: r#"{"escalate":true,"reason":"spans crates","estimated_features":36}"#
-                .to_owned(),
-        });
+        let launcher = Arc::new(launcher::testing::MockLauncher::with_response(
+            r#"{"escalate":true,"reason":"spans crates","estimated_features":36}"#,
+        ));
         let evaluator = EscalationEvaluator::new(cfg(), Some(launcher));
 
         let decision = evaluator
@@ -447,9 +446,9 @@ mod tests {
 
     #[tokio::test]
     async fn evaluate_skip_branch() {
-        let launcher = Arc::new(launcher::testing::MockLauncher {
-            response: r#"{"escalate":false,"reason":"too small"}"#.to_owned(),
-        });
+        let launcher = Arc::new(launcher::testing::MockLauncher::with_response(
+            r#"{"escalate":false,"reason":"too small"}"#,
+        ));
         let evaluator = EscalationEvaluator::new(cfg(), Some(launcher));
 
         let decision = evaluator
@@ -466,9 +465,9 @@ mod tests {
     /// tested separately.)
     #[tokio::test]
     async fn concurrent_evaluations_independent() {
-        let launcher = Arc::new(launcher::testing::MockLauncher {
-            response: r#"{"escalate":false,"reason":"ok"}"#.to_owned(),
-        });
+        let launcher = Arc::new(launcher::testing::MockLauncher::with_response(
+            r#"{"escalate":false,"reason":"ok"}"#,
+        ));
         let evaluator = Arc::new(EscalationEvaluator::new(cfg(), Some(launcher)));
 
         let e1 = Arc::clone(&evaluator);

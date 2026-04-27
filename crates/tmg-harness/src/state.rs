@@ -14,7 +14,6 @@
 //! [`AgentLoop::turn`]: tmg_core::AgentLoop::turn
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use crate::run::RunScope;
 
@@ -173,21 +172,20 @@ impl SessionState {
 
     /// Reset the per-turn signals after an auto-promotion succeeds so
     /// the same conditions do not immediately re-trigger.
+    ///
+    /// The [`Self::last_user_message`] tracker is also cleared so that
+    /// the first post-promotion turn starts a fresh workflow-loop
+    /// streak rather than inheriting the pre-promotion prompt's
+    /// counter.
     pub fn reset_after_promotion(&mut self) {
         self.last_user_input_size_signal = false;
         self.workflow_loop_count = 0;
         self.same_file_edit_count = 0;
         self.session_diff_lines = 0;
         self.file_edits.clear();
+        self.last_user_message.clear();
     }
 }
-
-/// Type-erased turn observer installed on [`AgentLoop`] via
-/// [`AgentLoop::set_turn_observer`].
-///
-/// [`AgentLoop`]: tmg_core::AgentLoop
-/// [`AgentLoop::set_turn_observer`]: tmg_core::AgentLoop::set_turn_observer
-pub type TurnObserver = Arc<dyn Fn(&TurnSummary) + Send + Sync>;
 
 #[cfg(test)]
 mod tests {
@@ -299,5 +297,32 @@ mod tests {
         assert_eq!(state.session_diff_lines, 0);
         assert_eq!(state.workflow_loop_count, 0);
         assert_eq!(state.same_file_edit_count, 0);
+    }
+
+    /// Post-promotion observation must start cleanly: the
+    /// `last_user_message` tracker is cleared so the first turn after
+    /// promotion does NOT count as a repeat of the pre-promotion
+    /// prompt.
+    #[test]
+    fn reset_after_promotion_clears_last_user_message_tracker() {
+        let mut state = SessionState::new(RunScope::AdHoc);
+        let prompt = TurnSummary {
+            user_message: "rebuild everything".to_owned(),
+            ..Default::default()
+        };
+        state.observe(&prompt, 1000);
+        state.observe(&prompt, 1000);
+        assert_eq!(state.workflow_loop_count, 2);
+
+        state.reset_after_promotion();
+
+        // The same prompt arrives again post-promotion — the loop
+        // counter must reset to 1, not 3, because the tracker was
+        // cleared.
+        state.observe(&prompt, 1000);
+        assert_eq!(
+            state.workflow_loop_count, 1,
+            "post-promotion observation must start a fresh streak",
+        );
     }
 }

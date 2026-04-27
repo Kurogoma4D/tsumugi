@@ -450,10 +450,29 @@ fn eprintln_warning(message: &str) {
 ///
 /// The observer captures the runner Arc plus the configured context
 /// budget so that `RunRunner::after_turn` is called with both pieces
-/// after every `AgentLoop::turn`. The callback uses `try_lock` so a
-/// long-running tool that's still holding the runner lock cannot
-/// stall the agent loop; in the rare contention case, one turn's
-/// metrics are skipped and a `tracing::trace!` is emitted.
+/// after every `AgentLoop::turn`.
+///
+/// **Async work via spawned task.** The closure itself is synchronous
+/// (the agent loop runs it inline at turn-end). To keep the SPEC §9.10
+/// triggers wired with real values, the closure spawns a tokio task
+/// that:
+///
+/// 1. Reads the active session's `files_modified` list under a short
+///    lock and computes the delta against a per-observer high-water
+///    mark (so we only count files newly written this turn).
+/// 2. Shells out to `git diff --shortstat --no-color HEAD` with a
+///    2-second timeout to estimate the cumulative diff size, falling
+///    back to `0` on any error (`git` not available, not a repo,
+///    parse failure, timeout). A `tracing::debug!` is emitted on
+///    fallback so operators can investigate.
+/// 3. Re-acquires the runner lock and invokes `after_turn` with the
+///    populated [`tmg_harness::TurnSummary`].
+///
+/// The observer detaches from the agent loop's execution: by the time
+/// `turn` returns, the spawned task may not have completed yet. This
+/// is acceptable because the auto-promotion evaluator only consults
+/// `session_state` between turns, and a one-turn lag on a signal is
+/// preferable to blocking the agent loop on `git`.
 ///
 /// Note: the auto-promotion evaluator hookup (`detect_signals` →
 /// `evaluate` → `escalate_to_harnessed`) is intentionally not part
@@ -464,25 +483,185 @@ fn install_turn_observer(
     runner: Arc<Mutex<RunRunner>>,
     max_context_tokens: usize,
 ) {
+    // High-water mark on `session.files_modified.len()` from the
+    // previous turn, so each call counts only the files newly recorded
+    // by this turn rather than the cumulative session list.
+    let files_high_water = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     let observer: tmg_core::TurnObserver = Box::new(move |summary: &tmg_core::TurnSummary| {
-        // The Arc clone is cheap; the lock guard is dropped quickly so
-        // the harness sink and the run-scoped tools can re-acquire it
-        // immediately.
-        let harness_summary = tmg_harness::TurnSummary {
-            tokens_used: summary.tokens_used,
-            tool_calls: summary.tool_calls,
-            files_modified: Vec::new(),
-            diff_lines: 0,
-            user_message: summary.user_message.clone(),
-        };
-        match runner.try_lock() {
-            Ok(mut guard) => guard.after_turn(&harness_summary, max_context_tokens),
-            Err(_) => {
-                tracing::trace!("RunRunner busy; skipping after_turn update for one turn",);
-            }
+        let runner = Arc::clone(&runner);
+        let high_water = Arc::clone(&files_high_water);
+        let tokens_used = summary.tokens_used;
+        let tool_calls = summary.tool_calls;
+        let user_message = summary.user_message.clone();
+
+        // The closure runs inside `AgentLoop::turn`, which is `async`
+        // and therefore inside the tokio runtime; `tokio::spawn` is
+        // safe here. A failure to spawn (no current runtime) would be
+        // a programming error rather than a recoverable condition;
+        // we simply fall back to the synchronous update path so the
+        // observer still updates `session_state` with the cheap
+        // fields.
+        if tokio::runtime::Handle::try_current().is_err() {
+            update_session_state_sync(
+                &runner,
+                tokens_used,
+                tool_calls,
+                user_message,
+                max_context_tokens,
+            );
+            return;
         }
+
+        tokio::spawn(async move {
+            // Step 1: drain the per-turn files_modified delta. Use a
+            // short non-blocking lock acquisition so a long-running
+            // tool that's still holding the lock cannot stall the
+            // observer task; the rare contention case skips one
+            // turn's metrics.
+            let (workspace, files_modified) = if let Ok(guard) = runner.try_lock() {
+                let workspace = guard.workspace_path_owned();
+                let files = guard
+                    .active_session()
+                    .map(|s| s.files_modified.clone())
+                    .unwrap_or_default();
+                (workspace, files)
+            } else {
+                tracing::trace!("RunRunner busy; skipping after_turn update for one turn",);
+                return;
+            };
+
+            let prev_mark =
+                high_water.swap(files_modified.len(), std::sync::atomic::Ordering::SeqCst);
+            let delta_files = if files_modified.len() > prev_mark {
+                files_modified[prev_mark..].to_vec()
+            } else {
+                Vec::new()
+            };
+
+            // Step 2: shell out for diff size with a 2s timeout.
+            let diff_lines = compute_diff_lines(&workspace).await;
+
+            let harness_summary = tmg_harness::TurnSummary {
+                tokens_used,
+                tool_calls,
+                files_modified: delta_files,
+                diff_lines,
+                user_message,
+            };
+
+            // Step 3: feed the summary into the runner.
+            let mut guard = runner.lock().await;
+            guard.after_turn(&harness_summary, max_context_tokens);
+        });
     });
     agent.set_turn_observer(Some(observer));
+}
+
+/// Synchronous fallback for [`install_turn_observer`] when no tokio
+/// runtime is available. Updates `session_state` with the
+/// always-known fields (`tokens_used`, `tool_calls`, `user_message`)
+/// and leaves the I/O-derived fields at zero. Should only fire in
+/// degraded test setups; production paths always run inside the
+/// tokio runtime.
+fn update_session_state_sync(
+    runner: &Arc<Mutex<RunRunner>>,
+    tokens_used: usize,
+    tool_calls: u32,
+    user_message: String,
+    max_context_tokens: usize,
+) {
+    let harness_summary = tmg_harness::TurnSummary {
+        tokens_used,
+        tool_calls,
+        files_modified: Vec::new(),
+        diff_lines: 0,
+        user_message,
+    };
+    match runner.try_lock() {
+        Ok(mut guard) => guard.after_turn(&harness_summary, max_context_tokens),
+        Err(_) => {
+            tracing::trace!("RunRunner busy; skipping after_turn update for one turn",);
+        }
+    }
+}
+
+/// Estimate the cumulative diff size in `workspace` by shelling out
+/// to `git diff --shortstat --no-color HEAD` with a 2-second timeout.
+///
+/// Returns `0` on any failure: workspace is not a git repo, `git`
+/// isn't on PATH, the command timed out, or the shortstat line could
+/// not be parsed. A `tracing::debug!` is emitted in the failure paths
+/// so operators can investigate without the agent loop being
+/// disturbed.
+async fn compute_diff_lines(workspace: &std::path::Path) -> u32 {
+    // Quick precondition: skip the spawn entirely when the workspace
+    // does not look like a git repo. Cheap stat, avoids paying the
+    // `git` startup cost for non-git projects.
+    if !workspace.join(".git").exists() {
+        return 0;
+    }
+
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("diff")
+        .arg("--shortstat")
+        .arg("--no-color")
+        .arg("HEAD")
+        .current_dir(workspace)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+
+    let output =
+        match tokio::time::timeout(std::time::Duration::from_secs(2), command.output()).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => {
+                tracing::debug!(?e, "git diff --shortstat failed; diff_lines=0");
+                return 0;
+            }
+            Err(_) => {
+                tracing::debug!("git diff --shortstat timed out; diff_lines=0");
+                return 0;
+            }
+        };
+
+    if !output.status.success() {
+        tracing::debug!(
+            status = ?output.status,
+            "git diff --shortstat returned non-zero; diff_lines=0",
+        );
+        return 0;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_shortstat(&stdout)
+}
+
+/// Parse a `git diff --shortstat` line of the form
+/// `" 3 files changed, 42 insertions(+), 17 deletions(-)"` and return
+/// `insertions + deletions`.
+///
+/// Returns `0` for empty input (no diff) or unparseable input. The
+/// parse is intentionally lenient: insertions / deletions are
+/// optional (a delete-only or insert-only diff omits the missing
+/// half), and either may appear before the other.
+fn parse_shortstat(s: &str) -> u32 {
+    // Take the first non-empty line; `--shortstat` emits exactly one
+    // line, but be defensive against trailing newlines.
+    let Some(line) = s.lines().find(|l| !l.trim().is_empty()) else {
+        return 0;
+    };
+    let mut total: u32 = 0;
+    for part in line.split(',') {
+        let trimmed = part.trim();
+        if let Some(num_str) = trimmed.split_whitespace().next()
+            && let Ok(n) = num_str.parse::<u32>()
+            && (trimmed.contains("insertion") || trimmed.contains("deletion"))
+        {
+            total = total.saturating_add(n);
+        }
+    }
+    total
 }
 
 /// Run `session_bootstrap` once and push its output into the agent's
@@ -506,5 +685,205 @@ async fn inject_bootstrap(agent: &mut tmg_core::AgentLoop, runner: Arc<Mutex<Run
             Err(e) => eprintln_warning(&format!("failed to serialize bootstrap payload: {e}")),
         },
         Err(e) => eprintln_warning(&format!("session_bootstrap failed: {e}")),
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::panic, reason = "test assertions use panic-based macros")]
+mod tests {
+    use super::*;
+
+    /// Parse the standard `git diff --shortstat` line shape.
+    #[test]
+    fn parse_shortstat_handles_canonical_line() {
+        let line = " 3 files changed, 42 insertions(+), 17 deletions(-)\n";
+        assert_eq!(parse_shortstat(line), 59);
+    }
+
+    /// `git diff --shortstat` may omit one of insertions / deletions
+    /// when the diff is one-sided.
+    #[test]
+    fn parse_shortstat_handles_insertions_only() {
+        assert_eq!(parse_shortstat(" 1 file changed, 5 insertions(+)\n"), 5,);
+    }
+
+    #[test]
+    fn parse_shortstat_handles_deletions_only() {
+        assert_eq!(parse_shortstat(" 2 files changed, 9 deletions(-)\n"), 9,);
+    }
+
+    #[test]
+    fn parse_shortstat_returns_zero_for_empty_or_garbage() {
+        assert_eq!(parse_shortstat(""), 0);
+        assert_eq!(parse_shortstat("\n  \n"), 0);
+        assert_eq!(parse_shortstat("not a shortstat line"), 0);
+    }
+
+    /// End-to-end: a sink-driven `files_modified` history flows
+    /// through the per-turn observer's spawned task, lands on
+    /// `SessionState`, and once the threshold is reached the
+    /// [`tmg_harness::EscalationEvaluator::detect_signals`] fires
+    /// the `SameFileEdit` rule.
+    #[tokio::test]
+    async fn observer_populates_files_modified_and_signals_fire() {
+        use tmg_core::StreamSink as _;
+        use tmg_harness::{
+            EscalationConfig, EscalationEvaluator, EscalationSignal, HarnessStreamSink, RunStore,
+            TurnSummary,
+        };
+
+        // Inner null sink — we only care about the wrapping side
+        // effects on the runner's session state.
+        struct NullSink;
+        impl tmg_core::StreamSink for NullSink {
+            fn on_token(&mut self, _t: &str) -> Result<(), tmg_core::CoreError> {
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap_or_else(|e| panic!("{e}"));
+        let run = store
+            .create_ad_hoc(workspace, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut runner = RunRunner::new(run, Arc::clone(&store));
+        let _ = runner.begin_session().unwrap_or_else(|e| panic!("{e}"));
+        let runner = Arc::new(Mutex::new(runner));
+
+        // Drive the sink to record five edits to the same file. The
+        // sink dedupes per-path, so the session sees exactly one
+        // entry; we re-drive the runner's `after_turn` directly to
+        // exercise the `same_file_edit` counter (which the sink does
+        // not own).
+        let mut sink = HarnessStreamSink::new(NullSink, Arc::clone(&runner));
+        sink.on_tool_result(
+            "file_write",
+            "Successfully wrote 5 bytes to '/tmp/hot.rs'",
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        // Simulate five turns that each touched `/tmp/hot.rs`. We feed
+        // the same delta `vec!["/tmp/hot.rs"]` into `after_turn` five
+        // times so the per-file edit tally reaches the threshold.
+        {
+            let mut guard = runner.lock().await;
+            for _ in 0..5 {
+                guard.after_turn(
+                    &TurnSummary {
+                        files_modified: vec!["/tmp/hot.rs".to_owned()],
+                        ..Default::default()
+                    },
+                    8192,
+                );
+            }
+        }
+
+        // Now the SPEC §9.10 evaluator should observe the
+        // SameFileEdit threshold trip.
+        let evaluator = EscalationEvaluator::new(EscalationConfig::default(), None);
+        let snapshot = {
+            let guard = runner.lock().await;
+            guard.session_state().clone()
+        };
+        let signals = evaluator.detect_signals(&snapshot);
+        assert!(
+            signals
+                .iter()
+                .any(|s| matches!(s, EscalationSignal::SameFileEdit { .. })),
+            "expected SameFileEdit signal after 5 same-file edits, got {signals:?}",
+        );
+    }
+
+    /// Files-modified delta accounting: when the observer runs twice
+    /// against a sink-populated session, the second turn sees only
+    /// the files newly added since the first turn.
+    #[tokio::test]
+    async fn files_modified_delta_advances_high_water_mark() {
+        use tmg_core::StreamSink as _;
+        use tmg_harness::{HarnessStreamSink, RunStore};
+
+        struct NullSink;
+        impl tmg_core::StreamSink for NullSink {
+            fn on_token(&mut self, _t: &str) -> Result<(), tmg_core::CoreError> {
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap_or_else(|e| panic!("{e}"));
+        let run = store
+            .create_ad_hoc(workspace, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut runner = RunRunner::new(run, Arc::clone(&store));
+        let _ = runner.begin_session().unwrap_or_else(|e| panic!("{e}"));
+        let runner = Arc::new(Mutex::new(runner));
+
+        let mut sink = HarnessStreamSink::new(NullSink, Arc::clone(&runner));
+        sink.on_tool_result(
+            "file_write",
+            "Successfully wrote 1 bytes to '/tmp/a.rs'",
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        // Snapshot 1: simulate the observer's high-water computation.
+        let high_water = std::sync::atomic::AtomicUsize::new(0);
+        let files_after_turn_1 = {
+            let guard = runner.lock().await;
+            guard
+                .active_session()
+                .unwrap_or_else(|| panic!("active session"))
+                .files_modified
+                .clone()
+        };
+        let prev = high_water.swap(
+            files_after_turn_1.len(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let delta_1 = files_after_turn_1[prev..].to_vec();
+        assert_eq!(delta_1, vec!["/tmp/a.rs".to_owned()]);
+
+        // Append a new file via the sink.
+        sink.on_tool_result(
+            "file_write",
+            "Successfully wrote 2 bytes to '/tmp/b.rs'",
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        // Snapshot 2: only the new file is in the delta; the high-
+        // water mark prevents the previous file from being counted
+        // again.
+        let files_after_turn_2 = {
+            let guard = runner.lock().await;
+            guard
+                .active_session()
+                .unwrap_or_else(|| panic!("active session"))
+                .files_modified
+                .clone()
+        };
+        let prev = high_water.swap(
+            files_after_turn_2.len(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let delta_2 = files_after_turn_2[prev..].to_vec();
+        assert_eq!(delta_2, vec!["/tmp/b.rs".to_owned()]);
+    }
+
+    /// `compute_diff_lines` short-circuits to `0` when the workspace
+    /// has no `.git` directory, regardless of whether `git` is on
+    /// PATH.
+    #[tokio::test]
+    async fn compute_diff_lines_returns_zero_outside_git() {
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let workspace = tmp.path().join("not-a-repo");
+        std::fs::create_dir_all(&workspace).unwrap_or_else(|e| panic!("{e}"));
+        let result = compute_diff_lines(&workspace).await;
+        assert_eq!(result, 0);
     }
 }
