@@ -8,6 +8,7 @@ members = [
     "crates/tmg-agents",
     "crates/tmg-sandbox",
     "crates/tmg-tui",
+    "crates/tmg-harness",
     "tmg-cli",
 ]
 
@@ -59,6 +60,12 @@ unicode-width = "0.2"
 # Platform directories
 dirs = "6"
 
+# Time
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
 # Testing
 tempfile = "3"
 proptest = "1"
@@ -75,6 +82,7 @@ tmg-skills = { path = "crates/tmg-skills" }
 tmg-agents = { path = "crates/tmg-agents" }
 tmg-sandbox = { path = "crates/tmg-sandbox" }
 tmg-tui = { path = "crates/tmg-tui" }
+tmg-harness = { path = "crates/tmg-harness" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

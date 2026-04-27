@@ -178,9 +178,7 @@ fn handle_key(app: &mut App, key: KeyEvent, cancel: &CancellationToken) {
         }
         // Shift+Enter or Alt+Enter: insert newline.
         // (Alt+Enter is the fallback for terminals without Kitty keyboard protocol.)
-        (KeyCode::Enter, m)
-            if m.contains(KeyModifiers::SHIFT) || m.contains(KeyModifiers::ALT) =>
-        {
+        (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) || m.contains(KeyModifiers::ALT) => {
             app.insert_newline();
         }
         // Enter alone: submit input and start turn.
