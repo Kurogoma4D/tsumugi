@@ -92,6 +92,33 @@ pub enum HarnessError {
         /// Index carried by the handle the caller passed in.
         actual: u32,
     },
+
+    /// Failed to parse `features.json` from disk (invalid JSON or
+    /// schema mismatch).
+    #[error("failed to parse features.json at {path}: {source}")]
+    FeaturesDeserialize {
+        /// Source file path.
+        path: PathBuf,
+        /// Underlying deserialization error.
+        source: serde_json::Error,
+    },
+
+    /// Failed to serialize `features.json`.
+    #[error("failed to serialize features.json at {path}: {source}")]
+    FeaturesSerialize {
+        /// Target file path.
+        path: PathBuf,
+        /// Underlying serialization error.
+        source: serde_json::Error,
+    },
+
+    /// `mark_passing` was called with an id that is not present in the
+    /// loaded `features.json`. The file is left untouched.
+    #[error("unknown feature id: {feature_id}")]
+    UnknownFeatureId {
+        /// The id that was looked up.
+        feature_id: String,
+    },
 }
 
 impl HarnessError {
@@ -114,6 +141,22 @@ impl HarnessError {
     /// Construct a [`HarnessError::SessionDeserialize`].
     pub fn session_deserialize(path: impl Into<PathBuf>, source: serde_json::Error) -> Self {
         Self::SessionDeserialize {
+            path: path.into(),
+            source,
+        }
+    }
+
+    /// Construct a [`HarnessError::FeaturesDeserialize`].
+    pub fn features_deserialize(path: impl Into<PathBuf>, source: serde_json::Error) -> Self {
+        Self::FeaturesDeserialize {
+            path: path.into(),
+            source,
+        }
+    }
+
+    /// Construct a [`HarnessError::FeaturesSerialize`].
+    pub fn features_serialize(path: impl Into<PathBuf>, source: serde_json::Error) -> Self {
+        Self::FeaturesSerialize {
             path: path.into(),
             source,
         }

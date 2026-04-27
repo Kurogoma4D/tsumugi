@@ -17,6 +17,7 @@ uuid = { workspace = true }
 
 # Workspace crates
 tmg-core = { workspace = true }
+tmg-sandbox = { workspace = true }
 tmg-tools = { workspace = true }
 
 [dev-dependencies]

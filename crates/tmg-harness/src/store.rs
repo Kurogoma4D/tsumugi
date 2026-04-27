@@ -36,6 +36,12 @@ pub const PROGRESS_FILENAME: &str = "progress.md";
 /// Sub-directory under each run directory holding `session_NNN.json` files.
 pub const SESSION_LOG_DIRNAME: &str = "session_log";
 
+/// Filename of the harnessed-only features list under each run directory.
+pub const FEATURES_FILENAME: &str = "features.json";
+
+/// Filename of the harnessed-only init script under each run directory.
+pub const INIT_SCRIPT_FILENAME: &str = "init.sh";
+
 /// Persistent store for runs rooted at a directory (typically
 /// `.tsumugi/runs/`).
 ///
@@ -88,6 +94,18 @@ impl RunStore {
     #[must_use]
     pub fn session_log_dir(&self, run_id: &RunId) -> PathBuf {
         self.run_dir(run_id).join(SESSION_LOG_DIRNAME)
+    }
+
+    /// Path for a harnessed run's `features.json`.
+    #[must_use]
+    pub fn features_file(&self, run_id: &RunId) -> PathBuf {
+        self.run_dir(run_id).join(FEATURES_FILENAME)
+    }
+
+    /// Path for a harnessed run's `init.sh`.
+    #[must_use]
+    pub fn init_script_file(&self, run_id: &RunId) -> PathBuf {
+        self.run_dir(run_id).join(INIT_SCRIPT_FILENAME)
     }
 
     /// Create a fresh ad-hoc run rooted at `workspace_path`.

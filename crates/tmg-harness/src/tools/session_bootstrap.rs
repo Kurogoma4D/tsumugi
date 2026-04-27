@@ -1,27 +1,43 @@
-//! `session_bootstrap` tool: returns the four SPEC §9.7 fields used to
-//! warm up a session at startup.
+//! `session_bootstrap` tool: returns the SPEC §9.7 fields used to warm
+//! up a session at startup.
 //!
-//! This tool is the ad-hoc-scope variant. The harnessed branch
-//! (features.json + init.sh) lands in #34; for now we always emit the
-//! four fields:
+//! ## Ad-hoc scope
+//!
+//! For ad-hoc runs, the tool emits four fields:
 //!
 //! - `working_directory`
 //! - `recent_git_log` (output of `git log --oneline -N`)
 //! - `progress_summary` (last K sessions of `progress.md`)
 //! - `last_session_hint` (most recent `next_session_hint`)
 //!
-//! When the combined output exceeds `bootstrap_max_tokens`, we shed
-//! older `progress.md` sessions and trim the git log until we fit.
+//! ## Harnessed scope
+//!
+//! For harnessed runs, the same fields are emitted **plus**:
+//!
+//! - `features_summary` (compact view of `features.json`)
+//! - `init_script_status` (exit code + tail of stdout/stderr from
+//!   running `init.sh` with the `[harness] default_session_timeout`
+//!   budget — plumbed through [`RunRunner::default_session_timeout`])
+//! - `smoke_test_result` (`{ "status": "unavailable", ... }` until
+//!   the tester subagent ships in a follow-up issue)
+//!
+//! When the combined output exceeds `bootstrap_max_tokens`, harnessed
+//! payloads first trim `features_summary` (older / lower-priority
+//! entries), then fall through to the ad-hoc trimming order
+//! (older `progress.md` sessions → tail of git log → `last_session_hint`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
 use tmg_core::TokenCounter;
+use tmg_sandbox::{SandboxConfig, SandboxContext, SandboxMode};
 use tmg_tools::{Tool, ToolError, ToolResult};
 use tokio::sync::Mutex;
 
+use crate::artifacts::{FeatureList, FeaturesSummary, InitScript, InitScriptOutput};
+use crate::run::RunScope;
 use crate::runner::RunRunner;
 // `TokenCounter` is referenced for its `estimate_tokens` heuristic only.
 // The previously-supported "attach an LLM-backed counter" path was
@@ -37,6 +53,12 @@ const DEFAULT_PROGRESS_SESSIONS: usize = 5;
 
 /// Maximum time to wait for `git log` before giving up.
 const GIT_LOG_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default number of features included in the `features_summary`.
+const DEFAULT_FEATURES_TOP_N: usize = 20;
+
+/// Number of stdout/stderr tail lines to surface for `init.sh`.
+const INIT_SCRIPT_TAIL_LINES: usize = 20;
 
 /// Tool that returns the SPEC §9.7 bootstrap payload for the active run.
 pub struct SessionBootstrapTool {
@@ -97,7 +119,9 @@ impl Tool for SessionBootstrapTool {
 
 /// Bootstrap payload returned by `session_bootstrap`.
 ///
-/// Field order follows SPEC §9.7.
+/// Field order follows SPEC §9.7. Harnessed-only fields default to
+/// `None` for ad-hoc runs and `skip_serializing_if = "Option::is_none"`,
+/// so they do not appear in ad-hoc output at all.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct BootstrapPayload {
     /// Absolute path to the workspace root.
@@ -110,9 +134,77 @@ pub struct BootstrapPayload {
     pub progress_summary: String,
     /// The most recent `next_session_hint`, if any.
     pub last_session_hint: Option<String>,
+    /// Compact view of `features.json` (harnessed scope only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features_summary: Option<FeaturesSummary>,
+    /// Result of running `init.sh` (harnessed scope only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_script_status: Option<InitScriptStatus>,
+    /// Result of running the tester subagent (harnessed scope only).
+    ///
+    /// Currently always `Some(SmokeTestResult::Unavailable { .. })` for
+    /// harnessed runs because the tester subagent is not yet
+    /// implemented; activated once the tester ships.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smoke_test_result: Option<SmokeTestResult>,
     /// Whether the payload was truncated to fit `bootstrap_max_tokens`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
+}
+
+/// Tail-line view of an `init.sh` invocation surfaced through
+/// [`BootstrapPayload::init_script_status`].
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct InitScriptStatus {
+    /// Exit code of the script (`-1` when killed by signal/timeout).
+    pub exit_code: i32,
+    /// Last `INIT_SCRIPT_TAIL_LINES` of stdout, joined with `\n`.
+    pub tail_stdout: String,
+    /// Last `INIT_SCRIPT_TAIL_LINES` of stderr, joined with `\n`.
+    pub tail_stderr: String,
+    /// Whether the script was killed because it exceeded the timeout
+    /// budget.
+    pub timed_out: bool,
+}
+
+/// Result of the harnessed-scope smoke test.
+///
+/// The tester subagent is tracked in a follow-up issue; until it lands,
+/// the bootstrap always returns the [`Unavailable`](Self::Unavailable)
+/// variant so the LLM can reason about its absence rather than seeing
+/// no field at all.
+///
+/// Serialised with an explicit `status` tag so the wire shape is:
+///
+/// ```json
+/// { "status": "unavailable", "reason": "..." }
+/// // or, once the tester ships:
+/// { "status": "available", "passed": true }
+/// ```
+///
+/// The redundant `tester_unavailable: true` flag from the previous
+/// `#[serde(untagged)]` shape is dropped: the tag carries the same
+/// signal and an untagged enum cannot grow new variants without ambiguity.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SmokeTestResult {
+    /// Tester subagent is not yet wired up.
+    Unavailable {
+        /// Reason the tester wasn't run (kept short and actionable).
+        reason: String,
+    },
+    /// Tester subagent ran and produced a verdict.
+    ///
+    /// Reserved for the follow-up issue that ships the tester; the
+    /// variant is included now so the JSON shape is stable across the
+    /// two PRs and so callers (LLM prompts, dashboards) can begin
+    /// matching `status == "available"` ahead of time.
+    Available {
+        /// Whether the smoke test passed.
+        // TODO(#tester-subagent): this field is filled in by the tester
+        // subagent; today the harness never constructs this variant.
+        passed: bool,
+    },
 }
 
 #[expect(
@@ -129,11 +221,29 @@ struct BootstrapInputs {
     progress_log_path: PathBuf,
     bootstrap_max_tokens: usize,
     last_hint: Option<String>,
+    /// `Some` only when the run is harnessed.
+    harness_inputs: Option<HarnessBootstrapInputs>,
+}
+
+/// Inputs needed to populate the harnessed-only fields. Held in a
+/// separate struct so `BootstrapInputs` stays the same shape for ad-hoc
+/// runs.
+struct HarnessBootstrapInputs {
+    features: FeatureList,
+    init_script: InitScript,
+    /// Wall-clock budget for running `init.sh`, sourced from
+    /// [`RunRunner::default_session_timeout`].
+    ///
+    /// Both the outer `tokio::time::timeout` and the inner sandbox
+    /// timer (`SandboxConfig::with_timeout`) are set from this value so
+    /// the two deadlines coincide.
+    init_script_timeout: Duration,
 }
 
 async fn run_bootstrap(runner: &Arc<Mutex<RunRunner>>) -> Result<BootstrapPayload, ToolError> {
     // Read everything we need under a single short lock so we never
-    // hold the runner while shelling out to `git log`.
+    // hold the runner while shelling out to `git log` or running
+    // `init.sh`.
     let inputs: BootstrapInputs = {
         let guard = runner.lock().await;
         let last_hint = guard.session_log().last_hint().map_err(|e| {
@@ -142,11 +252,20 @@ async fn run_bootstrap(runner: &Arc<Mutex<RunRunner>>) -> Result<BootstrapPayloa
                 std::io::Error::other(e.to_string()),
             )
         })?;
+        let harness_inputs = match guard.scope() {
+            RunScope::Harnessed { .. } => Some(HarnessBootstrapInputs {
+                features: guard.features().clone(),
+                init_script: guard.init_script().clone(),
+                init_script_timeout: guard.default_session_timeout(),
+            }),
+            RunScope::AdHoc => None,
+        };
         BootstrapInputs {
             workspace_path: guard.workspace_path_owned(),
             progress_log_path: guard.progress_log().path().to_path_buf(),
             bootstrap_max_tokens: guard.bootstrap_max_tokens(),
             last_hint,
+            harness_inputs,
         }
     };
 
@@ -155,11 +274,29 @@ async fn run_bootstrap(runner: &Arc<Mutex<RunRunner>>) -> Result<BootstrapPayloa
     let progress_summary =
         read_recent_progress(&inputs.progress_log_path, DEFAULT_PROGRESS_SESSIONS)?;
 
+    let (features_summary, init_script_status, smoke_test_result) =
+        if let Some(harness) = inputs.harness_inputs.as_ref() {
+            let features_summary = collect_features_summary(&harness.features);
+            let init_script_status = collect_init_script_status(
+                &harness.init_script,
+                &inputs.workspace_path,
+                harness.init_script_timeout,
+            )
+            .await;
+            let smoke_test_result = Some(tester_unavailable_placeholder());
+            (features_summary, init_script_status, smoke_test_result)
+        } else {
+            (None, None, None)
+        };
+
     let mut payload = BootstrapPayload {
         working_directory,
         recent_git_log,
         progress_summary,
         last_session_hint: inputs.last_hint,
+        features_summary,
+        init_script_status,
+        smoke_test_result,
         truncated: false,
     };
 
@@ -169,6 +306,96 @@ async fn run_bootstrap(runner: &Arc<Mutex<RunRunner>>) -> Result<BootstrapPayloa
     }
 
     Ok(payload)
+}
+
+/// Read the features summary, returning `None` if `features.json` does
+/// not exist or fails to parse. Bootstrap is best-effort: a missing or
+/// corrupt features file should not abort the whole bundle.
+fn collect_features_summary(features: &FeatureList) -> Option<FeaturesSummary> {
+    if !features.path().exists() {
+        return None;
+    }
+    match features.summary(DEFAULT_FEATURES_TOP_N) {
+        Ok(summary) => Some(summary),
+        Err(err) => {
+            tracing::warn!(
+                path = %features.path().display(),
+                error = %err,
+                "skipping features_summary in session_bootstrap"
+            );
+            None
+        }
+    }
+}
+
+/// Run `init.sh` and convert the result into an [`InitScriptStatus`].
+///
+/// Returns `None` when `init.sh` does not exist on disk; the agent will
+/// see no `init_script_status` field rather than a confusing
+/// not-found error.
+///
+/// Both the inner sandbox timer (`SandboxConfig::with_timeout`) and the
+/// outer `tokio::time::timeout` inside [`InitScript::run`] are set from
+/// `timeout` so a long-running script is killed exactly once at the
+/// configured deadline rather than 30 s earlier by the sandbox default.
+async fn collect_init_script_status(
+    init_script: &InitScript,
+    workspace: &Path,
+    timeout: Duration,
+) -> Option<InitScriptStatus> {
+    if !init_script.exists() {
+        return None;
+    }
+
+    // Use a `Full`-mode sandbox here: this issue is only about wiring
+    // the `init.sh` execution path. A future issue will tighten the
+    // policy to `WorkspaceWrite` once we are confident that
+    // initialiser scripts only need to touch the workspace.
+    //
+    // NOTE: this hard-codes `Full` regardless of the user's
+    // `[sandbox]` configuration. Until we plumb the configured
+    // `SandboxConfigSection` through `BootstrapInputs`, callers that
+    // configure a stricter mode at the CLI level should see a one-time
+    // warning emitted from the CLI startup path
+    // (`harness_init::warn_if_sandbox_mode_mismatch`).
+    let sandbox_config = SandboxConfig::new(workspace)
+        .with_mode(SandboxMode::Full)
+        .with_timeout(timeout.as_secs());
+    let sandbox = SandboxContext::new(sandbox_config);
+
+    match init_script.run(&sandbox, timeout).await {
+        Ok(output) => Some(init_script_status_from_output(&output)),
+        Err(err) => {
+            tracing::warn!(
+                path = %init_script.path().display(),
+                error = %err,
+                "init.sh execution failed in session_bootstrap"
+            );
+            None
+        }
+    }
+}
+
+fn init_script_status_from_output(output: &InitScriptOutput) -> InitScriptStatus {
+    InitScriptStatus {
+        exit_code: output.exit_code,
+        tail_stdout: output.tail_stdout(INIT_SCRIPT_TAIL_LINES),
+        tail_stderr: output.tail_stderr(INIT_SCRIPT_TAIL_LINES),
+        timed_out: output.timed_out,
+    }
+}
+
+/// Placeholder smoke-test result emitted while the tester subagent is
+/// not yet implemented.
+//
+// TODO(#tester-subagent): Replace this stub with a real invocation of
+// the tester subagent once that issue lands. The replacement should
+// honour `[harness] smoke_test_every_n_sessions` and gate execution by
+// `RunRunner::session_count()`.
+fn tester_unavailable_placeholder() -> SmokeTestResult {
+    SmokeTestResult::Unavailable {
+        reason: "tester subagent not yet implemented".to_owned(),
+    }
 }
 
 /// Read the last `n` sessions from `progress.md`.
@@ -217,11 +444,21 @@ fn estimate_tokens(text: &str) -> usize {
 
 /// Trim the payload until its serialized form fits within `max_tokens`.
 ///
-/// Strategy: shed older progress sessions first, then trim the git log
-/// from its tail (oldest commits), then drop `last_session_hint` as a
-/// last resort. **`working_directory` is preserved unconditionally** —
-/// it is never trimmed, so the post-truncation token count is bounded by
-/// `max_tokens + estimate_tokens(working_directory) + framing overhead`
+/// Strategy:
+/// 1. **Harnessed scope only**: shed `features_summary` entries (older /
+///    lower-priority — i.e. the *passing* ones at the tail of the
+///    summary list) before touching ad-hoc fields. `total` and
+///    `passing` counts are preserved so the LLM still sees the
+///    cardinality even when individual entries are dropped.
+/// 2. Drop the oldest `progress.md` sessions one at a time.
+/// 3. Trim the `git log` from the tail (oldest commits) by lines.
+/// 4. Last resort: clear `last_session_hint`.
+///
+/// `working_directory`, `init_script_status`, and `smoke_test_result`
+/// are preserved unconditionally — they are bounded in size by
+/// construction (`tail_stdout`/`tail_stderr` already cap at
+/// `INIT_SCRIPT_TAIL_LINES`), so the post-truncation token count is
+/// bounded by `max_tokens + framing_overhead + size_of_preserved_fields`
 /// rather than `max_tokens` alone.
 ///
 /// Sets `payload.truncated = true` when any reduction was applied.
@@ -232,14 +469,26 @@ fn truncate_to_budget(payload: &mut BootstrapPayload, max_tokens: usize) {
     }
     payload.truncated = true;
 
-    // 1) Drop oldest progress sessions one at a time.
+    // 1) Harnessed-only: shed features_summary entries from the tail
+    // (passing entries are placed last by `FeatureList::summary`, so
+    // they go first; failing entries survive longer).
+    if payload.features_summary.is_some() {
+        while estimate_tokens(&serialize_for_size(payload)) > max_tokens {
+            let dropped = drop_features_summary_tail(&mut payload.features_summary);
+            if !dropped {
+                break;
+            }
+        }
+    }
+
+    // 2) Drop oldest progress sessions one at a time.
     while estimate_tokens(&serialize_for_size(payload)) > max_tokens {
         if !drop_oldest_progress_session(&mut payload.progress_summary) {
             break;
         }
     }
 
-    // 2) Trim the git log from the bottom (oldest commit) by lines.
+    // 3) Trim the git log from the bottom (oldest commit) by lines.
     while estimate_tokens(&serialize_for_size(payload)) > max_tokens
         && !payload.recent_git_log.is_empty()
     {
@@ -256,10 +505,38 @@ fn truncate_to_budget(payload: &mut BootstrapPayload, max_tokens: usize) {
         payload.recent_git_log.push('\n');
     }
 
-    // 3) Last resort: clear the hint to free up budget.
+    // 4) Last resort: clear the hint to free up budget.
     if estimate_tokens(&serialize_for_size(payload)) > max_tokens {
         payload.last_session_hint = None;
     }
+}
+
+/// Drop one entry from the tail of `features_summary.entries`.
+///
+/// Returns `true` when an entry was dropped, `false` when there is
+/// nothing more to remove (the field is `None`, the list is empty, or
+/// the field has been replaced with `None` by a previous full drain).
+///
+/// Once `entries` is empty, the entire `features_summary` field is set
+/// to `None` so the field disappears from the serialized payload (one
+/// extra byte savings via `skip_serializing_if`).
+fn drop_features_summary_tail(features_summary: &mut Option<FeaturesSummary>) -> bool {
+    let Some(summary) = features_summary.as_mut() else {
+        return false;
+    };
+    if summary.entries.is_empty() {
+        // No more rows; drop the field entirely.
+        *features_summary = None;
+        return true;
+    }
+    summary.entries.pop();
+    summary.truncated = true;
+    if summary.entries.is_empty() {
+        // All rows shed: drop the now-empty summary so it stops
+        // wasting tokens.
+        *features_summary = None;
+    }
+    true
 }
 
 /// Serialize the payload for size estimation. Failures fall back to a
@@ -548,4 +825,268 @@ mod tests {
         assert!(injected.starts_with("[session_bootstrap]\n"));
         assert!(injected.ends_with("\n[/session_bootstrap]"));
     }
+
+    /// Helper: turn an existing ad-hoc runner into a harnessed one,
+    /// optionally seeding `features.json` and `init.sh` in the run
+    /// directory.
+    async fn promote_to_harnessed(
+        runner: &Arc<Mutex<RunRunner>>,
+        features_json: Option<&str>,
+        init_sh: Option<&str>,
+    ) {
+        let mut guard = runner.lock().await;
+        let new_scope = RunScope::Harnessed {
+            workflow_id: "wf".to_owned(),
+            max_sessions: None,
+        };
+        guard.run_mut().scope = new_scope.clone();
+        guard.run_mut().workflow_id = Some("wf".to_owned());
+        let features_path = guard.features().path().to_path_buf();
+        let init_path = guard.init_script().path().to_path_buf();
+        drop(guard);
+
+        if let Some(content) = features_json {
+            std::fs::write(&features_path, content).unwrap_or_else(|e| panic!("{e}"));
+        }
+        if let Some(content) = init_sh {
+            std::fs::write(&init_path, content).unwrap_or_else(|e| panic!("{e}"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mut perms = std::fs::metadata(&init_path)
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&init_path, perms).unwrap_or_else(|e| panic!("{e}"));
+            }
+        }
+    }
+
+    fn sample_features_json() -> &'static str {
+        r#"{
+  "features": [
+    {
+      "id": "feat-001",
+      "category": "auth",
+      "description": "Login",
+      "steps": ["A"],
+      "passes": false
+    },
+    {
+      "id": "feat-002",
+      "category": "auth",
+      "description": "Logout",
+      "steps": ["B"],
+      "passes": false
+    },
+    {
+      "id": "feat-003",
+      "category": "billing",
+      "description": "Invoice",
+      "steps": ["C"],
+      "passes": true
+    }
+  ]
+}"#
+    }
+
+    /// Acceptance: ad-hoc runs do not surface the harnessed-only fields
+    /// in either the typed payload or the JSON.
+    #[tokio::test]
+    async fn ad_hoc_payload_omits_harnessed_fields() {
+        let (_tmp, runner) = make_runner();
+        let tool = SessionBootstrapTool::new(Arc::clone(&runner));
+        let payload = tool.run_once().await.unwrap_or_else(|e| panic!("{e}"));
+        assert!(payload.features_summary.is_none());
+        assert!(payload.init_script_status.is_none());
+        assert!(payload.smoke_test_result.is_none());
+
+        let res = tool
+            .execute(serde_json::json!({}))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&res.output).unwrap_or_else(|e| panic!("{e}"));
+        for key in [
+            "features_summary",
+            "init_script_status",
+            "smoke_test_result",
+        ] {
+            assert!(
+                parsed.get(key).is_none(),
+                "ad-hoc payload should not contain `{key}`: {parsed}"
+            );
+        }
+    }
+
+    /// Acceptance: harnessed runs return the harnessed-only fields.
+    #[tokio::test]
+    async fn harnessed_payload_includes_features_and_smoke_test() {
+        let (_tmp, runner) = make_runner();
+        promote_to_harnessed(&runner, Some(sample_features_json()), None).await;
+
+        let tool = SessionBootstrapTool::new(Arc::clone(&runner));
+        let payload = tool.run_once().await.unwrap_or_else(|e| panic!("{e}"));
+
+        let summary = payload
+            .features_summary
+            .as_ref()
+            .unwrap_or_else(|| panic!("expected features_summary"));
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.passing, 1);
+        assert!(!summary.entries.is_empty());
+
+        // No init.sh seeded -> field absent.
+        assert!(payload.init_script_status.is_none());
+
+        let smoke = payload
+            .smoke_test_result
+            .as_ref()
+            .unwrap_or_else(|| panic!("expected smoke_test_result"));
+        match smoke {
+            SmokeTestResult::Unavailable { reason } => {
+                assert!(!reason.is_empty(), "reason should not be empty");
+            }
+            SmokeTestResult::Available { .. } => {
+                panic!("tester subagent is not implemented yet; expected Unavailable");
+            }
+        }
+
+        // Wire-shape regression: the new `#[serde(tag = "status", ...)]`
+        // form must serialise as `{ "status": "unavailable", "reason": ... }`
+        // and must NOT carry the old `tester_unavailable` boolean.
+        let json = serde_json::to_value(smoke).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(json["status"], "unavailable", "wire shape: {json}");
+        assert!(json.get("tester_unavailable").is_none(), "{json}");
+        assert!(json["reason"].is_string(), "{json}");
+    }
+
+    /// Acceptance: when `init.sh` exists in a harnessed run, it is
+    /// executed and its tail is captured.
+    #[tokio::test]
+    async fn harnessed_payload_runs_init_script() {
+        let (_tmp, runner) = make_runner();
+        let init_content = "#!/bin/sh\necho init-ran\n";
+        promote_to_harnessed(&runner, Some(sample_features_json()), Some(init_content)).await;
+
+        let tool = SessionBootstrapTool::new(Arc::clone(&runner));
+        let payload = tool.run_once().await.unwrap_or_else(|e| panic!("{e}"));
+        let status = payload
+            .init_script_status
+            .as_ref()
+            .unwrap_or_else(|| panic!("expected init_script_status"));
+        assert_eq!(status.exit_code, 0);
+        assert!(!status.timed_out);
+        assert!(
+            status.tail_stdout.contains("init-ran"),
+            "{}",
+            status.tail_stdout
+        );
+    }
+
+    /// `bootstrap_max_tokens` truncation in harnessed runs prefers
+    /// trimming `features_summary` before touching ad-hoc fields.
+    /// Acceptance test for issue #34.
+    #[tokio::test]
+    async fn truncation_prefers_features_summary() {
+        use std::fmt::Write as _;
+
+        let (_tmp, runner) = make_runner();
+
+        // Build a harnessed run with a fat features list. Many
+        // entries, all distinct ids, so the JSON is large.
+        let mut features_json = String::from("{\n  \"features\": [\n");
+        for i in 0..50 {
+            if i > 0 {
+                features_json.push_str(",\n");
+            }
+            write!(
+                features_json,
+                "    {{ \"id\": \"feat-{i:03}\", \"category\": \"cat\", \
+                 \"description\": \"description that takes up some space {}\", \
+                 \"steps\": [\"step1\", \"step2\"], \"passes\": false }}",
+                "x".repeat(40)
+            )
+            .unwrap_or_else(|e| panic!("write failed: {e}"));
+        }
+        features_json.push_str("\n  ]\n}\n");
+
+        promote_to_harnessed(&runner, Some(&features_json), None).await;
+
+        // Seed a small progress.md entry so we can later confirm it
+        // survives features-summary trimming.
+        {
+            let guard = runner.lock().await;
+            guard
+                .progress_log()
+                .append_entry("progress sentinel")
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+
+        // Force a tight budget that is comfortably bigger than the
+        // bookkeeping fields but smaller than the unrolled
+        // `features_summary`.
+        {
+            let mut guard = runner.lock().await;
+            guard.set_bootstrap_max_tokens(128);
+        }
+
+        let tool = SessionBootstrapTool::new(Arc::clone(&runner));
+        let payload = tool.run_once().await.unwrap_or_else(|e| panic!("{e}"));
+        assert!(payload.truncated, "expected payload to be truncated");
+
+        // The features_summary entries should have been trimmed (or
+        // dropped entirely) before the progress.md sentinel disappears.
+        let entries_after = payload
+            .features_summary
+            .as_ref()
+            .map_or(0, |s| s.entries.len());
+        assert!(
+            entries_after < 50,
+            "features_summary should have been trimmed, got {entries_after} entries"
+        );
+        assert!(
+            payload.progress_summary.contains("progress sentinel"),
+            "progress.md must survive features-first trimming: {}",
+            payload.progress_summary,
+        );
+    }
+
+    #[test]
+    fn drop_features_summary_tail_progressively_empties_entries() {
+        let mut summary = Some(FeaturesSummary {
+            total: 3,
+            passing: 0,
+            entries: vec![
+                FeaturesSummaryEntry {
+                    id: "a".to_owned(),
+                    category: "x".to_owned(),
+                    passes: false,
+                },
+                FeaturesSummaryEntry {
+                    id: "b".to_owned(),
+                    category: "x".to_owned(),
+                    passes: false,
+                },
+            ],
+            truncated: false,
+        });
+        assert!(drop_features_summary_tail(&mut summary));
+        assert_eq!(
+            summary.as_ref().map(|s| s.entries.len()),
+            Some(1),
+            "first drop reduces to 1 entry"
+        );
+        assert!(drop_features_summary_tail(&mut summary));
+        assert!(
+            summary.is_none(),
+            "after the last entry is shed the field should be cleared"
+        );
+        assert!(
+            !drop_features_summary_tail(&mut summary),
+            "no-op once cleared"
+        );
+    }
+
+    use crate::artifacts::{FeaturesSummary, FeaturesSummaryEntry};
 }
