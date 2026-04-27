@@ -13,10 +13,18 @@ tmg-harness = { workspace = true }
 tmg-workflow = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+syntect = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["signal", "sync"] }
 tokio-util = { workspace = true }
 thiserror = { workspace = true }
 unicode-width = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tmg-sandbox = { workspace = true }
+tmg-tools = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync"] }
 
 [lints]
 workspace = true

@@ -3,17 +3,22 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
 
-use tmg_agents::{AgentType, CustomAgentDef, SubagentManager, SubagentSummary, truncate_str};
+use tmg_agents::{AgentType, CustomAgentDef, SubagentManager, truncate_str};
 use tmg_core::{AgentLoop, CoreError, StreamSink, format_context_usage};
-use tmg_harness::{HarnessStreamSink, RunRunner, RunSummary};
+use tmg_harness::{HarnessStreamSink, RunProgressEvent, RunRunner, RunSummary};
 use tmg_llm::Role;
 use tmg_workflow::WorkflowProgress;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+use crate::activity::{
+    ActivityPane, RunHeader, RunProgressSection, ToolActivityEntry as ActivityEntry,
+    WorkflowProgressSection,
+};
+use crate::diff::DiffPreview;
 
 /// Represents a single entry in the chat display.
 #[derive(Debug, Clone)]
@@ -25,15 +30,11 @@ pub struct ChatEntry {
 }
 
 /// A single log entry in the tool activity pane.
-#[derive(Debug, Clone)]
-pub struct ToolActivityEntry {
-    /// The tool name.
-    pub tool_name: String,
-    /// A summary of the tool activity (call parameters or result excerpt).
-    pub summary: String,
-    /// Whether this entry represents an error.
-    pub is_error: bool,
-}
+///
+/// This is a re-export of [`crate::activity::ToolActivityEntry`] kept
+/// here so existing callers (and the public `App::tool_activity`
+/// accessor) keep their import path stable across the #45 refactor.
+pub type ToolActivityEntry = ActivityEntry;
 
 /// Messages sent from the background turn task to the event loop.
 pub enum TurnMessage {
@@ -121,8 +122,9 @@ pub struct App {
     /// Chat entries displayed in the chat pane.
     chat_entries: Vec<ChatEntry>,
 
-    /// Tool activity log displayed in the tool pane.
-    tool_activity: Vec<ToolActivityEntry>,
+    /// Structured Activity Pane state (issue #45). Replaces the
+    /// previous flat `tool_activity` field.
+    activity: ActivityPane,
 
     /// The current text in the input area.
     input: String,
@@ -160,9 +162,6 @@ pub struct App {
     /// Shared reference to the subagent manager for status display.
     subagent_manager: Option<Arc<Mutex<SubagentManager>>>,
 
-    /// Cached subagent summaries for display (updated periodically).
-    subagent_summaries: Vec<SubagentSummary>,
-
     /// Custom agent definitions for display in `/agents` list.
     custom_agents: Vec<CustomAgentDef>,
 
@@ -175,54 +174,37 @@ pub struct App {
     /// Optional path for structured event logging (JSON Lines).
     event_log_path: Option<PathBuf>,
 
-    /// The currently active run, used for header display.
+    /// The currently active run summary (kept for backward compatible
+    /// accessor `current_run()`). The header now also derives from
+    /// [`Self::run_header`].
     current_run: Option<RunSummary>,
+
+    /// Pre-formatted run header for the top bar (issue #45 SPEC §7.1).
+    /// `None` when no run is attached.
+    run_header: Option<RunHeader>,
 
     /// Optional [`RunRunner`] handle used to wrap each turn's sink with
     /// [`HarnessStreamSink`], so the active session's `tool_calls_count`
     /// and `files_modified` reflect actual tool activity.
     runner: Option<Arc<Mutex<RunRunner>>>,
 
+    /// Optional receiver of [`RunProgressEvent`]s from
+    /// [`RunRunner::progress_channel`]. Set by the CLI startup path
+    /// after subscribing to the runner.
+    run_progress_rx: Option<mpsc::Receiver<RunProgressEvent>>,
+
     /// Optional receiver of [`WorkflowProgress`] events from a running
-    /// workflow.
-    ///
-    /// **Status (#41 → #45):** the receiver field, the
-    /// [`Self::set_workflow_progress_rx`] setter, and the
-    /// [`Self::drain_workflow_progress`] drain are wired into `App` as
-    /// a half-built API. The CLI does *not* yet attach a sender to a
-    /// running workflow — the foreground `run_workflow` path still
-    /// owns its own internal channel — so these symbols are inert at
-    /// runtime. The full plumbing (passing the workflow's
-    /// `mpsc::Sender<WorkflowProgress>` from inside the
-    /// `RunWorkflowTool` foreground branch through to the `App`) is
-    /// tracked under issue #45 along with the activity-pane
-    /// rendering. Keeping the half-built API in the file documents
-    /// the intended contract and lets #45 land as a wire-up rather
-    /// than a fresh design.
+    /// workflow. Wired by the foreground `run_workflow` path so the
+    /// engine's events reach the activity pane.
     workflow_progress_rx: Option<mpsc::Receiver<WorkflowProgress>>,
 
-    /// Display state for the currently-running workflow, if any.
-    workflow_status: Option<WorkflowStatusLine>,
-}
-
-/// Minimal in-app state for the workflow progress hook.
-///
-/// We don't try to render full per-stage detail here — that lives in
-/// the dedicated TUI work (#45). What we *do* track is enough to draw
-/// a single status line: the current step id, optional iteration
-/// counter, and the wall-clock time the workflow started so the
-/// activity pane can show "elapsed" without waking on a timer.
-#[derive(Debug, Clone)]
-pub struct WorkflowStatusLine {
-    /// Most recent step id seen on the channel.
-    pub current_step: String,
-    /// `(iteration, max)` if the latest event was a `LoopIteration`.
-    pub loop_progress: Option<(u32, u32)>,
-    /// Wall-clock instant the workflow started (set when the first
-    /// event arrives).
-    pub started_at: Instant,
-    /// `true` once a `WorkflowCompleted` event has been observed.
-    pub completed: bool,
+    /// Whether the most recent `shell_exec` tool *call* was a `git diff`
+    /// invocation. Set on `ToolCall { name == "shell_exec" }` and read
+    /// in the matching `ToolResult` so we only run unified-diff
+    /// extraction on outputs that are actually likely to be diffs —
+    /// stray `git log -p` / `cat foo.diff` blobs no longer overwrite a
+    /// legitimate `file_write` / `file_patch` preview.
+    last_shell_exec_was_git_diff: bool,
 }
 
 impl App {
@@ -239,7 +221,7 @@ impl App {
         Self {
             agent: Some(agent),
             chat_entries: Vec::new(),
-            tool_activity: Vec::new(),
+            activity: ActivityPane::new(),
             input: String::new(),
             cursor_pos: 0,
             chat_scroll: 0,
@@ -252,98 +234,75 @@ impl App {
             error_message: None,
             turn_handle: None,
             subagent_manager: None,
-            subagent_summaries: Vec::new(),
             custom_agents: Vec::new(),
             pending_compact: false,
             thinking: false,
             event_log_path: event_log,
             current_run: None,
+            run_header: None,
             runner: None,
+            run_progress_rx: None,
             workflow_progress_rx: None,
-            workflow_status: None,
+            last_shell_exec_was_git_diff: false,
         }
     }
 
     /// Attach a workflow progress receiver.
     ///
-    /// Intended use: the CLI clones the workflow's progress sender
-    /// when a foreground `run_workflow` dispatches the engine and
-    /// passes the receiver here so the TUI's event loop drains
-    /// progress events. **Currently unused** — see
-    /// [`Self::workflow_progress_rx`] for the plan; #45 is the
-    /// follow-up that wires a real sender through.
+    /// Intended use: the CLI / `run_workflow` foreground path forks
+    /// the engine's progress channel and hands the receiver here so
+    /// the activity pane can drain `WorkflowProgress` events.
     pub fn set_workflow_progress_rx(&mut self, rx: mpsc::Receiver<WorkflowProgress>) {
         self.workflow_progress_rx = Some(rx);
-        self.workflow_status = None;
+        self.activity.workflow_progress = None;
     }
 
-    /// Drain pending workflow progress events. Returns `true` when at
-    /// least one event was consumed (the event loop should redraw).
+    /// Attach a run progress receiver.
     ///
-    /// We update [`Self::workflow_status`] in place. The detailed
-    /// rendering is intentionally minimal — issue #45 owns the full
-    /// activity-pane layout; this is the wiring deliverable for #41.
-    ///
-    /// **Currently unused at runtime** — no caller installs a real
-    /// receiver via [`Self::set_workflow_progress_rx`] yet, so this
-    /// drain is a no-op in practice. The full wiring lands with #45.
-    pub fn drain_workflow_progress(&mut self) -> bool {
-        let Some(rx) = self.workflow_progress_rx.as_mut() else {
-            return false;
-        };
-        let mut changed = false;
-        loop {
-            match rx.try_recv() {
-                Ok(ev) => {
-                    let entry = self
-                        .workflow_status
-                        .get_or_insert_with(|| WorkflowStatusLine {
-                            current_step: String::new(),
-                            loop_progress: None,
-                            started_at: Instant::now(),
-                            completed: false,
-                        });
-                    match ev {
-                        WorkflowProgress::StepStarted { step_id, .. } => {
-                            entry.current_step = step_id;
-                            entry.loop_progress = None;
-                        }
-                        WorkflowProgress::LoopIteration {
-                            step_id,
-                            iteration,
-                            max,
-                        } => {
-                            entry.current_step = step_id;
-                            entry.loop_progress = Some((iteration, max));
-                        }
-                        WorkflowProgress::WorkflowCompleted { .. } => {
-                            entry.completed = true;
-                        }
-                        // Other variants are not surfaced in the
-                        // minimal wire-up; #45 expands this.
-                        _ => {}
-                    }
-                    changed = true;
-                }
-                Err(mpsc::error::TryRecvError::Empty) => return changed,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    self.workflow_progress_rx = None;
-                    return changed;
-                }
-            }
-        }
-    }
-
-    /// Return the current workflow status line, if any. The renderer
-    /// can format this into the activity pane.
-    #[must_use]
-    pub fn workflow_status(&self) -> Option<&WorkflowStatusLine> {
-        self.workflow_status.as_ref()
+    /// The CLI calls this once with the receiver from
+    /// [`tmg_harness::RunRunner::progress_channel`] so scope upgrades
+    /// and session-end events flow into [`Self::run_header`] and the
+    /// activity pane.
+    pub fn set_run_progress_rx(&mut self, rx: mpsc::Receiver<RunProgressEvent>) {
+        self.run_progress_rx = Some(rx);
     }
 
     /// Set the active run for header display.
     pub fn set_current_run(&mut self, run: RunSummary) {
+        self.run_header = Some(RunHeader::from_summary(&run));
+        self.activity.run_progress.apply_summary(&run);
         self.current_run = Some(run);
+    }
+
+    /// Return a snapshot of the current run header (`None` if no run
+    /// is attached).
+    #[must_use]
+    pub fn run_header(&self) -> Option<&RunHeader> {
+        self.run_header.as_ref()
+    }
+
+    /// Return a reference to the structured Activity Pane state.
+    #[must_use]
+    pub fn activity(&self) -> &ActivityPane {
+        &self.activity
+    }
+
+    /// Borrow the run-progress section.
+    #[must_use]
+    pub fn run_progress(&self) -> &RunProgressSection {
+        &self.activity.run_progress
+    }
+
+    /// Borrow the workflow-progress section, if any.
+    #[must_use]
+    pub fn workflow_progress(&self) -> Option<&WorkflowProgressSection> {
+        self.activity.workflow_progress.as_ref()
+    }
+
+    /// Borrow the most recent diff preview, if any.
+    #[must_use]
+    pub fn diff_preview(&self) -> Option<&DiffPreview> {
+        self.activity.diff_preview.as_ref()
     }
 
     /// Set the shared [`RunRunner`] handle used to wrap turn sinks with
@@ -404,7 +363,7 @@ impl App {
 
     /// Return a reference to the tool activity log.
     pub fn tool_activity(&self) -> &[ToolActivityEntry] {
-        &self.tool_activity
+        &self.activity.tool_log
     }
 
     /// Return the current input text.
@@ -438,13 +397,14 @@ impl App {
     }
 
     /// Return the cached subagent summaries for display.
-    pub fn subagent_summaries(&self) -> &[SubagentSummary] {
-        &self.subagent_summaries
+    pub fn subagent_summaries(&self) -> &[tmg_agents::SubagentSummary] {
+        &self.activity.subagents
     }
 
     /// Return the count of running subagents from cached summaries.
     pub fn running_subagent_count(&self) -> usize {
-        self.subagent_summaries
+        self.activity
+            .subagents
             .iter()
             .filter(|s| !s.status.is_terminal())
             .count()
@@ -457,7 +417,7 @@ impl App {
     pub async fn refresh_subagent_summaries(&mut self) {
         if let Some(manager) = &self.subagent_manager {
             let manager = manager.lock().await;
-            self.subagent_summaries = manager.summaries().await;
+            self.activity.subagents = manager.summaries().await;
         }
     }
 
@@ -643,7 +603,8 @@ impl App {
             }
             "clear" => {
                 self.chat_entries.clear();
-                self.tool_activity.clear();
+                self.activity.tool_log.clear();
+                self.activity.diff_preview = None;
                 self.chat_scroll = 0;
                 if let Some(agent) = &mut self.agent {
                     agent.clear_history(&self.project_root, &self.cwd)?;
@@ -696,9 +657,9 @@ impl App {
             }
         }
 
-        if !self.subagent_summaries.is_empty() {
+        if !self.activity.subagents.is_empty() {
             text.push_str("\nActive subagents:\n");
-            for summary in &self.subagent_summaries {
+            for summary in &self.activity.subagents {
                 let task_preview = if summary.task.chars().count() > 60 {
                     format!("{}...", truncate_str(&summary.task, 57))
                 } else {
@@ -864,9 +825,25 @@ impl App {
                     changed = true;
                 }
                 Ok(TurnMessage::ToolCall { name, arguments }) => {
-                    // Truncate arguments for display.
+                    // Capture diff preview source from `file_write` /
+                    // `file_patch` arguments. We parse the JSON
+                    // best-effort: a malformed tool call still gets a
+                    // log entry, just no preview update.
+                    capture_diff_from_call(&mut self.activity.diff_preview, &name, &arguments);
+
+                    // Latch whether this `shell_exec` is a `git diff`
+                    // invocation. The matching `ToolResult` consults
+                    // the flag so we only extract a unified diff out
+                    // of outputs that are actually likely to contain
+                    // one — `git log -p`, `cat diff.txt`, and other
+                    // stray diff-looking blobs no longer overwrite a
+                    // legitimate `file_write` / `file_patch` preview.
+                    if name == "shell_exec" {
+                        self.last_shell_exec_was_git_diff = shell_exec_is_git_diff(&arguments);
+                    }
+
                     let summary = truncate_for_display(&arguments, 120);
-                    self.tool_activity.push(ToolActivityEntry {
+                    self.activity.tool_log.push(ToolActivityEntry {
                         tool_name: name,
                         summary: format!("calling: {summary}"),
                         is_error: false,
@@ -878,8 +855,24 @@ impl App {
                     output,
                     is_error,
                 }) => {
+                    // For `shell_exec` results whose original command
+                    // was `git diff` (latched on the matching
+                    // `ToolCall`), try to extract the unified diff.
+                    // Failure is silent — the tool log entry still
+                    // lands.
+                    if !is_error && name == "shell_exec" && self.last_shell_exec_was_git_diff {
+                        if let Some(preview) = crate::diff::try_extract_from_shell_output(&output) {
+                            self.activity.diff_preview = Some(preview);
+                        }
+                    }
+                    if name == "shell_exec" {
+                        // Reset the latch — each `git diff` call must
+                        // re-arm it on a fresh `ToolCall`.
+                        self.last_shell_exec_was_git_diff = false;
+                    }
+
                     let summary = truncate_for_display(&output, 200);
-                    self.tool_activity.push(ToolActivityEntry {
+                    self.activity.tool_log.push(ToolActivityEntry {
                         tool_name: name,
                         summary,
                         is_error,
@@ -973,6 +966,113 @@ impl App {
         }
     }
 
+    /// Drain pending [`RunProgressEvent`]s from the runner's progress
+    /// channel and update [`Self::run_header`] / the activity pane's
+    /// `RunProgressSection`. Returns `true` if anything changed.
+    pub fn drain_run_progress(&mut self) -> bool {
+        let Some(rx) = self.run_progress_rx.as_mut() else {
+            return false;
+        };
+        let mut changed = false;
+        loop {
+            match rx.try_recv() {
+                Ok(RunProgressEvent::ScopeUpgraded { features_count }) => {
+                    if let Some(header) = self.run_header.as_mut() {
+                        // We don't have the canonical workflow id at
+                        // this layer; the scope label still flips and
+                        // the feature counter updates. The CLI's
+                        // higher-level wiring is responsible for
+                        // re-loading the run summary on the next idle
+                        // tick to pick up the workflow id.
+                        header.scope_label = "harnessed";
+                        if let Some(total) = features_count {
+                            header.features = Some((0, total));
+                        }
+                    }
+                    let progress = &mut self.activity.run_progress;
+                    if !progress.is_harnessed() {
+                        progress.scope = tmg_harness::RunScope::harnessed("(unknown)", None);
+                    }
+                    if let Some(total) = features_count {
+                        progress.features_total = total;
+                    }
+                    changed = true;
+                }
+                Ok(RunProgressEvent::SessionEnded { trigger }) => {
+                    // The runner moves to a fresh successor session
+                    // for everything except `UserExit`; bumping the
+                    // header counter is best-effort because the CLI
+                    // re-attaches the new run summary on the next
+                    // idle pass. On `UserExit` no successor session
+                    // exists, so the counter must stay put.
+                    if !matches!(trigger, tmg_harness::SessionEndTrigger::UserExit) {
+                        if let Some(header) = self.run_header.as_mut() {
+                            header.session_num = header.session_num.saturating_add(1);
+                        }
+                        self.activity.run_progress.session_num =
+                            self.activity.run_progress.session_num.saturating_add(1);
+                        self.activity.run_progress.turns = 0;
+                    }
+                    changed = true;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => return changed,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.run_progress_rx = None;
+                    return changed;
+                }
+            }
+        }
+    }
+
+    /// Drain pending [`WorkflowProgress`] events. Returns `true` if a
+    /// redraw is needed.
+    ///
+    /// Delegates the state transition to
+    /// [`ActivityPane::apply_workflow_event`] so the activity-pane
+    /// state machine is testable in isolation.
+    pub fn drain_workflow_progress(&mut self) -> bool {
+        let Some(rx) = self.workflow_progress_rx.as_mut() else {
+            return false;
+        };
+        let mut changed = false;
+        loop {
+            match rx.try_recv() {
+                Ok(ev) => {
+                    self.activity.apply_workflow_event(&ev);
+                    changed = true;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => return changed,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.workflow_progress_rx = None;
+                    return changed;
+                }
+            }
+        }
+    }
+
+    /// Drain all three event channels (turn / run / workflow) in one
+    /// sweep. The event loop calls this every tick; returns `true` if
+    /// any channel produced an update.
+    ///
+    /// Order: turn messages first (they may take ownership of the
+    /// agent and gate the next compact step), then run progress
+    /// (header refresh), then workflow progress (activity pane
+    /// section). The order matches the user-visible priority — turn
+    /// updates always win.
+    pub fn drain_app_events(&mut self) -> bool {
+        let mut changed = false;
+        if self.drain_turn_messages() {
+            changed = true;
+        }
+        if self.drain_run_progress() {
+            changed = true;
+        }
+        if self.drain_workflow_progress() {
+            changed = true;
+        }
+        changed
+    }
+
     /// Return a mutable reference to the agent loop, if available.
     pub fn agent_mut(&mut self) -> Option<&mut AgentLoop> {
         self.agent.as_mut()
@@ -1005,6 +1105,111 @@ impl App {
     pub fn scroll_down(&mut self, lines: u16) {
         self.chat_scroll = self.chat_scroll.saturating_sub(lines);
     }
+}
+
+/// Inspect a tool-call argument blob for `file_write` / `file_patch`
+/// and update `current` with a synthesised diff preview when the
+/// arguments parse successfully.
+///
+/// We accept both the production `path` / `content` shape used by
+/// `tmg-tools::FileWriteTool` and a fallback that picks up `content`
+/// from a `file_patch` payload (which carries `path`, `search`,
+/// `replace`). The fallback synthesises a tiny "search → replace"
+/// diff so the activity pane has something to render until #46
+/// teaches `file_patch` to emit a real unified diff.
+fn capture_diff_from_call(current: &mut Option<DiffPreview>, name: &str, arguments: &str) {
+    match name {
+        "file_write" => {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+                return;
+            };
+            let path = value.get("path").and_then(|v| v.as_str());
+            let content = value.get("content").and_then(|v| v.as_str());
+            if let (Some(path), Some(content)) = (path, content) {
+                *current = Some(DiffPreview::from_file_write(path, content));
+            }
+        }
+        "file_patch" => {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+                return;
+            };
+            let path = value.get("path").and_then(|v| v.as_str());
+            let search = value.get("search").and_then(|v| v.as_str());
+            let replace = value.get("replace").and_then(|v| v.as_str());
+            if let (Some(path), Some(search), Some(replace)) = (path, search, replace) {
+                *current = Some(synthesise_patch_preview(path, search, replace));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Inspect a `shell_exec` tool-call argument blob and report whether
+/// the requested command is a `git diff` invocation.
+///
+/// The `shell_exec` tool's input shape is `{"command": "..."}`. We
+/// JSON-parse best-effort, trim leading whitespace from the command,
+/// and check (case-insensitively) for a `git diff` prefix. Anything
+/// non-conforming is treated as "not a git diff" so the TUI falls
+/// back to leaving the existing diff preview alone.
+fn shell_exec_is_git_diff(arguments: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return false;
+    };
+    let Some(command) = value.get("command").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let trimmed = command.trim_start();
+    // Match `git diff` and `git diff <args>` while letting `git
+    // difftool` or `git diffstat` slip through (the next char must be
+    // whitespace or end-of-string). Case-insensitive on the leading
+    // command so `GIT DIFF` (rare, but legal in some shells via
+    // aliases) still matches.
+    let lower = trimmed.to_ascii_lowercase();
+    let prefix = "git diff";
+    if !lower.starts_with(prefix) {
+        return false;
+    }
+    matches!(
+        lower.as_bytes().get(prefix.len()),
+        None | Some(b' ' | b'\t')
+    )
+}
+
+/// Build a tiny synthesised hunk for a `file_patch` call. This is
+/// best-effort — we do not have access to the surrounding file
+/// content at the TUI layer — so the hunk markers are zero, and the
+/// hunk body is `search` lines as `-` followed by `replace` lines as
+/// `+`.
+fn synthesise_patch_preview(path: &str, search: &str, replace: &str) -> DiffPreview {
+    use crate::diff::{DiffHunk, DiffLine, DiffLineKind};
+
+    let mut lines: Vec<DiffLine> = Vec::new();
+    for line in search.lines() {
+        lines.push(DiffLine {
+            kind: DiffLineKind::Removed,
+            content: line.to_owned(),
+        });
+    }
+    for line in replace.lines() {
+        lines.push(DiffLine {
+            kind: DiffLineKind::Added,
+            content: line.to_owned(),
+        });
+    }
+    let removed = u32::try_from(search.lines().count()).unwrap_or(u32::MAX);
+    let added = u32::try_from(replace.lines().count()).unwrap_or(u32::MAX);
+    DiffPreview::with_hunks(
+        PathBuf::from(path),
+        vec![DiffHunk {
+            old_start: 0,
+            old_lines: removed,
+            new_start: 0,
+            new_lines: added,
+            header_context: "file_patch".to_owned(),
+            lines,
+        }],
+    )
 }
 
 /// Truncate a string for display, replacing middle with ellipsis if
@@ -1085,6 +1290,10 @@ impl StreamSink for ChannelStreamSink {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "tests use expect for clarity; the workspace policy denies them in production code"
+)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1149,5 +1358,94 @@ mod tests {
         let text = "first line\nsecond line\nthird line";
         let result = truncate_for_display(text, 100);
         assert_eq!(result, "first line");
+    }
+
+    #[test]
+    fn capture_diff_from_file_write_call() {
+        let mut current: Option<DiffPreview> = None;
+        let args = serde_json::json!({
+            "path": "src/foo.rs",
+            "content": "fn main() {}\n",
+        })
+        .to_string();
+        capture_diff_from_call(&mut current, "file_write", &args);
+        let preview = current.expect("preview should be set");
+        assert_eq!(preview.file, PathBuf::from("src/foo.rs"));
+        assert_eq!(preview.hunks.len(), 1);
+    }
+
+    #[test]
+    fn capture_diff_from_file_patch_call() {
+        let mut current: Option<DiffPreview> = None;
+        let args = serde_json::json!({
+            "path": "src/bar.rs",
+            "search": "fn old() {}",
+            "replace": "fn new() {}",
+        })
+        .to_string();
+        capture_diff_from_call(&mut current, "file_patch", &args);
+        let preview = current.expect("preview should be set");
+        assert_eq!(preview.file, PathBuf::from("src/bar.rs"));
+        assert_eq!(preview.hunks[0].lines.len(), 2);
+    }
+
+    #[test]
+    fn capture_diff_ignores_other_tools() {
+        let mut current: Option<DiffPreview> = None;
+        let args = serde_json::json!({"command": "ls"}).to_string();
+        capture_diff_from_call(&mut current, "shell_exec", &args);
+        assert!(current.is_none());
+    }
+
+    #[test]
+    fn capture_diff_handles_malformed_json() {
+        let mut current: Option<DiffPreview> = None;
+        capture_diff_from_call(&mut current, "file_write", "not json {");
+        assert!(current.is_none());
+    }
+
+    #[test]
+    fn shell_exec_is_git_diff_matches_plain_command() {
+        let args = serde_json::json!({"command": "git diff"}).to_string();
+        assert!(shell_exec_is_git_diff(&args));
+    }
+
+    #[test]
+    fn shell_exec_is_git_diff_matches_with_args_and_whitespace() {
+        let args = serde_json::json!({"command": "  git diff --stat HEAD~1"}).to_string();
+        assert!(shell_exec_is_git_diff(&args));
+    }
+
+    #[test]
+    fn shell_exec_is_git_diff_is_case_insensitive() {
+        let args = serde_json::json!({"command": "GIT DIFF"}).to_string();
+        assert!(shell_exec_is_git_diff(&args));
+    }
+
+    #[test]
+    fn shell_exec_is_git_diff_rejects_other_commands() {
+        for cmd in [
+            "ls",
+            "git log -p",
+            "git status",
+            "cat foo.diff",
+            "git difftool",
+            "git diffstat",
+        ] {
+            let args = serde_json::json!({ "command": cmd }).to_string();
+            assert!(
+                !shell_exec_is_git_diff(&args),
+                "expected `{cmd}` to not match git diff",
+            );
+        }
+    }
+
+    #[test]
+    fn shell_exec_is_git_diff_rejects_malformed() {
+        assert!(!shell_exec_is_git_diff("not json {"));
+        assert!(!shell_exec_is_git_diff("{}"));
+        assert!(!shell_exec_is_git_diff(
+            &serde_json::json!({"command": 42}).to_string(),
+        ));
     }
 }

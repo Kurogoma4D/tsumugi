@@ -53,10 +53,19 @@ pub struct RunWorkflowTool {
     engine: Arc<WorkflowEngine>,
     workflow_index: WorkflowIndex,
     background_runs: BackgroundRunsHandle,
+    /// Optional observer that receives a clone of every
+    /// [`WorkflowProgress`] event the *foreground* path observes.
+    ///
+    /// The host (e.g. the CLI's TUI startup) installs this so live
+    /// progress events reach the TUI in addition to the foreground
+    /// drain task. Background runs use the per-run progress buffer
+    /// (queried via `workflow_status`) and are not fanned out here —
+    /// the buffer already provides the durable history surface.
+    progress_observer: Option<mpsc::Sender<WorkflowProgress>>,
 }
 
 impl RunWorkflowTool {
-    /// Build a new `run_workflow` tool.
+    /// Build a new `run_workflow` tool without a TUI progress observer.
     #[must_use]
     pub fn new(
         engine: Arc<WorkflowEngine>,
@@ -67,6 +76,29 @@ impl RunWorkflowTool {
             engine,
             workflow_index,
             background_runs,
+            progress_observer: None,
+        }
+    }
+
+    /// Build a new `run_workflow` tool that fans foreground progress
+    /// events out to `observer` in addition to draining them
+    /// internally. The CLI uses this to feed its TUI activity pane.
+    ///
+    /// Sends to a closed/full observer channel are silently dropped:
+    /// the observer is best-effort, and a stalled TUI must never
+    /// block engine progress.
+    #[must_use]
+    pub fn with_progress_observer(
+        engine: Arc<WorkflowEngine>,
+        workflow_index: WorkflowIndex,
+        background_runs: BackgroundRunsHandle,
+        observer: mpsc::Sender<WorkflowProgress>,
+    ) -> Self {
+        Self {
+            engine,
+            workflow_index,
+            background_runs,
+            progress_observer: Some(observer),
         }
     }
 }
@@ -164,7 +196,13 @@ impl RunWorkflowTool {
                 .to_string(),
             ))
         } else {
-            let outputs = run_foreground(&self.engine, &workflow, inputs).await;
+            let outputs = run_foreground(
+                &self.engine,
+                &workflow,
+                inputs,
+                self.progress_observer.clone(),
+            )
+            .await;
             match outputs {
                 Ok(outs) => Ok(ToolResult::success(serialize_outputs(&outs).to_string())),
                 Err(e) => Ok(ToolResult::error(format!("workflow failed: {e}"))),
@@ -351,20 +389,35 @@ async fn push_progress(buffer: &Mutex<VecDeque<WorkflowProgress>>, ev: WorkflowP
 /// Run a workflow inline (foreground mode). The returned receiver is
 /// fully drained before this future resolves so we don't leak
 /// background tasks.
+///
+/// When `observer` is `Some`, every event the engine emits is also
+/// forwarded to the observer channel (typically wired to the TUI's
+/// activity pane). Forwarding uses `try_send`: a stalled or full
+/// observer must never block engine progress, so dropped events are
+/// accepted as the cost of liveness.
 async fn run_foreground(
     engine: &WorkflowEngine,
     workflow: &WorkflowDef,
     inputs: BTreeMap<String, Value>,
+    observer: Option<mpsc::Sender<WorkflowProgress>>,
 ) -> Result<WorkflowOutputs, crate::error::WorkflowError> {
     // Use a small channel; events are not surfaced to the LLM in
     // foreground mode, but the engine still emits them. We drain in a
     // detached task so the engine can make forward progress.
     let (tx, mut rx) = mpsc::channel::<WorkflowProgress>(64);
     let drain = tokio::spawn(async move {
-        while rx.recv().await.is_some() {
-            // Discarded. Foreground callers that want the events
-            // should switch to background mode and read via the
-            // status tool.
+        while let Some(ev) = rx.recv().await {
+            if let Some(obs) = observer.as_ref() {
+                // Best-effort fan-out. `try_send` covers both the
+                // `Closed` (TUI dropped its receiver) and `Full`
+                // (TUI tick is slower than the engine) cases without
+                // blocking the drain loop.
+                let _ = obs.try_send(ev);
+            }
+            // The original drain semantics: events are discarded
+            // beyond the optional fan-out. Foreground callers that
+            // want a complete event log should use background mode
+            // and `workflow_status`.
         }
     });
     let result = engine.run(workflow, inputs, tx).await;

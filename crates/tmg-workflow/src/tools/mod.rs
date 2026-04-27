@@ -18,14 +18,18 @@ mod types;
 mod workflow_status;
 
 pub use run_workflow::RunWorkflowTool;
+// `register_workflow_tools_with_observer` is defined inline below;
+// `register_workflow_tools` is also a free fn here. They are
+// re-exported via `crate::lib`.
 pub use types::{BackgroundRun, BackgroundRunsHandle, WorkflowRunId};
 pub use workflow_status::WorkflowStatusTool;
 
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::WorkflowEngine;
+use crate::progress::WorkflowProgress;
 
 /// Convenience helper: register `run_workflow` and `workflow_status`
 /// against the supplied [`tmg_tools::ToolRegistry`].
@@ -38,17 +42,43 @@ pub fn register_workflow_tools(
     engine: &Arc<WorkflowEngine>,
     background_runs: &BackgroundRunsHandle,
 ) {
+    register_workflow_tools_with_observer(registry, engine, background_runs, None);
+}
+
+/// Like [`register_workflow_tools`] but installs `observer` so the
+/// foreground `run_workflow` path fans every [`WorkflowProgress`]
+/// event out to the supplied channel as well as draining it
+/// internally.
+///
+/// Sends to a closed/full observer channel are silently dropped — the
+/// observer is best-effort, and a stalled TUI must never block engine
+/// progress.
+pub fn register_workflow_tools_with_observer(
+    registry: &mut tmg_tools::ToolRegistry,
+    engine: &Arc<WorkflowEngine>,
+    background_runs: &BackgroundRunsHandle,
+    observer: Option<mpsc::Sender<WorkflowProgress>>,
+) {
     let Some(workflow_index) = engine.workflow_index_handle() else {
         // No index attached → nothing to dispatch. We still skip
         // registration to keep the LLM's view of the tool catalogue
         // honest.
         return;
     };
-    registry.register(RunWorkflowTool::new(
-        Arc::clone(engine),
-        workflow_index,
-        Arc::clone(background_runs),
-    ));
+    if let Some(observer) = observer {
+        registry.register(RunWorkflowTool::with_progress_observer(
+            Arc::clone(engine),
+            workflow_index,
+            Arc::clone(background_runs),
+            observer,
+        ));
+    } else {
+        registry.register(RunWorkflowTool::new(
+            Arc::clone(engine),
+            workflow_index,
+            Arc::clone(background_runs),
+        ));
+    }
     registry.register(WorkflowStatusTool::new(Arc::clone(background_runs)));
 }
 

@@ -687,6 +687,17 @@ fn run_tui(
         // workflows terminate promptly instead of being aborted at the
         // runtime boundary.
         let mut background_runs: Option<tmg_workflow::BackgroundRunsHandle> = None;
+        // Optional receiver of [`tmg_workflow::WorkflowProgress`]
+        // events forwarded by the foreground `run_workflow` path; the
+        // TUI subscribes via `set_workflow_progress_rx`. Only wired
+        // when at least one workflow has been discovered (otherwise
+        // there is nothing to listen to). The buffer size matches the
+        // engine's internal channel cap so back-pressure is bounded
+        // without blocking engine progress; saturation simply drops
+        // observer events.
+        let mut workflow_progress_rx: Option<
+            tokio::sync::mpsc::Receiver<tmg_workflow::WorkflowProgress>,
+        > = None;
         if !workflow_metas.is_empty() {
             // Eagerly parse each discovered workflow into a
             // canonical [`tmg_workflow::WorkflowDef`]. Parse errors
@@ -735,7 +746,22 @@ fn run_tui(
                     .with_workflow_index(Arc::clone(&workflow_index)),
                 );
                 let bg_runs = tmg_workflow::tools::new_background_runs();
-                tmg_workflow::register_workflow_tools(&mut registry, &engine, &bg_runs);
+                // Build a TUI-side observer channel. The foreground
+                // `run_workflow` path fans every progress event into
+                // `tui_progress_tx` in addition to draining it
+                // internally; the TUI's activity pane drains the
+                // matching receiver every tick. Saturation is dropped
+                // (best-effort) so a stalled TUI never blocks engine
+                // progress.
+                let (tui_progress_tx, tui_progress_rx) =
+                    tokio::sync::mpsc::channel::<tmg_workflow::WorkflowProgress>(64);
+                tmg_workflow::register_workflow_tools_with_observer(
+                    &mut registry,
+                    &engine,
+                    &bg_runs,
+                    Some(tui_progress_tx),
+                );
+                workflow_progress_rx = Some(tui_progress_rx);
                 // Stash a clone for the TUI shutdown path so we can
                 // fire the cancellation tokens on every still-running
                 // background workflow before the runtime tears down.
@@ -779,6 +805,15 @@ fn run_tui(
         // without the auto-injected bundle.
         inject_bootstrap(&mut agent, Arc::clone(&runner)).await;
 
+        // Subscribe to the runner's progress channel before handing
+        // ownership of the runner mutex to the TUI. The channel is
+        // bounded (16); the activity pane drains it every tick so
+        // back-pressure on the runner is bounded by one TUI frame.
+        let run_progress_rx = {
+            let mut guard = runner.lock().await;
+            Some(guard.progress_channel())
+        };
+
         let tui_cancel = cancel.clone();
         let tui_result = tmg_tui::run(
             agent,
@@ -791,6 +826,8 @@ fn run_tui(
             event_log,
             Some(run_summary),
             Some(Arc::clone(&runner)),
+            run_progress_rx,
+            workflow_progress_rx,
         )
         .await;
 

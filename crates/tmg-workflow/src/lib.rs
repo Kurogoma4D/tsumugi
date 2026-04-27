@@ -49,5 +49,5 @@ pub use parse::{parse_workflow_file, parse_workflow_str};
 pub use progress::{HumanResponder, HumanResponse, HumanResponseKind, WorkflowProgress};
 pub use tools::{
     BackgroundRunsHandle, RunWorkflowTool, WorkflowRunId, WorkflowStatusTool,
-    register_workflow_tools,
+    register_workflow_tools, register_workflow_tools_with_observer,
 };

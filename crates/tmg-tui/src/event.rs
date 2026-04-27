@@ -52,8 +52,12 @@ pub async fn run_event_loop(
         .unwrap_or_else(Instant::now);
 
     loop {
-        // Drain any pending turn messages before drawing.
-        app.drain_turn_messages();
+        // Drain pending events from all three channels (turn / run /
+        // workflow) before drawing. `drain_app_events` is the
+        // canonical entry-point introduced in #45; it preserves the
+        // previous turn-message behaviour and additionally pumps the
+        // run-progress and workflow-progress streams.
+        app.drain_app_events();
 
         // Handle pending /compact command as a background task.
         if app.needs_compact() && !app.is_streaming() {
