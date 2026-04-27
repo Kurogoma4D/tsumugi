@@ -124,6 +124,7 @@ impl PartialSkillsConfig {
 struct PartialHarnessConfig {
     pub runs_dir: Option<PathBuf>,
     pub auto_resume_on_start: Option<bool>,
+    pub bootstrap_max_tokens: Option<usize>,
 }
 
 impl PartialHarnessConfig {
@@ -135,6 +136,9 @@ impl PartialHarnessConfig {
         if other.auto_resume_on_start.is_some() {
             self.auto_resume_on_start = other.auto_resume_on_start;
         }
+        if other.bootstrap_max_tokens.is_some() {
+            self.bootstrap_max_tokens = other.bootstrap_max_tokens;
+        }
     }
 
     /// Convert to final `HarnessConfig`, filling in defaults for unset
@@ -145,6 +149,9 @@ impl PartialHarnessConfig {
             auto_resume_on_start: self
                 .auto_resume_on_start
                 .unwrap_or(default_auto_resume_on_start()),
+            bootstrap_max_tokens: self
+                .bootstrap_max_tokens
+                .unwrap_or_else(default_bootstrap_max_tokens),
         }
     }
 }
@@ -254,6 +261,14 @@ impl PartialTsumugiConfig {
                 reason: "must be one of: true, false, 1, 0".to_owned(),
             })?;
             self.harness.auto_resume_on_start = Some(parsed);
+        }
+        if let Some(v) = env_fn("TMG_HARNESS_BOOTSTRAP_MAX_TOKENS") {
+            let n = v.parse::<usize>().map_err(|_| ConfigError::InvalidValue {
+                field: "TMG_HARNESS_BOOTSTRAP_MAX_TOKENS".to_owned(),
+                value: v,
+                reason: "must be a non-negative integer".to_owned(),
+            })?;
+            self.harness.bootstrap_max_tokens = Some(n);
         }
         Ok(())
     }
@@ -379,6 +394,15 @@ pub struct HarnessConfig {
     /// Whether to automatically resume the most recent unfinished run on
     /// startup, instead of creating a new ad-hoc run.
     pub auto_resume_on_start: bool,
+
+    /// Maximum tokens for the `session_bootstrap` payload before the
+    /// tool truncates older progress sessions / git log entries to fit.
+    ///
+    /// Set to `0` to disable truncation entirely (the payload is
+    /// emitted in full regardless of size). Any value `>= 1` is a hard
+    /// budget; older `progress.md` sessions and tail-end git log lines
+    /// are shed until the serialized payload fits.
+    pub bootstrap_max_tokens: usize,
 }
 
 fn default_runs_dir() -> PathBuf {
@@ -389,11 +413,16 @@ const fn default_auto_resume_on_start() -> bool {
     true
 }
 
+fn default_bootstrap_max_tokens() -> usize {
+    tmg_harness::DEFAULT_BOOTSTRAP_MAX_TOKENS
+}
+
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
             runs_dir: default_runs_dir(),
             auto_resume_on_start: default_auto_resume_on_start(),
+            bootstrap_max_tokens: default_bootstrap_max_tokens(),
         }
     }
 }
@@ -964,6 +993,10 @@ compat_claude = false
         let config = TsumugiConfig::default();
         assert_eq!(config.harness.runs_dir, default_runs_dir());
         assert!(config.harness.auto_resume_on_start);
+        assert_eq!(
+            config.harness.bootstrap_max_tokens,
+            tmg_harness::DEFAULT_BOOTSTRAP_MAX_TOKENS
+        );
     }
 
     #[test]
@@ -972,12 +1005,14 @@ compat_claude = false
 [harness]
 runs_dir = "/tmp/tsumugi-runs"
 auto_resume_on_start = false
+bootstrap_max_tokens = 1024
 "#;
         let partial: PartialTsumugiConfig =
             toml::from_str(toml_str).unwrap_or_else(|e| panic!("{e}"));
         let config = partial.into_final();
         assert_eq!(config.harness.runs_dir, PathBuf::from("/tmp/tsumugi-runs"));
         assert!(!config.harness.auto_resume_on_start);
+        assert_eq!(config.harness.bootstrap_max_tokens, 1024);
     }
 
     #[test]
@@ -985,9 +1020,11 @@ auto_resume_on_start = false
         let mut base = PartialTsumugiConfig::default();
         base.harness.runs_dir = Some(PathBuf::from(".tsumugi/runs"));
         base.harness.auto_resume_on_start = Some(true);
+        base.harness.bootstrap_max_tokens = Some(2048);
 
         let mut overlay = PartialTsumugiConfig::default();
         overlay.harness.auto_resume_on_start = Some(false);
+        overlay.harness.bootstrap_max_tokens = Some(8192);
         // runs_dir stays None: should not override.
 
         base.merge_from(&overlay);
@@ -998,6 +1035,7 @@ auto_resume_on_start = false
             PathBuf::from(".tsumugi/runs")
         );
         assert!(!final_config.harness.auto_resume_on_start);
+        assert_eq!(final_config.harness.bootstrap_max_tokens, 8192);
     }
 
     #[test]
@@ -1007,6 +1045,7 @@ auto_resume_on_start = false
             match key {
                 "TMG_HARNESS_RUNS_DIR" => Some("/var/tsumugi".to_owned()),
                 "TMG_HARNESS_AUTO_RESUME_ON_START" => Some("false".to_owned()),
+                "TMG_HARNESS_BOOTSTRAP_MAX_TOKENS" => Some("12345".to_owned()),
                 _ => None,
             }
         };
@@ -1016,6 +1055,25 @@ auto_resume_on_start = false
         let final_config = config.into_final();
         assert_eq!(final_config.harness.runs_dir, PathBuf::from("/var/tsumugi"));
         assert!(!final_config.harness.auto_resume_on_start);
+        assert_eq!(final_config.harness.bootstrap_max_tokens, 12345);
+    }
+
+    #[test]
+    fn harness_env_override_invalid_bootstrap_max_tokens_returns_error() {
+        let mut config = PartialTsumugiConfig::default();
+        let env_fn = |key: &str| -> Option<String> {
+            if key == "TMG_HARNESS_BOOTSTRAP_MAX_TOKENS" {
+                Some("not-a-number".to_owned())
+            } else {
+                None
+            }
+        };
+        let result = config.apply_env_overrides(&env_fn);
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue { ref field, .. })
+                if field == "TMG_HARNESS_BOOTSTRAP_MAX_TOKENS"
+        ));
     }
 
     #[test]

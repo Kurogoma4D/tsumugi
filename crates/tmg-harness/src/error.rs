@@ -55,12 +55,65 @@ pub enum HarnessError {
         /// Run id actually present inside the loaded `run.toml`.
         found: String,
     },
+
+    /// Failed to serialize a [`Session`](crate::session::Session) to JSON.
+    #[error("failed to serialize session at {path}: {source}")]
+    SessionSerialize {
+        /// Target file path.
+        path: PathBuf,
+        /// Underlying serialization error.
+        source: serde_json::Error,
+    },
+
+    /// Failed to deserialize a `session_NNN.json` from disk.
+    #[error("failed to parse session log at {path}: {source}")]
+    SessionDeserialize {
+        /// Source file path.
+        path: PathBuf,
+        /// Underlying deserialization error.
+        source: serde_json::Error,
+    },
+
+    /// `RunRunner::end_session` was called with a [`SessionHandle`] that
+    /// does not match the currently-active [`Session`]. This typically
+    /// indicates a bug in the caller (e.g. an out-of-order
+    /// `begin_session` / `end_session` pairing); we refuse to persist
+    /// rather than silently overwriting the active session with the
+    /// wrong index.
+    ///
+    /// [`SessionHandle`]: crate::session::SessionHandle
+    /// [`Session`]: crate::session::Session
+    #[error(
+        "session handle mismatch: end_session called with index {actual} but active session is index {expected}"
+    )]
+    SessionMismatch {
+        /// Index of the session that is actually active.
+        expected: u32,
+        /// Index carried by the handle the caller passed in.
+        actual: u32,
+    },
 }
 
 impl HarnessError {
     /// Construct an [`HarnessError::Io`] from a path and `std::io::Error`.
     pub fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         Self::Io {
+            path: path.into(),
+            source,
+        }
+    }
+
+    /// Construct a [`HarnessError::SessionSerialize`].
+    pub fn session_serialize(path: impl Into<PathBuf>, source: serde_json::Error) -> Self {
+        Self::SessionSerialize {
+            path: path.into(),
+            source,
+        }
+    }
+
+    /// Construct a [`HarnessError::SessionDeserialize`].
+    pub fn session_deserialize(path: impl Into<PathBuf>, source: serde_json::Error) -> Self {
+        Self::SessionDeserialize {
             path: path.into(),
             source,
         }

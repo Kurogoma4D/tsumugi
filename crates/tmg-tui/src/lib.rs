@@ -21,7 +21,7 @@ use crossterm::event::{
 use crossterm::execute;
 use tmg_agents::{CustomAgentDef, SubagentManager};
 use tmg_core::AgentLoop;
-use tmg_harness::RunSummary;
+use tmg_harness::{RunRunner, RunSummary};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -42,6 +42,10 @@ use tokio_util::sync::CancellationToken;
 /// * `custom_agents` - Custom agent definitions for `/agents` list display.
 /// * `event_log` - Optional path to write structured event log (JSON Lines).
 /// * `current_run` - Optional active run summary for header display.
+/// * `runner` - Optional shared [`RunRunner`] used to wrap each turn's
+///   sink with [`HarnessStreamSink`](tmg_harness::HarnessStreamSink) so
+///   the active session's `tool_calls_count` and `files_modified` are
+///   updated as the LLM drives the conversation.
 ///
 /// # Errors
 ///
@@ -60,6 +64,7 @@ pub async fn run(
     custom_agents: Vec<CustomAgentDef>,
     event_log: Option<PathBuf>,
     current_run: Option<RunSummary>,
+    runner: Option<Arc<Mutex<RunRunner>>>,
 ) -> Result<(), TuiError> {
     let mut terminal = ratatui::init();
 
@@ -103,6 +108,10 @@ pub async fn run(
 
     if let Some(run) = current_run {
         app.set_current_run(run);
+    }
+
+    if let Some(r) = runner {
+        app.set_runner(r);
     }
 
     let result = event::run_event_loop(&mut terminal, &mut app, cancel).await;

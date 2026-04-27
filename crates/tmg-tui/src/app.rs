@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tmg_agents::{AgentType, CustomAgentDef, SubagentManager, SubagentSummary, truncate_str};
 use tmg_core::{AgentLoop, CoreError, StreamSink, format_context_usage};
-use tmg_harness::RunSummary;
+use tmg_harness::{HarnessStreamSink, RunRunner, RunSummary};
 use tmg_llm::Role;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -175,6 +175,11 @@ pub struct App {
 
     /// The currently active run, used for header display.
     current_run: Option<RunSummary>,
+
+    /// Optional [`RunRunner`] handle used to wrap each turn's sink with
+    /// [`HarnessStreamSink`], so the active session's `tool_calls_count`
+    /// and `files_modified` reflect actual tool activity.
+    runner: Option<Arc<Mutex<RunRunner>>>,
 }
 
 impl App {
@@ -210,12 +215,19 @@ impl App {
             thinking: false,
             event_log_path: event_log,
             current_run: None,
+            runner: None,
         }
     }
 
     /// Set the active run for header display.
     pub fn set_current_run(&mut self, run: RunSummary) {
         self.current_run = Some(run);
+    }
+
+    /// Set the shared [`RunRunner`] handle used to wrap turn sinks with
+    /// [`HarnessStreamSink`].
+    pub fn set_runner(&mut self, runner: Arc<Mutex<RunRunner>>) {
+        self.runner = Some(runner);
     }
 
     /// Return the active run, if any.
@@ -628,14 +640,33 @@ impl App {
             .as_deref()
             .and_then(|path| tmg_core::EventLogWriter::open_append(path).ok());
 
+        let runner = self.runner.clone();
+
         let join = tokio::spawn(async move {
             let channel_sink = ChannelStreamSink { tx: tx.clone() };
-            let result = if let Some(log) = event_log_writer {
-                let mut tee = tmg_core::TeeStreamSink::new(channel_sink, log);
-                agent.turn(&user_input, &mut tee).await
-            } else {
-                let mut sink = channel_sink;
-                agent.turn(&user_input, &mut sink).await
+            // The chain of sinks below is built bottom-up: the channel
+            // sink (and optional event log) sit at the bottom, and
+            // `HarnessStreamSink` wraps them so harness session-stat
+            // updates fire on every event without changing the in-flight
+            // forwarding to the TUI.
+            let result = match (event_log_writer, runner) {
+                (Some(log), Some(runner)) => {
+                    let tee = tmg_core::TeeStreamSink::new(channel_sink, log);
+                    let mut wrapped = HarnessStreamSink::new(tee, runner);
+                    agent.turn(&user_input, &mut wrapped).await
+                }
+                (Some(log), None) => {
+                    let mut tee = tmg_core::TeeStreamSink::new(channel_sink, log);
+                    agent.turn(&user_input, &mut tee).await
+                }
+                (None, Some(runner)) => {
+                    let mut wrapped = HarnessStreamSink::new(channel_sink, runner);
+                    agent.turn(&user_input, &mut wrapped).await
+                }
+                (None, None) => {
+                    let mut sink = channel_sink;
+                    agent.turn(&user_input, &mut sink).await
+                }
             };
 
             match result {

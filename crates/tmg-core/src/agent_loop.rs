@@ -225,11 +225,40 @@ impl AgentLoop {
         &self.history
     }
 
+    /// Insert a system message immediately after the initial system
+    /// prompt at `history[0]`.
+    ///
+    /// The harness startup path uses this to inject the
+    /// `session_bootstrap` payload before the first user turn. Inserting
+    /// at index `1` (rather than appending after any prompt-file
+    /// user-role messages) keeps the conversation compatible with
+    /// chat templates that reject `system` messages following a `user`
+    /// turn (Mistral, Qwen, Gemma, etc.).
+    ///
+    /// Subsequent calls insert at the same position, so the most-recent
+    /// bootstrap appears closest to the initial system prompt; existing
+    /// bootstrap messages are pushed one slot deeper. Bootstraps are
+    /// preserved across the loop until the next
+    /// [`clear_history`](Self::clear_history).
+    pub fn insert_bootstrap_system_message(&mut self, content: impl Into<String>) {
+        // Defensive: if `history` is empty (impossible in normal use —
+        // `with_context_config` always seeds index 0 with the system
+        // prompt), fall back to push so we don't panic.
+        let position = usize::from(!self.history.is_empty());
+        self.history.insert(position, Message::system(content));
+    }
+
     /// Clear conversation history, retaining only the system prompt and
     /// any injected prompt-file messages.
     ///
     /// This reloads prompt files from `project_root`/`cwd` so the
     /// conversation restarts with a fresh context.
+    ///
+    /// **Bootstrap messages are dropped.** Any system messages added
+    /// via [`insert_bootstrap_system_message`](Self::insert_bootstrap_system_message)
+    /// (e.g. the `session_bootstrap` payload injected at startup) are
+    /// removed by this call. Callers that want the bootstrap preserved
+    /// across `/clear` must re-inject it after `clear_history` returns.
     ///
     /// # Errors
     ///
@@ -620,6 +649,60 @@ mod tests {
         let chat = msg.to_chat_message();
         assert_eq!(chat.role, tmg_llm::Role::Tool);
         assert_eq!(chat.tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn insert_bootstrap_system_message_role_and_content() {
+        // Build a Message directly (not via AgentLoop::new which requires
+        // an LLM client) and verify the role/content roundtrip used by
+        // `insert_bootstrap_system_message`.
+        let injected = Message::system("BOOTSTRAP: hello");
+        assert_eq!(injected.role(), tmg_llm::Role::System);
+        assert_eq!(injected.content(), "BOOTSTRAP: hello");
+
+        let chat = injected.to_chat_message();
+        assert_eq!(chat.role, tmg_llm::Role::System);
+        assert_eq!(chat.content.as_deref(), Some("BOOTSTRAP: hello"));
+    }
+
+    /// `insert_bootstrap_system_message` must place the bootstrap
+    /// directly after the initial system prompt (index 0), even when
+    /// prompt-file user-role messages have already been loaded into
+    /// history. This is required by chat templates (Mistral / Qwen /
+    /// Gemma) that reject `system` messages following a `user` turn.
+    ///
+    /// We exercise the position logic directly on a `Vec<Message>`
+    /// instead of constructing a full `AgentLoop` (which needs an LLM
+    /// client); the implementation under test only manipulates this
+    /// vector.
+    #[test]
+    fn insert_bootstrap_system_message_inserted_after_history_zero() {
+        let mut history = vec![
+            Message::system("BASE"),
+            Message::user("prompt-file content from TSUMUGI.md"),
+        ];
+
+        // Mirror the production logic.
+        let position = usize::from(!history.is_empty());
+        history.insert(position, Message::system("BOOTSTRAP-1"));
+
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].content(), "BASE");
+        assert_eq!(history[1].role(), tmg_llm::Role::System);
+        assert_eq!(history[1].content(), "BOOTSTRAP-1");
+        assert_eq!(history[2].role(), tmg_llm::Role::User);
+
+        // A second bootstrap injection lands at the same slot, pushing
+        // the previous bootstrap one slot deeper but staying entirely
+        // ahead of the first user-role message.
+        let position = usize::from(!history.is_empty());
+        history.insert(position, Message::system("BOOTSTRAP-2"));
+
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[0].content(), "BASE");
+        assert_eq!(history[1].content(), "BOOTSTRAP-2");
+        assert_eq!(history[2].content(), "BOOTSTRAP-1");
+        assert_eq!(history[3].role(), tmg_llm::Role::User);
     }
 
     #[test]

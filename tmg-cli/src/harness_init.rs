@@ -73,6 +73,7 @@ mod tests {
         let cfg = HarnessConfig {
             runs_dir: store.runs_dir().to_path_buf(),
             auto_resume_on_start: true,
+            bootstrap_max_tokens: tmg_harness::DEFAULT_BOOTSTRAP_MAX_TOKENS,
         };
         let resolved =
             resolve_startup_run(&cfg, &store, workspace.clone()).unwrap_or_else(|e| panic!("{e}"));
@@ -93,6 +94,7 @@ mod tests {
         let cfg = HarnessConfig {
             runs_dir: store.runs_dir().to_path_buf(),
             auto_resume_on_start: false,
+            bootstrap_max_tokens: tmg_harness::DEFAULT_BOOTSTRAP_MAX_TOKENS,
         };
         let resolved =
             resolve_startup_run(&cfg, &store, workspace.clone()).unwrap_or_else(|e| panic!("{e}"));
@@ -121,6 +123,7 @@ mod tests {
         let cfg = HarnessConfig {
             runs_dir: store.runs_dir().to_path_buf(),
             auto_resume_on_start: true,
+            bootstrap_max_tokens: tmg_harness::DEFAULT_BOOTSTRAP_MAX_TOKENS,
         };
         let resolved =
             resolve_startup_run(&cfg, &store, workspace.clone()).unwrap_or_else(|e| panic!("{e}"));
@@ -140,6 +143,7 @@ mod tests {
         let cfg = HarnessConfig {
             runs_dir: store.runs_dir().to_path_buf(),
             auto_resume_on_start: true,
+            bootstrap_max_tokens: tmg_harness::DEFAULT_BOOTSTRAP_MAX_TOKENS,
         };
         let resolved =
             resolve_startup_run(&cfg, &store, workspace.clone()).unwrap_or_else(|e| panic!("{e}"));
@@ -166,6 +170,7 @@ mod tests {
         let cfg = HarnessConfig {
             runs_dir: store.runs_dir().to_path_buf(),
             auto_resume_on_start: true,
+            bootstrap_max_tokens: tmg_harness::DEFAULT_BOOTSTRAP_MAX_TOKENS,
         };
 
         // Starting in workspace_b should NOT resume run_a; instead a
@@ -195,6 +200,7 @@ mod tests {
         let cfg = HarnessConfig {
             runs_dir: store.runs_dir().to_path_buf(),
             auto_resume_on_start: true,
+            bootstrap_max_tokens: tmg_harness::DEFAULT_BOOTSTRAP_MAX_TOKENS,
         };
 
         // First launch: create a fresh run, begin and end one session,
@@ -206,7 +212,7 @@ mod tests {
         let handle_one = runner_one.begin_session().unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(runner_one.run().session_count, 1);
         runner_one
-            .end_session(handle_one, SessionEndTrigger::Completed)
+            .end_session(&handle_one, SessionEndTrigger::Completed)
             .unwrap_or_else(|e| panic!("{e}"));
 
         // Second launch: resume the same run (same workspace, status
