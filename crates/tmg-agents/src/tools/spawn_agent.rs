@@ -1,9 +1,12 @@
 //! The `spawn_agent` tool: spawns a subagent from the main agent loop.
 //!
 //! Parameters:
-//! - `agent_type` (string, required): one of the built-in types
-//!   (`"explore"`, `"worker"`, `"plan"`, `"initializer"`, `"tester"`,
-//!   `"qa"`) or the name of a custom agent
+//! - `agent_type` (string, required): one of the user-spawnable
+//!   built-in types (`"explore"`, `"worker"`, `"plan"`,
+//!   `"initializer"`, `"tester"`, `"qa"`) or the name of a custom
+//!   agent. The `"escalator"` type is harness-orchestrated only and is
+//!   intentionally excluded from this tool's schema (see
+//!   [`AgentType::is_user_spawnable`]).
 //! - `task` (string, required): the task description for the subagent
 //! - `background` (boolean, optional, default: `false`): whether to run
 //!   in the background
@@ -69,12 +72,17 @@ impl SpawnAgentTool {
 
     /// Resolve an `agent_type` string to an `AgentKind`.
     ///
-    /// First checks built-in types, then falls back to custom agents.
-    /// Uses `Arc::clone` for custom agents to avoid copying the entire
-    /// definition on each resolution.
+    /// First checks built-in types (excluding harness-orchestrated ones
+    /// such as `escalator`; see [`AgentType::is_user_spawnable`]), then
+    /// falls back to custom agents. Uses `Arc::clone` for custom agents
+    /// to avoid copying the entire definition on each resolution.
     fn resolve_agent_kind(&self, name: &str) -> Option<AgentKind> {
-        // Try built-in first.
-        if let Some(builtin) = AgentType::from_name(name) {
+        // Try built-in first, but only the user-spawnable subset --
+        // harness-only agents (e.g. `escalator`) must not be reachable
+        // through `spawn_agent`.
+        if let Some(builtin) = AgentType::from_name(name)
+            && builtin.is_user_spawnable()
+        {
             return Some(AgentKind::Builtin(builtin));
         }
 
@@ -84,9 +92,19 @@ impl SpawnAgentTool {
             .map(|def| AgentKind::Custom(Arc::clone(def)))
     }
 
-    /// Return all available agent type names for error messages.
+    /// Return the agent type names this tool is allowed to spawn.
+    ///
+    /// Used both for the JSON-Schema `enum` and for the
+    /// "valid types" hint inside `unknown agent_type` error messages.
+    /// Filters [`AgentType::ALL`] through
+    /// [`AgentType::is_user_spawnable`] so harness-only agents
+    /// (currently `escalator`) never appear.
     fn available_agent_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = AgentType::ALL.iter().map(|t| t.name().to_owned()).collect();
+        let mut names: Vec<String> = AgentType::ALL
+            .iter()
+            .filter(|t| t.is_user_spawnable())
+            .map(|t| t.name().to_owned())
+            .collect();
         let mut custom_names: Vec<String> = self.custom_agents.keys().cloned().collect();
         custom_names.sort();
         names.extend(custom_names);
@@ -107,6 +125,8 @@ impl Tool for SpawnAgentTool {
          'initializer' (project bootstrap: features.json/init.sh/progress.md + initial commit), \
          'tester' (smoke-test runner via shell_exec), \
          'qa' (read-only acceptance-criteria QA; only agent that can mark features passing). \
+         The 'escalator' built-in is harness-orchestrated only and \
+         cannot be spawned through this tool. \
          Custom agents defined in .tsumugi/agents/ are also available. \
          Set background=true to run asynchronously."
     }
@@ -221,5 +241,92 @@ impl Tool for SpawnAgentTool {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::panic, reason = "test assertions")]
+#[expect(clippy::expect_used, reason = "test assertions")]
+mod tests {
+    use super::*;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::manager::SubagentManager;
+
+    /// Build a `SpawnAgentTool` with no custom agents over a manager
+    /// that points at a deliberately-unreachable endpoint. The schema
+    /// and resolution paths exercised in these tests never actually
+    /// dispatch an HTTP request, so the unreachable endpoint is fine.
+    fn make_tool() -> Option<SpawnAgentTool> {
+        let cfg = tmg_llm::LlmClientConfig::new("http://127.0.0.1:1", "test-model");
+        let client = tmg_llm::LlmClient::new(cfg).ok()?;
+        let manager = SubagentManager::new(
+            client,
+            CancellationToken::new(),
+            "http://127.0.0.1:1",
+            "test-model",
+        );
+        Some(SpawnAgentTool::new(Arc::new(Mutex::new(manager))))
+    }
+
+    #[test]
+    fn schema_enum_excludes_escalator() {
+        let Some(tool) = make_tool() else {
+            // LlmClient construction failed for environmental reasons;
+            // the schema does not depend on the client at runtime, but
+            // the constructor does. Skip rather than fail spuriously.
+            return;
+        };
+        let schema = tool.parameters_schema();
+        let enum_values = schema
+            .pointer("/properties/agent_type/enum")
+            .and_then(serde_json::Value::as_array)
+            .expect("agent_type enum must exist");
+        let names: Vec<&str> = enum_values
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(
+            !names.contains(&"escalator"),
+            "schema enum must not advertise 'escalator' as a spawnable agent: {names:?}"
+        );
+        // Sanity-check that the user-spawnable built-ins are still there.
+        for expected in ["explore", "worker", "plan", "initializer", "tester", "qa"] {
+            assert!(
+                names.contains(&expected),
+                "schema enum must advertise '{expected}': {names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_escalator_at_runtime() {
+        let Some(tool) = make_tool() else {
+            return;
+        };
+        let params = serde_json::json!({
+            "agent_type": "escalator",
+            "task": "should be rejected before any spawn",
+        });
+        let err = tool
+            .execute(params)
+            .await
+            .expect_err("escalator must be rejected by spawn_agent");
+        match err {
+            ToolError::InvalidParams { message } => {
+                assert!(
+                    message.contains("unknown agent_type") && message.contains("escalator"),
+                    "error must call out the rejected agent_type: {message}"
+                );
+                // Ensure the suggested-types list does not mention
+                // 'escalator' either.
+                let suggested = message.split("Valid types:").nth(1).map_or("", str::trim);
+                assert!(
+                    !suggested.contains("escalator"),
+                    "error suggestions must not include 'escalator': {message}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
     }
 }

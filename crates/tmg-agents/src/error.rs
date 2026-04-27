@@ -22,6 +22,13 @@ pub enum AgentError {
     #[error("subagent nesting is not allowed: spawn_agent cannot be called from a subagent")]
     NestingForbidden,
 
+    /// The escalator subagent was requested but disabled by operator
+    /// configuration (`[harness.escalator] disable = true`, SPEC §9.10).
+    /// The auto-promotion gate (issue #37) treats this as "do not
+    /// escalate" rather than as a hard error.
+    #[error("escalator disabled")]
+    EscalatorDisabled,
+
     /// The subagent was cancelled via `CancellationToken`.
     #[error("subagent cancelled")]
     Cancelled,

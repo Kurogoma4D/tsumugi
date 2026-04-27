@@ -227,6 +227,10 @@ fn run_prompt(
 /// with a normal-completion trigger when the TUI returns and aborted
 /// with `UserCancelled` if the cancellation token fired or the TUI
 /// returned an error.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear startup wiring (config -> store -> manager -> registry -> agent loop); splitting obscures the single-shot launch sequence"
+)]
 fn run_tui(
     endpoint: &str,
     model: &str,
@@ -298,13 +302,21 @@ fn run_tui(
         let custom_agent_defs: Vec<tmg_agents::CustomAgentDef> =
             custom_agent_metas.iter().map(|m| m.def().clone()).collect();
 
-        // Create the subagent manager.
-        let subagent_manager = Arc::new(Mutex::new(tmg_agents::SubagentManager::new(
-            client.clone(),
-            cancel.clone(),
-            endpoint,
-            model,
-        )));
+        // Create the subagent manager. The escalator's
+        // endpoint/model/disable knobs flow through
+        // [`tmg_agents::EscalatorOverrides`] so the resolver in
+        // `SubagentManager` is the single source of truth for
+        // precedence (see `crates/tmg-agents/src/manager.rs` module
+        // docs).
+        let escalator_overrides = tmg_agents::EscalatorOverrides::from_strings(
+            harness_config.escalator.endpoint.clone(),
+            harness_config.escalator.model.clone(),
+            harness_config.escalator.disable,
+        );
+        let subagent_manager = Arc::new(Mutex::new(
+            tmg_agents::SubagentManager::new(client.clone(), cancel.clone(), endpoint, model)
+                .with_escalator_overrides(escalator_overrides),
+        ));
 
         // Wire the active `RunRunner` into the subagent manager so
         // harnessed-run subagents (initializer / tester / qa) get
