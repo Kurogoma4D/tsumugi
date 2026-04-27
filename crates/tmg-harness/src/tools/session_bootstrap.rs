@@ -835,10 +835,7 @@ mod tests {
         init_sh: Option<&str>,
     ) {
         let mut guard = runner.lock().await;
-        let new_scope = RunScope::Harnessed {
-            workflow_id: "wf".to_owned(),
-            max_sessions: None,
-        };
+        let new_scope = RunScope::harnessed("wf", None);
         guard.run_mut().scope = new_scope.clone();
         guard.run_mut().workflow_id = Some("wf".to_owned());
         let features_path = guard.features().path().to_path_buf();

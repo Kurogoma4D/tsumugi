@@ -148,6 +148,10 @@ struct PartialHarnessConfig {
     /// subagent (SPEC §10.1 / §9.10 / issue #36).
     #[serde(default)]
     pub escalator: PartialEscalatorConfig,
+    /// `[harness.escalation]` thresholds for the auto-promotion gate
+    /// (SPEC §10.1 / §9.10 / issue #37).
+    #[serde(default)]
+    pub escalation: PartialEscalationGateConfig,
 }
 
 /// Partial `[harness.escalator]` config used for deserialization from
@@ -208,6 +212,103 @@ impl PartialEscalatorConfig {
     }
 }
 
+/// Partial `[harness.escalation]` config used for deserialization
+/// from TOML.
+///
+/// Mirrors the strict `deny_unknown_fields` policy of the rest of the
+/// harness section so a typo in `tsumugi.toml` (e.g.
+/// `repetiton_workflow_threshold`) is rejected at load time. Defaults
+/// match the SPEC §10.1 example values.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialEscalationGateConfig {
+    /// Master switch; when `false`, the auto-promotion gate is
+    /// disabled entirely and `[harness.escalation]` thresholds are
+    /// ignored.
+    pub enabled: Option<bool>,
+    /// Cumulative session diff threshold above which the diff-size
+    /// signal fires.
+    pub diff_size_threshold: Option<u32>,
+    /// Context window utilisation threshold (in `0.0..=1.0`) for the
+    /// context-pressure signal.
+    pub context_pressure_threshold: Option<f32>,
+    /// Minimum tool-call count required to qualify the
+    /// context-pressure signal.
+    pub context_pressure_pending_subtasks: Option<u32>,
+    /// Workflow-loop count for the repetition-by-prompt signal.
+    pub repetition_workflow_threshold: Option<u32>,
+    /// Per-file edit count for the repetition-by-file signal.
+    pub repetition_file_edit_threshold: Option<u32>,
+}
+
+impl PartialEscalationGateConfig {
+    /// Merge `other` into `self`. `Some` fields in `other` take precedence.
+    fn merge_from(&mut self, other: &Self) {
+        if other.enabled.is_some() {
+            self.enabled = other.enabled;
+        }
+        if other.diff_size_threshold.is_some() {
+            self.diff_size_threshold = other.diff_size_threshold;
+        }
+        if other.context_pressure_threshold.is_some() {
+            self.context_pressure_threshold = other.context_pressure_threshold;
+        }
+        if other.context_pressure_pending_subtasks.is_some() {
+            self.context_pressure_pending_subtasks = other.context_pressure_pending_subtasks;
+        }
+        if other.repetition_workflow_threshold.is_some() {
+            self.repetition_workflow_threshold = other.repetition_workflow_threshold;
+        }
+        if other.repetition_file_edit_threshold.is_some() {
+            self.repetition_file_edit_threshold = other.repetition_file_edit_threshold;
+        }
+    }
+
+    /// Resolve into the final [`tmg_harness::EscalationConfig`].
+    ///
+    /// Defaults match the SPEC §10.1 example values; validation is
+    /// delegated to [`tmg_harness::EscalationConfig::validated`] so
+    /// the gate's invariants live in one place (`tmg-harness`) and
+    /// the CLI just translates errors into `ConfigError`.
+    fn into_final(self) -> Result<tmg_harness::EscalationConfig, ConfigError> {
+        let defaults = tmg_harness::EscalationConfig::default();
+        let enabled = self.enabled.unwrap_or(defaults.enabled);
+        let diff_size_threshold = self
+            .diff_size_threshold
+            .unwrap_or(defaults.diff_size_threshold);
+        let context_pressure_threshold = self
+            .context_pressure_threshold
+            .unwrap_or(defaults.context_pressure_threshold);
+        let context_pressure_pending_subtasks = self
+            .context_pressure_pending_subtasks
+            .unwrap_or(defaults.context_pressure_pending_subtasks);
+        let repetition_workflow_threshold = self
+            .repetition_workflow_threshold
+            .unwrap_or(defaults.repetition_workflow_threshold);
+        let repetition_file_edit_threshold = self
+            .repetition_file_edit_threshold
+            .unwrap_or(defaults.repetition_file_edit_threshold);
+
+        tmg_harness::EscalationConfig::validated(
+            enabled,
+            diff_size_threshold,
+            context_pressure_threshold,
+            context_pressure_pending_subtasks,
+            repetition_workflow_threshold,
+            repetition_file_edit_threshold,
+        )
+        .map_err(|e| ConfigError::InvalidValue {
+            field: "harness.escalation".to_owned(),
+            value: format!(
+                "diff={diff_size_threshold} ctx={context_pressure_threshold} \
+                 pending={context_pressure_pending_subtasks} \
+                 wf={repetition_workflow_threshold} fe={repetition_file_edit_threshold}",
+            ),
+            reason: e.to_string(),
+        })
+    }
+}
+
 impl PartialHarnessConfig {
     /// Merge `other` into `self`. `Some` fields in `other` take precedence.
     fn merge_from(&mut self, other: &Self) {
@@ -231,6 +332,7 @@ impl PartialHarnessConfig {
                 .clone_from(&other.default_session_timeout);
         }
         self.escalator.merge_from(&other.escalator);
+        self.escalation.merge_from(&other.escalation);
     }
 
     /// Convert to final `HarnessConfig`, filling in defaults for unset
@@ -280,6 +382,8 @@ impl PartialHarnessConfig {
             });
         }
 
+        let escalation = self.escalation.into_final()?;
+
         Ok(HarnessConfig {
             runs_dir: self.runs_dir.unwrap_or_else(default_runs_dir),
             auto_resume_on_start: self
@@ -292,6 +396,7 @@ impl PartialHarnessConfig {
             default_max_sessions,
             default_session_timeout,
             escalator: self.escalator.into_final(),
+            escalation,
         })
     }
 }
@@ -487,6 +592,57 @@ impl PartialTsumugiConfig {
             })?;
             self.harness.escalator.disable = Some(parsed);
         }
+        // [harness.escalation] env overrides (issue #37). Each knob
+        // accepts the same parse rules as its TOML counterpart;
+        // validation is delegated to `EscalationConfig::validated`.
+        if let Some(v) = env_fn("TMG_HARNESS_ESCALATION_ENABLED") {
+            let parsed = parse_bool(&v).map_err(|()| ConfigError::InvalidValue {
+                field: "TMG_HARNESS_ESCALATION_ENABLED".to_owned(),
+                value: v,
+                reason: "must be one of: true, false, 1, 0".to_owned(),
+            })?;
+            self.harness.escalation.enabled = Some(parsed);
+        }
+        if let Some(v) = env_fn("TMG_HARNESS_ESCALATION_DIFF_SIZE_THRESHOLD") {
+            let n = v.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
+                field: "TMG_HARNESS_ESCALATION_DIFF_SIZE_THRESHOLD".to_owned(),
+                value: v,
+                reason: "must be a non-negative integer".to_owned(),
+            })?;
+            self.harness.escalation.diff_size_threshold = Some(n);
+        }
+        if let Some(v) = env_fn("TMG_HARNESS_ESCALATION_CONTEXT_PRESSURE_THRESHOLD") {
+            let n = v.parse::<f32>().map_err(|_| ConfigError::InvalidValue {
+                field: "TMG_HARNESS_ESCALATION_CONTEXT_PRESSURE_THRESHOLD".to_owned(),
+                value: v,
+                reason: "must be a floating-point number".to_owned(),
+            })?;
+            self.harness.escalation.context_pressure_threshold = Some(n);
+        }
+        if let Some(v) = env_fn("TMG_HARNESS_ESCALATION_CONTEXT_PRESSURE_PENDING_SUBTASKS") {
+            let n = v.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
+                field: "TMG_HARNESS_ESCALATION_CONTEXT_PRESSURE_PENDING_SUBTASKS".to_owned(),
+                value: v,
+                reason: "must be a non-negative integer".to_owned(),
+            })?;
+            self.harness.escalation.context_pressure_pending_subtasks = Some(n);
+        }
+        if let Some(v) = env_fn("TMG_HARNESS_ESCALATION_REPETITION_WORKFLOW_THRESHOLD") {
+            let n = v.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
+                field: "TMG_HARNESS_ESCALATION_REPETITION_WORKFLOW_THRESHOLD".to_owned(),
+                value: v,
+                reason: "must be a non-negative integer".to_owned(),
+            })?;
+            self.harness.escalation.repetition_workflow_threshold = Some(n);
+        }
+        if let Some(v) = env_fn("TMG_HARNESS_ESCALATION_REPETITION_FILE_EDIT_THRESHOLD") {
+            let n = v.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
+                field: "TMG_HARNESS_ESCALATION_REPETITION_FILE_EDIT_THRESHOLD".to_owned(),
+                value: v,
+                reason: "must be a non-negative integer".to_owned(),
+            })?;
+            self.harness.escalation.repetition_file_edit_threshold = Some(n);
+        }
         Ok(())
     }
 
@@ -628,7 +784,7 @@ pub struct EscalatorConfig {
 }
 
 /// Harness settings from `[harness]` section.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HarnessConfig {
     /// Directory where run state is persisted (relative to cwd).
     pub runs_dir: PathBuf,
@@ -670,6 +826,29 @@ pub struct HarnessConfig {
     /// subagent.
     #[serde(default)]
     pub escalator: EscalatorConfig,
+
+    /// `[harness.escalation]` thresholds for the auto-promotion gate
+    /// (SPEC §9.10 / §10.1, issue #37). The validated
+    /// [`tmg_harness::EscalationConfig`] enforces non-zero thresholds
+    /// and `0.0 < context_pressure_threshold <= 1.0`.
+    ///
+    /// **Round-trip limitation:** this field is marked
+    /// `#[serde(default, skip)]` because
+    /// [`tmg_harness::EscalationConfig`] does not implement
+    /// `Serialize` / `Deserialize` directly — its construction goes
+    /// through `PartialEscalationGateConfig::into_final` for
+    /// validation. Consequently, **a fully-resolved `HarnessConfig`
+    /// cannot be serialized back to TOML without silently dropping
+    /// the user's `[harness.escalation]` thresholds.** This is
+    /// load-only today; any future feature that needs to round-trip
+    /// the resolved config (e.g. `tmg config show` rendering the
+    /// effective config) must derive `Serialize` / `Deserialize` on
+    /// `tmg_harness::EscalationConfig` and remove this `skip`.
+    ///
+    /// TODO: add `Serialize` / `Deserialize` to
+    /// `tmg_harness::EscalationConfig` once `tmg config show` lands.
+    #[serde(default, skip)]
+    pub escalation: tmg_harness::EscalationConfig,
 }
 
 fn default_runs_dir() -> PathBuf {
@@ -706,6 +885,7 @@ impl Default for HarnessConfig {
             default_max_sessions: default_default_max_sessions(),
             default_session_timeout: default_session_timeout(),
             escalator: EscalatorConfig::default(),
+            escalation: tmg_harness::EscalationConfig::default(),
         }
     }
 }
@@ -1771,5 +1951,117 @@ disable = false
         // overlay did not set `model`; global wins.
         assert_eq!(final_config.harness.escalator.model, "global-model");
         assert!(final_config.harness.escalator.disable);
+    }
+
+    // -----------------------------------------------------------------
+    // [harness.escalation] tests (issue #37)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn escalation_section_defaults_to_spec_values() {
+        let config = TsumugiConfig::default();
+        assert!(config.harness.escalation.enabled);
+        assert_eq!(config.harness.escalation.diff_size_threshold, 500);
+        assert!((config.harness.escalation.context_pressure_threshold - 0.6).abs() < 1e-6);
+        assert_eq!(
+            config.harness.escalation.context_pressure_pending_subtasks,
+            3
+        );
+        assert_eq!(config.harness.escalation.repetition_workflow_threshold, 3);
+        assert_eq!(config.harness.escalation.repetition_file_edit_threshold, 5);
+    }
+
+    #[test]
+    fn escalation_section_round_trips_via_toml() {
+        let toml = r"
+[harness.escalation]
+enabled = false
+diff_size_threshold = 1000
+context_pressure_threshold = 0.8
+context_pressure_pending_subtasks = 5
+repetition_workflow_threshold = 4
+repetition_file_edit_threshold = 7
+";
+        let partial: PartialTsumugiConfig = toml::from_str(toml).unwrap_or_else(|e| panic!("{e}"));
+        let config = partial.into_final().unwrap_or_else(|e| panic!("{e}"));
+        assert!(!config.harness.escalation.enabled);
+        assert_eq!(config.harness.escalation.diff_size_threshold, 1000);
+        assert!((config.harness.escalation.context_pressure_threshold - 0.8).abs() < 1e-6);
+        assert_eq!(
+            config.harness.escalation.context_pressure_pending_subtasks,
+            5
+        );
+        assert_eq!(config.harness.escalation.repetition_workflow_threshold, 4);
+        assert_eq!(config.harness.escalation.repetition_file_edit_threshold, 7);
+    }
+
+    #[test]
+    fn escalation_unknown_field_is_rejected() {
+        // Acceptance: typos in `[harness.escalation]` are caught at
+        // load time thanks to `deny_unknown_fields`.
+        let toml = r"
+[harness.escalation]
+enabled = true
+diff_sze_threshold = 500
+";
+        let result: Result<PartialTsumugiConfig, toml::de::Error> = toml::from_str(toml);
+        assert!(result.is_err(), "typo must be rejected");
+        let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            msg.contains("diff_sze_threshold") || msg.contains("unknown field"),
+            "error must identify the typo, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn escalation_zero_threshold_is_rejected() {
+        let toml = r"
+[harness.escalation]
+diff_size_threshold = 0
+";
+        let partial: PartialTsumugiConfig = toml::from_str(toml).unwrap_or_else(|e| panic!("{e}"));
+        let Err(err) = partial.into_final() else {
+            panic!("zero threshold must be rejected");
+        };
+        assert!(matches!(err, ConfigError::InvalidValue { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn escalation_invalid_context_threshold_is_rejected() {
+        let toml = r"
+[harness.escalation]
+context_pressure_threshold = 1.5
+";
+        let partial: PartialTsumugiConfig = toml::from_str(toml).unwrap_or_else(|e| panic!("{e}"));
+        let Err(err) = partial.into_final() else {
+            panic!("out-of-range context threshold must be rejected");
+        };
+        assert!(matches!(err, ConfigError::InvalidValue { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn escalation_env_overrides_apply() {
+        let toml = r"
+[harness.escalation]
+enabled = true
+diff_size_threshold = 500
+";
+        let mut partial: PartialTsumugiConfig =
+            toml::from_str(toml).unwrap_or_else(|e| panic!("{e}"));
+
+        let env_fn = |key: &str| -> Option<String> {
+            match key {
+                "TMG_HARNESS_ESCALATION_ENABLED" => Some("false".to_owned()),
+                "TMG_HARNESS_ESCALATION_DIFF_SIZE_THRESHOLD" => Some("750".to_owned()),
+                _ => None,
+            }
+        };
+        partial
+            .apply_env_overrides(&env_fn)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let final_config = partial.into_final().unwrap_or_else(|e| panic!("{e}"));
+        assert!(!final_config.harness.escalation.enabled);
+        assert_eq!(final_config.harness.escalation.diff_size_threshold, 750);
     }
 }

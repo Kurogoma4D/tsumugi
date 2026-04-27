@@ -90,10 +90,7 @@ mod tests {
         let mut run = store
             .create_ad_hoc(workspace, None)
             .unwrap_or_else(|e| panic!("{e}"));
-        run.scope = RunScope::Harnessed {
-            workflow_id: "test-workflow".to_owned(),
-            max_sessions: Some(10),
-        };
+        run.scope = RunScope::harnessed("test-workflow", Some(10));
         run.workflow_id = Some("test-workflow".to_owned());
         store.save(&run).unwrap_or_else(|e| panic!("{e}"));
 

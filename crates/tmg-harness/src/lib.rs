@@ -28,10 +28,12 @@
 
 pub mod artifacts;
 pub mod error;
+pub mod escalation;
 pub mod run;
 pub mod runner;
 pub mod session;
 pub mod sink;
+pub mod state;
 pub mod store;
 pub mod tools;
 
@@ -40,10 +42,15 @@ pub use artifacts::{
     InitScriptError, InitScriptOutput, ProgressLog, SessionLog, SessionLogEntry,
 };
 pub use error::HarnessError;
+pub use escalation::{
+    EscalationConfig, EscalationConfigError, EscalationDecision, EscalationError,
+    EscalationEvaluator, EscalationSignal, EscalatorLauncher, SubagentEscalatorLauncher,
+};
 pub use run::{Run, RunId, RunScope, RunStatus, RunSummary};
-pub use runner::{DEFAULT_BOOTSTRAP_MAX_TOKENS, RunRunner};
+pub use runner::{DEFAULT_BOOTSTRAP_MAX_TOKENS, RunProgressEvent, RunProgressReceiver, RunRunner};
 pub use session::{Session, SessionEndTrigger, SessionHandle};
 pub use sink::HarnessStreamSink;
+pub use state::{SessionState, TurnSummary};
 pub use store::{
     FEATURES_FILENAME, INIT_SCRIPT_FILENAME, PROGRESS_FILENAME, RUN_FILENAME, RunStore,
     SESSION_LOG_DIRNAME, WORKSPACE_LINK,

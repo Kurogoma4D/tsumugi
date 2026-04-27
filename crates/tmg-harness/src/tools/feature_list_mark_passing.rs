@@ -150,10 +150,7 @@ mod tests {
         let mut run = store
             .create_ad_hoc(workspace, None)
             .unwrap_or_else(|e| panic!("{e}"));
-        run.scope = RunScope::Harnessed {
-            workflow_id: "wf".to_owned(),
-            max_sessions: None,
-        };
+        run.scope = RunScope::harnessed("wf", None);
         store.save(&run).unwrap_or_else(|e| panic!("{e}"));
 
         std::fs::write(store.features_file(&run.id), json).unwrap_or_else(|e| panic!("{e}"));

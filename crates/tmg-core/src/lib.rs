@@ -7,7 +7,7 @@ pub mod event_log;
 pub mod message;
 pub mod prompt;
 
-pub use agent_loop::{AgentLoop, StreamSink};
+pub use agent_loop::{AgentLoop, StreamSink, TurnObserver, TurnSummary};
 pub use context::{
     ContextCompressor, ContextConfig, TokenCounter, format_context_usage, truncate_tool_result,
 };

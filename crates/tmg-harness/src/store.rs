@@ -20,9 +20,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use chrono::Utc;
+
 use crate::artifacts::ProgressLog;
 use crate::error::HarnessError;
-use crate::run::{Run, RunId, RunSummary};
+use crate::run::{Run, RunId, RunScope, RunSummary};
 
 /// Filename used for the persistent run record under each run directory.
 pub const RUN_FILENAME: &str = "run.toml";
@@ -200,6 +202,73 @@ impl RunStore {
             return Err(HarnessError::io(&path, e));
         }
         Ok(())
+    }
+
+    /// Promote an ad-hoc run to harnessed scope, persisting the new
+    /// `[scope.harnessed]` section in `run.toml`.
+    ///
+    /// SPEC §9.3 step 2: writes the auto-promotion metadata
+    /// (`upgraded_at`, `upgraded_from_session`, `upgrade_reason`) plus
+    /// the relative paths of `features.json` / `init.sh` so a later
+    /// process restart can locate the artifacts. The
+    /// `workflow_id` is set to the synthetic `"auto-promoted"` label
+    /// so listings and TUI surfaces can distinguish a run created
+    /// directly as harnessed from one promoted by the auto-gate.
+    ///
+    /// **Atomicity:** the write reuses [`Self::save`]'s tmp-and-rename
+    /// pattern, so concurrent readers never observe a torn `run.toml`.
+    /// The on-disk `features.json` / `init.sh` files must already
+    /// exist (the `Initializer` subagent writes them); we record only
+    /// their relative paths here.
+    ///
+    /// `current_session` is the 1-indexed session number that was
+    /// active when the auto-promotion fired (typically
+    /// `runner.run().session_count`). It is stored verbatim in
+    /// `upgraded_from_session` so `progress.md` and TUI surfaces can
+    /// link the upgrade to the specific session.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarnessError::RunNotFound`] when the run id has no
+    ///   corresponding `run.toml`.
+    /// - [`HarnessError::IdMismatch`] when the loaded record's id
+    ///   disagrees with the directory name.
+    /// - [`HarnessError::Serialize`] / [`HarnessError::Io`] for write
+    ///   failures.
+    pub fn upgrade_to_harnessed(
+        &self,
+        run_id: &RunId,
+        current_session: u32,
+        upgrade_reason: &str,
+    ) -> Result<Run, HarnessError> {
+        let mut run = self.load(run_id)?;
+        let workflow_id = match &run.scope {
+            RunScope::AdHoc => "auto-promoted".to_owned(),
+            RunScope::Harnessed { workflow_id, .. } => workflow_id.clone(),
+        };
+        // Use the existing run's max_sessions if the scope already
+        // carried one; otherwise leave it open (None). The auto-gate
+        // intentionally does not impose a default cap so the user can
+        // configure `[harness] default_max_sessions` separately.
+        let existing_cap = match &run.scope {
+            RunScope::AdHoc => None,
+            RunScope::Harnessed { max_sessions, .. } => *max_sessions,
+        };
+
+        run.scope = RunScope::Harnessed {
+            workflow_id: workflow_id.clone(),
+            max_sessions: existing_cap,
+            features_path: Some(FEATURES_FILENAME.to_owned()),
+            init_script_path: Some(INIT_SCRIPT_FILENAME.to_owned()),
+            upgraded_at: Some(Utc::now()),
+            upgraded_from_session: Some(current_session),
+            upgrade_reason: Some(upgrade_reason.to_owned()),
+        };
+        run.workflow_id = Some(workflow_id);
+        run.max_sessions = existing_cap;
+
+        self.save(&run)?;
+        Ok(run)
     }
 
     /// List all runs as lightweight summaries.
@@ -536,6 +605,46 @@ mod tests {
             }
             other => panic!("expected IdMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn upgrade_to_harnessed_flips_scope_and_records_metadata() {
+        let (tmp, store) = make_store();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap_or_else(|e| panic!("{e}"));
+        let run = store
+            .create_ad_hoc(workspace, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(run.scope, RunScope::AdHoc);
+
+        let upgraded = store
+            .upgrade_to_harnessed(&run.id, 2, "spans crates")
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        match upgraded.scope {
+            RunScope::Harnessed {
+                workflow_id,
+                features_path,
+                init_script_path,
+                upgraded_at,
+                upgraded_from_session,
+                upgrade_reason,
+                ..
+            } => {
+                assert_eq!(workflow_id, "auto-promoted");
+                assert_eq!(features_path.as_deref(), Some("features.json"));
+                assert_eq!(init_script_path.as_deref(), Some("init.sh"));
+                assert!(upgraded_at.is_some());
+                assert_eq!(upgraded_from_session, Some(2));
+                assert_eq!(upgrade_reason.as_deref(), Some("spans crates"));
+            }
+            RunScope::AdHoc => panic!("expected harnessed, got ad-hoc"),
+        }
+
+        // The on-disk record reflects the upgrade.
+        let reloaded = store.load(&run.id).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(reloaded.scope, RunScope::Harnessed { .. }));
+        assert_eq!(reloaded.workflow_id.as_deref(), Some("auto-promoted"));
     }
 
     #[test]

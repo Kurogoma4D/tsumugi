@@ -79,6 +79,15 @@ impl fmt::Display for RunId {
 /// Scope of a run. SPEC §9.2 defines a 2-stage model: a run starts as
 /// [`AdHoc`](RunScope::AdHoc) and can later be promoted to
 /// [`Harnessed`](RunScope::Harnessed) when a workflow attaches.
+///
+/// The `Harnessed` variant carries optional auto-promotion metadata
+/// (`upgraded_at`, `upgraded_from_session`, `upgrade_reason`,
+/// `features_path`, `init_script_path`) populated by
+/// [`RunStore::upgrade_to_harnessed`](crate::store::RunStore::upgrade_to_harnessed)
+/// when an ad-hoc run is promoted via the SPEC §9.3 flow. Runs created
+/// directly as harnessed (e.g. via the future `tmg run start` command)
+/// leave these fields `None`, so existing on-disk records remain
+/// readable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RunScope {
@@ -91,6 +100,26 @@ pub enum RunScope {
         /// Optional cap on the number of sessions allowed in this run.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_sessions: Option<u32>,
+        /// Path (relative to the run directory) of `features.json`.
+        ///
+        /// Populated by [`RunStore::upgrade_to_harnessed`](crate::store::RunStore::upgrade_to_harnessed)
+        /// on auto-promotion; runs created directly as harnessed
+        /// leave this `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        features_path: Option<String>,
+        /// Path (relative to the run directory) of `init.sh`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        init_script_path: Option<String>,
+        /// Timestamp of the auto-promotion that produced this scope.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upgraded_at: Option<DateTime<Utc>>,
+        /// 1-indexed session number that was active when the
+        /// auto-promotion fired.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upgraded_from_session: Option<u32>,
+        /// Concise reason text emitted by the escalator subagent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upgrade_reason: Option<String>,
     },
 }
 
@@ -102,6 +131,45 @@ impl RunScope {
             Self::AdHoc => "ad-hoc",
             Self::Harnessed { .. } => "harnessed",
         }
+    }
+
+    /// Whether this scope is the [`AdHoc`](Self::AdHoc) variant.
+    ///
+    /// Convenience for the auto-promotion gate; equivalent to
+    /// `matches!(scope, RunScope::AdHoc)`.
+    #[must_use]
+    pub fn is_ad_hoc(&self) -> bool {
+        matches!(self, Self::AdHoc)
+    }
+
+    /// Construct a fresh harnessed scope without any auto-promotion
+    /// metadata.
+    ///
+    /// Equivalent to writing
+    /// `RunScope::Harnessed { workflow_id, max_sessions, features_path: None, init_script_path: None, upgraded_at: None, upgraded_from_session: None, upgrade_reason: None }`
+    /// — provided as a constructor so that test fixtures and the
+    /// future `tmg run start` path do not have to enumerate every
+    /// auto-promotion field.
+    #[must_use]
+    pub fn harnessed(workflow_id: impl Into<String>, max_sessions: Option<u32>) -> Self {
+        Self::Harnessed {
+            workflow_id: workflow_id.into(),
+            max_sessions,
+            features_path: None,
+            init_script_path: None,
+            upgraded_at: None,
+            upgraded_from_session: None,
+            upgrade_reason: None,
+        }
+    }
+}
+
+impl Default for RunScope {
+    /// Default scope is [`Self::AdHoc`]; matches the freshly-created
+    /// run from [`Run::new_ad_hoc`] and the
+    /// [`SessionState`](crate::state::SessionState) seed.
+    fn default() -> Self {
+        Self::AdHoc
     }
 }
 
@@ -292,12 +360,54 @@ mod tests {
         run.scope = RunScope::Harnessed {
             workflow_id: "fix-bug".to_owned(),
             max_sessions: Some(8),
+            features_path: None,
+            init_script_path: None,
+            upgraded_at: None,
+            upgraded_from_session: None,
+            upgrade_reason: None,
         };
         run.workflow_id = Some("fix-bug".to_owned());
         run.max_sessions = Some(8);
         let serialized = toml::to_string(&run).unwrap_or_else(|e| panic!("{e}"));
         let parsed: Run = toml::from_str(&serialized).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(run, parsed);
+    }
+
+    #[test]
+    fn harnessed_run_with_upgrade_metadata_round_trip() {
+        let mut run = Run::new_ad_hoc(PathBuf::from("/tmp/project"));
+        run.scope = RunScope::Harnessed {
+            workflow_id: "auto-promoted".to_owned(),
+            max_sessions: None,
+            features_path: Some("features.json".to_owned()),
+            init_script_path: Some("init.sh".to_owned()),
+            upgraded_at: Some(chrono::Utc::now()),
+            upgraded_from_session: Some(2),
+            upgrade_reason: Some("multi-feature scope".to_owned()),
+        };
+        let serialized = toml::to_string(&run).unwrap_or_else(|e| panic!("{e}"));
+        let parsed: Run = toml::from_str(&serialized).unwrap_or_else(|e| panic!("{e}"));
+        // chrono's Utc::now() loses sub-second precision through TOML
+        // serialization in some chrono versions; compare structurally
+        // rather than asserting full equality on the timestamp.
+        match (&run.scope, &parsed.scope) {
+            (
+                RunScope::Harnessed {
+                    workflow_id: a,
+                    upgrade_reason: ra,
+                    ..
+                },
+                RunScope::Harnessed {
+                    workflow_id: b,
+                    upgrade_reason: rb,
+                    ..
+                },
+            ) => {
+                assert_eq!(a, b);
+                assert_eq!(ra, rb);
+            }
+            other => panic!("expected harnessed/harnessed, got {other:?}"),
+        }
     }
 
     #[test]

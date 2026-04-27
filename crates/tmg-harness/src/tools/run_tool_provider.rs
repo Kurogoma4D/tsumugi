@@ -148,10 +148,7 @@ mod tests {
     /// tools when asked.
     #[tokio::test]
     async fn harnessed_provider_registers_all_run_aware_tools() {
-        let scope = RunScope::Harnessed {
-            workflow_id: "wf".to_owned(),
-            max_sessions: None,
-        };
+        let scope = RunScope::harnessed("wf", None);
         let (_tmp, runner) = make_runner_with_scope(&scope);
         let provider = RunRunnerToolProvider::new(runner).await;
 
@@ -187,10 +184,7 @@ mod tests {
     /// Unknown names always return `false`.
     #[tokio::test]
     async fn unknown_name_returns_false() {
-        let scope = RunScope::Harnessed {
-            workflow_id: "wf".to_owned(),
-            max_sessions: None,
-        };
+        let scope = RunScope::harnessed("wf", None);
         let (_tmp, runner) = make_runner_with_scope(&scope);
         let provider = RunRunnerToolProvider::new(runner).await;
 

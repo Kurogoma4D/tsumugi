@@ -127,10 +127,7 @@ mod tests {
     /// `feature_list_*` tools.
     #[tokio::test]
     async fn harnessed_registration_includes_feature_tools() {
-        let scope = RunScope::Harnessed {
-            workflow_id: "test-wf".to_owned(),
-            max_sessions: None,
-        };
+        let scope = RunScope::harnessed("test-wf", None);
         let (_tmp, runner) = make_runner_with_scope(&scope);
         let mut registry = ToolRegistry::new();
         register_run_tools(&mut registry, runner).await;

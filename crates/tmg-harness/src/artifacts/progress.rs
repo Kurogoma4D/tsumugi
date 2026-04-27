@@ -112,6 +112,40 @@ impl ProgressLog {
         self.append_raw(formatted.as_bytes())
     }
 
+    /// Append a multi-line block verbatim, preserving its internal
+    /// newlines.
+    ///
+    /// Used by the auto-promotion path
+    /// ([`crate::runner::RunRunner::escalate_to_harnessed`]) to write a
+    /// `## Session #N (...) [SCOPE UPGRADE]` block consisting of a
+    /// header line plus a few `- key: value` bullets. The shape of the
+    /// block is owned by the caller; this helper only guarantees the
+    /// append-only / through-disk semantics shared by every other
+    /// mutator on this type.
+    ///
+    /// Visibility is intentionally `pub(crate)`: the auto-promotion
+    /// runner is the only consumer today, and the API contract is
+    /// loose enough that exposing it more broadly would invite
+    /// free-form writers that defeat the structured shape of
+    /// `progress.md`.
+    pub(crate) fn append_raw_block(&self, block: &str) -> Result<(), HarnessError> {
+        self.append_raw(block.as_bytes())
+    }
+
+    /// Read the entire file as a string, returning the empty string
+    /// when the file does not yet exist.
+    ///
+    /// Used by the auto-promotion path to test for an existing
+    /// `[SCOPE UPGRADE]` marker before re-appending the block — so a
+    /// retry after a partial first attempt does not double-write.
+    pub(crate) fn read_all(&self) -> Result<String, HarnessError> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(c) => Ok(c),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(HarnessError::io(&self.path, e)),
+        }
+    }
+
     /// Read the last `n` session blocks (header + entries) and return
     /// them concatenated, newest-first.
     ///
