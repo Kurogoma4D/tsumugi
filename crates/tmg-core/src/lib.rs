@@ -3,6 +3,7 @@
 pub mod agent_loop;
 pub mod context;
 pub mod error;
+pub mod event_log;
 pub mod message;
 pub mod prompt;
 
@@ -11,6 +12,7 @@ pub use context::{
     ContextCompressor, ContextConfig, TokenCounter, format_context_usage, truncate_tool_result,
 };
 pub use error::CoreError;
+pub use event_log::{EventLogWriter, TeeStreamSink};
 pub use message::Message;
 
 // Re-export ToolCallingMode from tmg-llm for downstream consumers.

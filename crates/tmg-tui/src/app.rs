@@ -104,6 +104,10 @@ struct TurnHandle {
 }
 
 /// The main application state.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "TUI state flags are independent and rarely change together"
+)]
 pub struct App {
     /// The agent loop driving LLM conversations.
     ///
@@ -164,11 +168,20 @@ pub struct App {
 
     /// Whether the model is currently in the thinking/reasoning phase.
     thinking: bool,
+
+    /// Optional path for structured event logging (JSON Lines).
+    event_log_path: Option<PathBuf>,
 }
 
 impl App {
     /// Create a new `App` with the given agent loop and model name.
-    pub fn new(agent: AgentLoop, model_name: &str, project_root: PathBuf, cwd: PathBuf) -> Self {
+    pub fn new(
+        agent: AgentLoop,
+        model_name: &str,
+        project_root: PathBuf,
+        cwd: PathBuf,
+        event_log: Option<PathBuf>,
+    ) -> Self {
         let max_tokens = agent.context_config().max_context_tokens;
         let context_usage = format_context_usage(0, max_tokens);
         Self {
@@ -191,6 +204,7 @@ impl App {
             custom_agents: Vec::new(),
             pending_compact: false,
             thinking: false,
+            event_log_path: event_log,
         }
     }
 
@@ -592,9 +606,21 @@ impl App {
 
         let (tx, rx) = mpsc::channel::<TurnMessage>(256);
 
+        // Open the event log writer if configured (append mode so all
+        // turns accumulate in a single file).
+        let event_log_writer = self.event_log_path.as_deref().and_then(|path| {
+            tmg_core::EventLogWriter::open_append(path).ok()
+        });
+
         let join = tokio::spawn(async move {
-            let mut sink = ChannelStreamSink { tx: tx.clone() };
-            let result = agent.turn(&user_input, &mut sink).await;
+            let channel_sink = ChannelStreamSink { tx: tx.clone() };
+            let result = if let Some(log) = event_log_writer {
+                let mut tee = tmg_core::TeeStreamSink::new(channel_sink, log);
+                agent.turn(&user_input, &mut tee).await
+            } else {
+                let mut sink = channel_sink;
+                agent.turn(&user_input, &mut sink).await
+            };
 
             match result {
                 Ok(()) => {

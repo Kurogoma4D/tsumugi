@@ -58,6 +58,12 @@ struct Cli {
     )]
     #[arg(long)]
     tool_calling: Option<ToolCallingMode>,
+
+    /// Path to write structured event log (JSON Lines format).
+    /// Enables diagnostics by recording every agent event (tokens,
+    /// tool calls, results) to the specified file.
+    #[arg(long)]
+    event_log: Option<PathBuf>,
 }
 
 impl Cli {
@@ -102,13 +108,19 @@ fn main() -> anyhow::Result<()> {
     };
 
     if let Some(prompt) = cli.prompt {
-        run_prompt(&config.llm.endpoint, &config.llm.model, &prompt)?;
+        run_prompt(
+            &config.llm.endpoint,
+            &config.llm.model,
+            &prompt,
+            cli.event_log.as_deref(),
+        )?;
     } else {
         run_tui(
             &config.llm.endpoint,
             &config.llm.model,
             context_config,
             config.llm.tool_calling,
+            cli.event_log,
         )?;
     }
 
@@ -123,9 +135,19 @@ fn main() -> anyhow::Result<()> {
     clippy::print_stdout,
     reason = "integration check: intentional stdout streaming output"
 )]
-fn run_prompt(endpoint: &str, model: &str, prompt: &str) -> anyhow::Result<()> {
+fn run_prompt(
+    endpoint: &str,
+    model: &str,
+    prompt: &str,
+    event_log: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
     use std::io::Write as _;
     use tokio_stream::StreamExt as _;
+
+    let mut log_writer = event_log
+        .map(tmg_core::EventLogWriter::new)
+        .transpose()
+        .context("opening event log file")?;
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -144,20 +166,32 @@ fn run_prompt(endpoint: &str, model: &str, prompt: &str) -> anyhow::Result<()> {
 
         while let Some(event) = stream.next().await {
             match event? {
-                tmg_llm::StreamEvent::ThinkingDelta(_) => {
+                tmg_llm::StreamEvent::ThinkingDelta(token) => {
+                    if let Some(ref mut log) = log_writer {
+                        log.write_thinking(&token);
+                    }
                     // Thinking tokens are not displayed in one-shot mode.
                 }
                 tmg_llm::StreamEvent::ContentDelta(text) => {
+                    if let Some(ref mut log) = log_writer {
+                        log.write_token(&text);
+                    }
                     print!("{text}");
                     std::io::stdout().flush()?;
                 }
                 tmg_llm::StreamEvent::ToolCallComplete(tc) => {
+                    if let Some(ref mut log) = log_writer {
+                        log.write_tool_call(&tc.function.name, &tc.function.arguments);
+                    }
                     println!(
                         "\n[tool_call] {}({})",
                         tc.function.name, tc.function.arguments
                     );
                 }
                 tmg_llm::StreamEvent::Done(reason) => {
+                    if let Some(ref mut log) = log_writer {
+                        log.write_done();
+                    }
                     println!();
                     if let Some(r) = reason {
                         println!("[done: {r}]");
@@ -181,6 +215,7 @@ fn run_tui(
     model: &str,
     context_config: tmg_core::ContextConfig,
     tool_calling_mode: tmg_core::ToolCallingMode,
+    event_log: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -241,6 +276,7 @@ fn run_tui(
             cwd,
             Some(subagent_manager),
             custom_agent_defs,
+            event_log,
         )
         .await?;
 
