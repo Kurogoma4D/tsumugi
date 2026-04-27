@@ -247,8 +247,14 @@ fn run_tui(
         });
 
         let cwd = std::env::current_dir()?;
-        // Use cwd as project root for now (could be improved with git root detection).
-        let project_root = cwd.clone();
+        // Canonicalise so the persisted `workspace_path` and the
+        // `workspace` symlink target are absolute and stable across
+        // shells that may have entered via a symlinked path. Falls
+        // back to the raw cwd if canonicalisation fails (e.g. on
+        // unusual filesystems).
+        let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+        // Use canonical cwd as project root for now (could be improved with git root detection).
+        let project_root = canonical_cwd.clone();
 
         // Resolve `runs_dir`: relative paths are interpreted against cwd
         // so the on-disk layout matches `.tsumugi/runs/<run-id>` for the
@@ -256,10 +262,10 @@ fn run_tui(
         let runs_dir = if harness_config.runs_dir.is_absolute() {
             harness_config.runs_dir.clone()
         } else {
-            cwd.join(&harness_config.runs_dir)
+            canonical_cwd.join(&harness_config.runs_dir)
         };
         let store = Arc::new(RunStore::new(runs_dir));
-        let run = harness_init::resolve_startup_run(harness_config, &store, cwd.clone())
+        let run = harness_init::resolve_startup_run(harness_config, &store, canonical_cwd.clone())
             .context("resolving startup run")?;
         let mut runner = RunRunner::new(run, Arc::clone(&store));
         let session_handle = runner
@@ -294,7 +300,7 @@ fn run_tui(
             registry,
             cancel.clone(),
             &project_root,
-            &cwd,
+            &canonical_cwd,
             context_config,
             tool_calling_mode,
         )?;
@@ -305,7 +311,7 @@ fn run_tui(
             model,
             tui_cancel,
             project_root,
-            cwd,
+            canonical_cwd,
             Some(subagent_manager),
             custom_agent_defs,
             event_log,
@@ -315,10 +321,12 @@ fn run_tui(
 
         // Close the harness session before propagating the TUI result so
         // that `last_session_at` / `session_count` are persisted even on
-        // error or cancellation paths.
-        let trigger = if tui_result.is_err() {
+        // error or cancellation paths. Capture the underlying error
+        // message in the `Errored` trigger so post-mortem inspection of
+        // the run sees the real failure rather than a generic string.
+        let trigger = if let Err(ref e) = tui_result {
             SessionEndTrigger::Errored {
-                message: "TUI returned an error".to_owned(),
+                message: format!("TUI returned an error: {e:#}"),
             }
         } else if cancel.is_cancelled() {
             SessionEndTrigger::UserCancelled

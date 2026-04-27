@@ -23,6 +23,12 @@ use crate::session::{SessionEndTrigger, SessionHandle};
 use crate::store::RunStore;
 
 /// Minimal harness runner wrapping a [`Run`] and a [`RunStore`].
+///
+/// **Concurrency:** like [`RunStore`], this runner assumes the owning
+/// process is the only writer to the underlying `runs_dir`. There is
+/// no inter-process locking around session begin/end; running multiple
+/// `tmg` processes against the same `runs_dir` can race on
+/// `session_count` updates. A locking layer is tracked as a follow-up.
 #[derive(Debug)]
 pub struct RunRunner {
     run: Run,

@@ -43,6 +43,18 @@ pub enum HarnessError {
         /// The run id that was looked up.
         run_id: String,
     },
+
+    /// The run id stored in `run.toml` did not match the directory it
+    /// was loaded from. This indicates a corrupted or hand-edited run
+    /// directory; we refuse to load rather than silently use the wrong
+    /// id.
+    #[error("run id mismatch: expected {expected}, found {found} in run.toml")]
+    IdMismatch {
+        /// Run id derived from the directory name (what the caller asked for).
+        expected: String,
+        /// Run id actually present inside the loaded `run.toml`.
+        found: String,
+    },
 }
 
 impl HarnessError {
