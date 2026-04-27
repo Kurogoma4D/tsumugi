@@ -80,6 +80,49 @@ Execute the following checks in order:
 - Use `#[expect(lint, reason = "...")]` instead of `#[allow(...)]` for intentional suppressions — `#[expect]` warns when the suppression becomes stale
 - Ensure no `todo!()`, `unimplemented!()`, `dbg!()`, or `println!()` in non-debug code
 
+## 4.5. Runtime Verification (動作確認)
+
+QA チェック通過後、変更がランタイム動作に影響する場合は実際にバイナリを動かして検証する。
+LLM サーバー (`llama-server`) が稼働している場合のみ実行する。未稼働の場合はスキップして記録する。
+
+### ワンショットモード検証
+
+変更内容に応じたプロンプトで `--event-log` 付きワンショット実行を行い、イベントログを検証する:
+
+```bash
+# LLM サーバー疎通確認
+curl -s --max-time 5 "${TMG_LLM_ENDPOINT:-http://localhost:8080}/health" && LLM_AVAILABLE=1 || LLM_AVAILABLE=0
+```
+
+LLM が利用可能な場合:
+
+```bash
+timeout 120 ./target/debug/tmg --prompt "<変更に関連するテストプロンプト>" --event-log /tmp/tmg-verify.jsonl 2>&1
+```
+
+イベントログ (`/tmp/tmg-verify.jsonl`) を読んで以下を確認:
+- `token` イベントが存在する (レスポンスが返っている)
+- `is_error: true` のイベントがない
+- `done` イベントで正常終了している
+- 変更に関連するツール呼び出しがある場合、`tool_call` → `tool_result` ペアが正しい
+
+### TUI モード検証 (任意)
+
+TUI に影響する変更の場合、ユーザーに手動確認を案内する:
+> TUI の動作確認が必要です。PR 作成後に `/run-tui` で検証してください。
+
+### 検証結果の記録
+
+PR 本文に検証結果を追記する:
+
+```
+### Runtime Verification
+- LLM server: available / unavailable (skipped)
+- One-shot mode: PASS / FAIL / SKIP
+  - Events: N tokens, M tool calls, 0 errors
+- TUI mode: manual verification recommended / N/A
+```
+
 ## 5. Worktree Cleanup
 
 - After PR creation, remove the worktree using `git worktree remove`
@@ -132,7 +175,8 @@ Before marking the task complete, verify:
 - [ ] Worktree was created and later removed successfully
 - [ ] Issue requirements were fully addressed
 - [ ] All quality checks (build, clippy, fmt, test) passed
-- [ ] PR was created with proper description and issue linkage
+- [ ] Runtime verification completed (one-shot mode with --event-log) or skipped with reason
+- [ ] PR was created with proper description, issue linkage, and runtime verification results
 - [ ] No uncommitted changes remain
 - [ ] Crate boundaries and workspace structure are respected
 
