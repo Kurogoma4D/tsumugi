@@ -24,7 +24,7 @@ use serde_json::json;
 use tokio::sync::{Mutex, oneshot};
 
 use crate::def::{StepDef, StepResult};
-use crate::engine::{EngineCtx, StepOutcome};
+use crate::engine::{EngineCtx, StepOutcome, build_eval_ctx};
 use crate::error::{Result, WorkflowError};
 use crate::expr;
 use crate::progress::{HumanResponseKind, WorkflowProgress};
@@ -59,8 +59,7 @@ pub(crate) async fn execute(
     // Render the prompt and `show:` payload eagerly so the receiver
     // sees the substituted values, not the raw template.
     let stages_snapshot = ctx.stages.read().await.clone();
-    let inner_ctx = expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env)
-        .with_stages(&stages_snapshot);
+    let inner_ctx = build_eval_ctx(ctx, step_results, &stages_snapshot);
     let rendered_message = expr::eval_string(message, &inner_ctx)?;
     let rendered_show = match show {
         Some(template) => Some(expr::eval_string(template, &inner_ctx)?),

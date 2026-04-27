@@ -6,12 +6,15 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::def::{FailurePolicy, InputDef, StepDef, WorkflowDef, WorkflowMode};
+use crate::def::{
+    BootstrapItem, FailurePolicy, InitPhase, InputDef, IteratePhase, StepDef, WorkflowDef,
+    WorkflowMode,
+};
 use crate::error::{Result, WorkflowError};
 
 /// Identifier pattern enforced for workflow ids and step ids.
@@ -66,6 +69,103 @@ struct RawWorkflow {
     stages: Option<Vec<RawPipelineStage>>,
     #[serde(default)]
     outputs: BTreeMap<String, String>,
+    /// `mode: long_running`-only `init:` phase.
+    #[serde(default)]
+    init: Option<RawInitPhase>,
+    /// `mode: long_running`-only `iterate:` phase.
+    #[serde(default)]
+    iterate: Option<RawIteratePhase>,
+}
+
+/// Permissive serde mirror for the `init:` phase.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInitPhase {
+    #[serde(default)]
+    artifacts: BTreeMap<String, String>,
+    #[serde(default)]
+    steps: Vec<RawStepOrRef>,
+}
+
+/// Permissive serde mirror for the `iterate:` phase.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawIteratePhase {
+    #[serde(default)]
+    bootstrap: Vec<RawBootstrapItem>,
+    #[serde(default)]
+    steps: Vec<RawStepOrRef>,
+    until: String,
+    max_sessions: u32,
+    /// Humantime-style duration (e.g. `"30m"`, `"2h"`) or seconds.
+    session_timeout: RawTimeout,
+}
+
+/// One entry of `iterate.bootstrap:`. Uses a manual `Deserialize` impl
+/// (rather than `#[serde(untagged)]`) so a malformed entry produces a
+/// precise error: zero or multiple of `run:` / `read:` / `smoke_test:`
+/// keys are rejected with a clear message naming the offending keys.
+#[derive(Debug)]
+enum RawBootstrapItem {
+    Run { run: String },
+    Read { read: String },
+    SmokeTest { smoke_test: Box<RawStep> },
+}
+
+impl<'de> Deserialize<'de> for RawBootstrapItem {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Helper struct that captures *all three* shorthand keys so we
+        // can detect "none" and "more than one" cases ourselves rather
+        // than relying on serde(untagged)'s generic
+        // "data did not match any variant" message.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Helper {
+            #[serde(default)]
+            run: Option<String>,
+            #[serde(default)]
+            read: Option<String>,
+            #[serde(default)]
+            smoke_test: Option<Box<RawStep>>,
+        }
+        let helper = Helper::deserialize(deserializer)?;
+        let mut present: Vec<&'static str> = Vec::new();
+        if helper.run.is_some() {
+            present.push("run");
+        }
+        if helper.read.is_some() {
+            present.push("read");
+        }
+        if helper.smoke_test.is_some() {
+            present.push("smoke_test");
+        }
+        match present.len() {
+            0 => Err(serde::de::Error::custom(
+                "bootstrap entry must declare exactly one of `run:`, `read:`, or `smoke_test:`; found none",
+            )),
+            1 => {
+                if let Some(run) = helper.run {
+                    Ok(Self::Run { run })
+                } else if let Some(read) = helper.read {
+                    Ok(Self::Read { read })
+                } else if let Some(smoke_test) = helper.smoke_test {
+                    Ok(Self::SmokeTest { smoke_test })
+                } else {
+                    // Unreachable: present.len() == 1 implies exactly
+                    // one is_some() above.
+                    Err(serde::de::Error::custom(
+                        "internal error: present-count desync in bootstrap entry parser",
+                    ))
+                }
+            }
+            _ => Err(serde::de::Error::custom(format!(
+                "bootstrap entry must declare exactly one of `run:`, `read:`, or `smoke_test:`; found {present:?}"
+            ))),
+        }
+    }
 }
 
 /// One entry in a pipeline's `stages:` list.
@@ -265,6 +365,10 @@ pub async fn parse_workflow_file(path: impl AsRef<Path>) -> Result<WorkflowDef> 
     parse_workflow_str(&content, path)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear validation: id, mode, inputs, steps, init, iterate. Splitting this would scatter the validation matrix without aiding clarity."
+)]
 fn finalize_workflow(raw: RawWorkflow, path: &Path) -> Result<WorkflowDef> {
     let path_display = path.display().to_string();
 
@@ -360,6 +464,41 @@ fn finalize_workflow(raw: RawWorkflow, path: &Path) -> Result<WorkflowDef> {
         out
     };
 
+    // Validate init/iterate against mode (SPEC §8.12 / §9.9).
+    match mode {
+        WorkflowMode::Normal => {
+            if raw.init.is_some() {
+                return Err(WorkflowError::invalid_workflow(
+                    &path_display,
+                    "`init:` is only allowed when `mode: long_running`",
+                ));
+            }
+            if raw.iterate.is_some() {
+                return Err(WorkflowError::invalid_workflow(
+                    &path_display,
+                    "`iterate:` is only allowed when `mode: long_running`",
+                ));
+            }
+        }
+        WorkflowMode::LongRunning => {
+            if raw.iterate.is_none() {
+                return Err(WorkflowError::invalid_workflow(
+                    &path_display,
+                    "`mode: long_running` requires an `iterate:` phase",
+                ));
+            }
+        }
+    }
+
+    let init = match raw.init {
+        Some(init) => Some(convert_init_phase(init, &path_display, &registry)?),
+        None => None,
+    };
+    let iterate = match raw.iterate {
+        Some(iter) => Some(convert_iterate_phase(iter, &path_display, &registry)?),
+        None => None,
+    };
+
     Ok(WorkflowDef {
         id: raw.id,
         description: raw.description,
@@ -367,6 +506,8 @@ fn finalize_workflow(raw: RawWorkflow, path: &Path) -> Result<WorkflowDef> {
         inputs,
         steps,
         outputs: raw.outputs,
+        init,
+        iterate,
     })
 }
 
@@ -437,6 +578,123 @@ fn convert_pipeline_stage(
         inputs: raw.inputs,
         loop_spec,
     })
+}
+
+/// Convert an [`RawInitPhase`] into a validated [`InitPhase`].
+///
+/// Inner steps share a fresh seen-set (init steps live in their own
+/// scope, distinct from top-level steps and from `iterate.steps`).
+fn convert_init_phase(
+    raw: RawInitPhase,
+    path_display: &str,
+    outer_registry: &BTreeMap<String, StepDef>,
+) -> Result<InitPhase> {
+    let mut artifacts: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for (name, raw_path) in raw.artifacts {
+        if name.is_empty() {
+            return Err(WorkflowError::invalid_workflow(
+                path_display,
+                "init.artifacts: artifact names must not be empty",
+            ));
+        }
+        if !is_valid_id(&name) {
+            return Err(WorkflowError::invalid_workflow(
+                path_display,
+                format!("init.artifacts: '{name}' must match {ID_PATTERN}"),
+            ));
+        }
+        artifacts.insert(name, PathBuf::from(raw_path));
+    }
+    let mut inner_seen: BTreeSet<String> = BTreeSet::new();
+    let steps = resolve_steps(raw.steps, path_display, &mut inner_seen, outer_registry)?;
+    Ok(InitPhase { artifacts, steps })
+}
+
+/// Convert an [`RawIteratePhase`] into a validated [`IteratePhase`].
+fn convert_iterate_phase(
+    raw: RawIteratePhase,
+    path_display: &str,
+    outer_registry: &BTreeMap<String, StepDef>,
+) -> Result<IteratePhase> {
+    if raw.max_sessions == 0 {
+        return Err(WorkflowError::invalid_workflow(
+            path_display,
+            "iterate.max_sessions must be >= 1",
+        ));
+    }
+    let session_timeout = raw
+        .session_timeout
+        .into_duration("iterate.session_timeout")?;
+    if session_timeout.is_zero() {
+        return Err(WorkflowError::invalid_workflow(
+            path_display,
+            "iterate.session_timeout must be > 0",
+        ));
+    }
+    let mut bootstrap: Vec<BootstrapItem> = Vec::with_capacity(raw.bootstrap.len());
+    for entry in raw.bootstrap {
+        bootstrap.push(convert_bootstrap_item(entry, path_display, outer_registry)?);
+    }
+    let mut inner_seen: BTreeSet<String> = BTreeSet::new();
+    let steps = resolve_steps(raw.steps, path_display, &mut inner_seen, outer_registry)?;
+    Ok(IteratePhase {
+        bootstrap,
+        steps,
+        until: raw.until,
+        max_sessions: raw.max_sessions,
+        session_timeout,
+    })
+}
+
+/// Convert one raw bootstrap entry into its canonical
+/// [`BootstrapItem`].
+fn convert_bootstrap_item(
+    raw: RawBootstrapItem,
+    path_display: &str,
+    outer_registry: &BTreeMap<String, StepDef>,
+) -> Result<BootstrapItem> {
+    match raw {
+        RawBootstrapItem::Run { run } => {
+            if run.trim().is_empty() {
+                return Err(WorkflowError::invalid_workflow(
+                    path_display,
+                    "iterate.bootstrap: `run:` value must not be empty",
+                ));
+            }
+            Ok(BootstrapItem::Run(run))
+        }
+        RawBootstrapItem::Read { read } => {
+            if read.trim().is_empty() {
+                return Err(WorkflowError::invalid_workflow(
+                    path_display,
+                    "iterate.bootstrap: `read:` value must not be empty",
+                ));
+            }
+            Ok(BootstrapItem::Read(read))
+        }
+        RawBootstrapItem::SmokeTest { smoke_test } => {
+            // The smoke_test step gets its own seen-set so its id
+            // doesn't collide with anything else.
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            let step = convert_step(*smoke_test, path_display, &mut seen, outer_registry)?;
+            // Reject non-shell smoke_test step types until shared
+            // resource semantics (agent_semaphore contention with the
+            // iterate phase, sandbox plumbing for write_file) are
+            // pinned down. See `LongRunningExecutor::run_smoke_test`'s
+            // doc comment for the rationale.
+            if !matches!(step, StepDef::Shell { .. }) {
+                return Err(WorkflowError::invalid_workflow(
+                    path_display,
+                    format!(
+                        "iterate.bootstrap.smoke_test: only `type: shell` steps are \
+                         supported (got '{kind}')",
+                        kind = step.step_type(),
+                    ),
+                ));
+            }
+            Ok(BootstrapItem::SmokeTest(Box::new(step)))
+        }
+    }
 }
 
 #[expect(
@@ -1184,14 +1442,169 @@ steps: []
     }
 
     #[test]
-    fn long_running_mode_parses() {
-        let yaml = r"
+    fn long_running_mode_parses_with_iterate() {
+        let yaml = r#"
 id: lr
+mode: long_running
+iterate:
+  until: "false"
+  max_sessions: 5
+  session_timeout: "30s"
+  steps:
+    - id: noop
+      type: shell
+      command: "true"
+"#;
+        let wf = parse_workflow_str(yaml, p()).unwrap();
+        assert_eq!(wf.mode, WorkflowMode::LongRunning);
+        let iter = wf.iterate.as_ref().unwrap();
+        assert_eq!(iter.max_sessions, 5);
+        assert_eq!(iter.session_timeout, Duration::from_secs(30));
+        assert_eq!(iter.until, "false");
+        assert_eq!(iter.steps.len(), 1);
+    }
+
+    #[test]
+    fn long_running_without_iterate_errors() {
+        let yaml = r"
+id: bad_lr
 mode: long_running
 steps: []
 ";
+        let err = parse_workflow_str(yaml, p()).unwrap_err();
+        assert!(
+            err.to_string().contains("requires an `iterate:` phase"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn normal_mode_with_iterate_errors() {
+        let yaml = r#"
+id: bad_normal
+iterate:
+  until: "false"
+  max_sessions: 1
+  session_timeout: "10s"
+  steps:
+    - id: x
+      type: shell
+      command: "true"
+"#;
+        let err = parse_workflow_str(yaml, p()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only allowed when `mode: long_running`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn normal_mode_with_init_errors() {
+        let yaml = r"
+id: bad_normal_init
+init:
+  steps: []
+";
+        let err = parse_workflow_str(yaml, p()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only allowed when `mode: long_running`"),
+            "{err}"
+        );
+    }
+
+    /// SPEC §8.12 `build-app` sample: a `long_running` workflow with
+    /// `init`, `iterate`, `bootstrap` (`run`/`read`/`smoke_test`) and
+    /// an `until` based on the artifact resolver.
+    #[test]
+    fn parses_spec_8_12_build_app_sample() {
+        let yaml = r#"
+id: build_app
+mode: long_running
+
+init:
+  artifacts:
+    progress_file: ".tsumugi/runs/RUNID/progress.md"
+    features_file: ".tsumugi/runs/RUNID/features.json"
+  steps:
+    - id: bootstrap_init
+      type: agent
+      subagent: initializer
+      prompt: "Read the codebase and produce features.json + init.sh."
+
+iterate:
+  bootstrap:
+    - run: "git status --porcelain"
+    - read: "${{ artifacts.progress_file }}"
+    - smoke_test:
+        id: smoke
+        type: shell
+        command: "cargo check"
+  steps:
+    - id: implement
+      type: agent
+      subagent: worker
+      prompt: "Pick the next failing feature and implement it."
+    - id: verify
+      type: shell
+      command: "cargo test --workspace"
+  until: "artifact.features.all_passing"
+  max_sessions: 20
+  session_timeout: "30m"
+"#;
         let wf = parse_workflow_str(yaml, p()).unwrap();
+        assert_eq!(wf.id, "build_app");
         assert_eq!(wf.mode, WorkflowMode::LongRunning);
+
+        let init = wf.init.as_ref().unwrap();
+        assert_eq!(init.artifacts.len(), 2);
+        assert!(init.artifacts.contains_key("progress_file"));
+        assert_eq!(init.steps.len(), 1);
+        match &init.steps[0] {
+            StepDef::Agent { subagent, .. } => assert_eq!(subagent, "initializer"),
+            other => panic!("expected agent step, got {other:?}"),
+        }
+
+        let iter = wf.iterate.as_ref().unwrap();
+        assert_eq!(iter.bootstrap.len(), 3);
+        match &iter.bootstrap[0] {
+            BootstrapItem::Run(s) => assert_eq!(s, "git status --porcelain"),
+            other => panic!("expected Run, got {other:?}"),
+        }
+        match &iter.bootstrap[1] {
+            BootstrapItem::Read(s) => assert!(s.contains("artifacts.progress_file")),
+            other => panic!("expected Read, got {other:?}"),
+        }
+        match &iter.bootstrap[2] {
+            BootstrapItem::SmokeTest(step) => {
+                assert_eq!(step.id(), "smoke");
+                assert_eq!(step.step_type(), "shell");
+            }
+            other => panic!("expected SmokeTest, got {other:?}"),
+        }
+        assert_eq!(iter.steps.len(), 2);
+        assert_eq!(iter.until, "artifact.features.all_passing");
+        assert_eq!(iter.max_sessions, 20);
+        assert_eq!(iter.session_timeout, Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn iterate_max_sessions_zero_errors() {
+        let yaml = r#"
+id: bad_max
+mode: long_running
+iterate:
+  until: "false"
+  max_sessions: 0
+  session_timeout: "10s"
+  steps:
+    - id: x
+      type: shell
+      command: "true"
+"#;
+        let err = parse_workflow_str(yaml, p()).unwrap_err();
+        assert!(err.to_string().contains("max_sessions"), "{err}");
     }
 
     /// SPEC §8.4 `review_loop` sample: top-level steps + a loop body
@@ -1586,6 +1999,96 @@ steps:
             err.to_string()
                 .contains("does not currently support 'when'"),
             "{err}"
+        );
+    }
+
+    /// PR #66 review fix #6: a bootstrap entry that declares none of
+    /// `run:` / `read:` / `smoke_test:` produces a precise error
+    /// message naming all three keys.
+    #[test]
+    fn bootstrap_entry_with_no_keys_is_rejected() {
+        let yaml = r#"
+id: lr_bad_bootstrap
+mode: long_running
+
+iterate:
+  bootstrap:
+    - {}
+  steps:
+    - id: noop
+      type: shell
+      command: "true"
+  until: "true"
+  max_sessions: 1
+  session_timeout: "5s"
+"#;
+        let err = parse_workflow_str(yaml, p()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`run:`") && msg.contains("`read:`") && msg.contains("`smoke_test:`"),
+            "missing key list in error: {msg}"
+        );
+        assert!(msg.contains("found none"), "wrong wording: {msg}");
+    }
+
+    /// PR #66 review fix #6: a bootstrap entry that declares more than
+    /// one key (e.g. both `run:` and `read:`) is rejected with a list
+    /// of the offending keys.
+    #[test]
+    fn bootstrap_entry_with_multiple_keys_is_rejected() {
+        let yaml = r#"
+id: lr_bad_bootstrap_multi
+mode: long_running
+
+iterate:
+  bootstrap:
+    - run: "echo a"
+      read: "b.txt"
+  steps:
+    - id: noop
+      type: shell
+      command: "true"
+  until: "true"
+  max_sessions: 1
+  session_timeout: "5s"
+"#;
+        let err = parse_workflow_str(yaml, p()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("\"run\"") && msg.contains("\"read\""),
+            "expected key names in error: {msg}"
+        );
+    }
+
+    /// PR #66 review fix #7: `smoke_test` entries must be `type: shell`
+    /// — non-shell steps are rejected at parse time until shared
+    /// resource semantics are pinned down.
+    #[test]
+    fn bootstrap_smoke_test_rejects_non_shell_steps() {
+        let yaml = r#"
+id: lr_smoke_non_shell
+mode: long_running
+
+iterate:
+  bootstrap:
+    - smoke_test:
+        id: bad
+        type: write_file
+        path: "x"
+        content: "y"
+  steps:
+    - id: noop
+      type: shell
+      command: "true"
+  until: "true"
+  max_sessions: 1
+  session_timeout: "5s"
+"#;
+        let err = parse_workflow_str(yaml, p()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("only `type: shell`") || msg.contains("only `type: shell` steps"),
+            "expected shell-only restriction: {msg}"
         );
     }
 }

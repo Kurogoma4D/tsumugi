@@ -55,11 +55,30 @@
 //!   scope keys ("unknown identifier 'foo' in 'inputs'").
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde_json::Value;
 
 use crate::def::{StepResult, WorkflowOutputs};
 use crate::error::{Result, WorkflowError};
+
+/// Resolves the special `${{ artifact.<name>.<method> }}` expression
+/// scope.
+///
+/// `tail` is the dotted suffix after the leading `artifact.` (for
+/// example, the expression `${{ artifact.features.all_passing }}`
+/// arrives here as `"features.all_passing"`). Implementations dispatch
+/// on the head and return a JSON value (typically a bool / number /
+/// string) suitable for use in `${{ ... }}` substitution and `until:`
+/// boolean evaluation.
+///
+/// The trait is `Send + Sync` so the [`ExprContext`] holding a
+/// reference to the resolver can be shared across the workflow
+/// engine's recursive dispatch.
+pub trait ArtifactResolver: Send + Sync {
+    /// Resolve `tail` (dotted, no leading `artifact.`) into a value.
+    fn resolve(&self, tail: &str) -> Result<Value>;
+}
 
 /// Compute a 1-based `(line, col)` for a byte offset into `src`.
 ///
@@ -84,14 +103,25 @@ fn line_col(src: &str, pos: usize) -> (usize, usize) {
     (line, col)
 }
 
-/// The four+ scopes available to expressions.
+/// The scopes available to expressions.
 ///
-/// `stages` is an optional fifth scope used by declarative-pipeline
-/// (`stages:`) workflows added in issue #41. It carries the per-stage
-/// [`WorkflowOutputs`] map keyed by stage id; pipelines can reference
-/// `${{ stages.<id>.outputs.<key> }}` between stages. Plain workflows
-/// (no `stages:`) leave it as `None`, which matches the historical
-/// scope set (`inputs`, `steps`, `config`, `env`) exactly.
+/// In addition to the four standard scopes (`inputs`, `steps`,
+/// `config`, `env`), additional optional scopes can be attached:
+///
+/// - `stages`: an optional pipeline scope used by declarative-pipeline
+///   (`stages:`) workflows added in issue #41. It carries the per-stage
+///   [`WorkflowOutputs`] map keyed by stage id; pipelines can reference
+///   `${{ stages.<id>.outputs.<key> }}` between stages. Plain workflows
+///   (no `stages:`) leave it as `None`.
+/// - `artifacts`: a `BTreeMap<String, PathBuf>` exposed to expressions
+///   as `${{ artifacts.<name> }}` (returns the path string).
+/// - `artifact_resolver`: an [`ArtifactResolver`] that dispatches the
+///   special `${{ artifact.<name>.<method> }}` form against a live
+///   data source — typically the harnessed run's `features.json`.
+///
+/// All three optional fields default to `None`. Workflows that don't
+/// opt into these scopes see a clear "unknown top-level identifier"
+/// error if they try to reference them.
 pub struct ExprContext<'a> {
     /// Workflow inputs as a JSON object.
     pub inputs: &'a Value,
@@ -105,15 +135,21 @@ pub struct ExprContext<'a> {
     /// outer workflow has `stages:` and is dispatching a `workflow`
     /// step). `None` outside that context.
     pub stages: Option<&'a BTreeMap<String, WorkflowOutputs>>,
+    /// Optional named artifact paths (`artifacts.<name>` -> path
+    /// string).
+    pub artifacts: Option<&'a BTreeMap<String, PathBuf>>,
+    /// Optional resolver for the `artifact.<name>.<method>` scope.
+    pub artifact_resolver: Option<&'a dyn ArtifactResolver>,
 }
 
 impl<'a> ExprContext<'a> {
-    /// Construct a new context.
+    /// Construct a new context with the four standard scopes.
     ///
-    /// The `stages` scope is left empty (`None`) — equivalent to the
-    /// historical four-scope context used by single-workflow runs. Use
-    /// [`Self::with_stages`] to attach a stages map for pipeline
-    /// dispatch.
+    /// All optional scopes (`stages`, `artifacts`, `artifact_resolver`)
+    /// are left empty. Use [`with_stages`](Self::with_stages),
+    /// [`with_artifacts`](Self::with_artifacts), and
+    /// [`with_artifact_resolver`](Self::with_artifact_resolver) to opt
+    /// into the additional scopes.
     #[must_use]
     pub fn new(
         inputs: &'a Value,
@@ -127,6 +163,8 @@ impl<'a> ExprContext<'a> {
             config,
             env,
             stages: None,
+            artifacts: None,
+            artifact_resolver: None,
         }
     }
 
@@ -136,6 +174,26 @@ impl<'a> ExprContext<'a> {
     #[must_use]
     pub fn with_stages(mut self, stages: &'a BTreeMap<String, WorkflowOutputs>) -> Self {
         self.stages = Some(stages);
+        self
+    }
+
+    /// Attach an `artifacts` map to this context.
+    ///
+    /// Returns `self` for builder-style chaining. The map is borrowed
+    /// for the context's lifetime.
+    #[must_use]
+    pub fn with_artifacts(mut self, artifacts: &'a BTreeMap<String, PathBuf>) -> Self {
+        self.artifacts = Some(artifacts);
+        self
+    }
+
+    /// Attach an [`ArtifactResolver`] to this context.
+    ///
+    /// Returns `self` for builder-style chaining. The resolver is
+    /// borrowed for the context's lifetime.
+    #[must_use]
+    pub fn with_artifact_resolver(mut self, resolver: &'a dyn ArtifactResolver) -> Self {
+        self.artifact_resolver = Some(resolver);
         self
     }
 }
@@ -718,14 +776,96 @@ fn resolve_path(segs: &[PathSeg], ctx: &ExprContext) -> Result<Value> {
             // when the engine attached a stages map (pipeline dispatch).
             return resolve_stages_path(&segs[1..], ctx);
         }
+        "artifacts" => {
+            return resolve_artifacts_path(&segs[1..], ctx);
+        }
+        "artifact" => {
+            return resolve_artifact_method(&segs[1..], ctx);
+        }
         other => {
             return Err(WorkflowError::expression(format!(
-                "unknown top-level identifier '{other}' (allowed: inputs, steps, stages, config, env)"
+                "unknown top-level identifier '{other}' (allowed: inputs, steps, stages, config, env, artifacts, artifact)"
             )));
         }
     };
 
     walk_path(&head, &segs[1..], scope)
+}
+
+/// Resolve `artifacts.<name>` to the configured path string.
+///
+/// Returns a clear error when no `artifacts` map was attached (i.e.
+/// the caller is not in a long-running workflow context) so the
+/// workflow author sees a useful message instead of a silent `null`.
+fn resolve_artifacts_path(rest: &[PathSeg], ctx: &ExprContext) -> Result<Value> {
+    let Some(artifacts) = ctx.artifacts else {
+        return Err(WorkflowError::expression(
+            "the 'artifacts' scope is only available inside a long_running workflow's iterate phase",
+        ));
+    };
+    let Some(first) = rest.first() else {
+        // Bare `artifacts` reference — return all entries as an object
+        // for completeness (cheap; the map is small).
+        let mut obj = serde_json::Map::new();
+        for (name, path) in artifacts {
+            obj.insert(
+                name.clone(),
+                Value::String(path.to_string_lossy().into_owned()),
+            );
+        }
+        return Ok(Value::Object(obj));
+    };
+    let name = match first {
+        PathSeg::Ident(s) | PathSeg::Index(s) => s,
+    };
+    let Some(path) = artifacts.get(name) else {
+        return Err(WorkflowError::expression(format!(
+            "unknown artifact '{name}' in 'artifacts' (declared names: {names})",
+            names = artifacts.keys().cloned().collect::<Vec<_>>().join(", "),
+        )));
+    };
+    let value = Value::String(path.to_string_lossy().into_owned());
+    walk_path(&value, &rest[1..], &format!("artifacts.{name}"))
+}
+
+/// Resolve `artifact.<name>.<method>` by dispatching to the attached
+/// [`ArtifactResolver`].
+///
+/// The full dotted suffix (e.g. `features.all_passing`) is passed to
+/// the resolver verbatim. Any remaining path segments after the
+/// resolver returns are walked normally so callers can still drill
+/// into a returned object (e.g. `artifact.features.all_passing` ->
+/// bool, `artifact.features.summary.entries[0]` -> object).
+fn resolve_artifact_method(rest: &[PathSeg], ctx: &ExprContext) -> Result<Value> {
+    let Some(resolver) = ctx.artifact_resolver else {
+        return Err(WorkflowError::expression(
+            "the 'artifact' scope is only available inside a long_running workflow's iterate phase",
+        ));
+    };
+    if rest.is_empty() {
+        return Err(WorkflowError::expression(
+            "expected 'artifact.<name>.<method>' (e.g. 'artifact.features.all_passing')",
+        ));
+    }
+    // Consume *all* leading identifier segments as the resolver tail.
+    // `[ "features", "all_passing" ]` -> `"features.all_passing"`. Any
+    // further segments after that — typically empty — are left for
+    // `walk_path` to handle in case the resolver returns a structured
+    // value the caller wants to drill into.
+    //
+    // Concretely we feed the resolver the whole tail; callers that
+    // want a "stop walking after method" semantic can return a scalar
+    // and `walk_path` becomes a no-op.
+    let tail_parts: Vec<&str> = rest
+        .iter()
+        .map(|seg| match seg {
+            PathSeg::Ident(s) | PathSeg::Index(s) => s.as_str(),
+        })
+        .collect();
+    let tail = tail_parts.join(".");
+    let value = resolver.resolve(&tail)?;
+    // No further walking — the resolver already received the full tail.
+    Ok(value)
 }
 
 fn resolve_steps_path(rest: &[PathSeg], ctx: &ExprContext) -> Result<Value> {
@@ -1256,5 +1396,80 @@ mod tests {
         let src = "ab\ncd\nefg";
         let (line, col) = line_col(src, 7);
         assert_eq!((line, col), (3, 2));
+    }
+
+    #[test]
+    fn artifacts_scope_returns_path_string() {
+        let inputs = Value::Null;
+        let s = BTreeMap::new();
+        let c = Value::Null;
+        let e = BTreeMap::new();
+        let mut artifacts = BTreeMap::new();
+        artifacts.insert(
+            "progress_file".to_owned(),
+            PathBuf::from("/run/progress.md"),
+        );
+        let ctx = ExprContext::new(&inputs, &s, &c, &e).with_artifacts(&artifacts);
+        let v = eval_value("artifacts.progress_file", &ctx).unwrap();
+        assert_eq!(v, json!("/run/progress.md"));
+    }
+
+    #[test]
+    fn artifacts_scope_unknown_name_errors() {
+        let inputs = Value::Null;
+        let s = BTreeMap::new();
+        let c = Value::Null;
+        let e = BTreeMap::new();
+        let mut artifacts = BTreeMap::new();
+        artifacts.insert("known".to_owned(), PathBuf::from("/p"));
+        let ctx = ExprContext::new(&inputs, &s, &c, &e).with_artifacts(&artifacts);
+        let err = eval_value("artifacts.unknown", &ctx).unwrap_err();
+        assert!(err.to_string().contains("unknown artifact 'unknown'"));
+    }
+
+    #[test]
+    fn artifacts_scope_without_attached_errors() {
+        let (i, s, c, e) = ctx_with_inputs(Value::Null);
+        let ctx = make_ctx(&i, &s, &c, &e);
+        let err = eval_value("artifacts.foo", &ctx).unwrap_err();
+        assert!(err.to_string().contains("only available inside"));
+    }
+
+    /// A test resolver that maps a fixed table.
+    struct TestResolver;
+    impl ArtifactResolver for TestResolver {
+        fn resolve(&self, tail: &str) -> Result<Value> {
+            match tail {
+                "features.all_passing" => Ok(json!(true)),
+                "features.passing_count" => Ok(json!(7)),
+                other => Err(WorkflowError::expression(format!("unknown {other}"))),
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_method_dispatches_to_resolver() {
+        let inputs = Value::Null;
+        let s = BTreeMap::new();
+        let c = Value::Null;
+        let e = BTreeMap::new();
+        let resolver = TestResolver;
+        let ctx = ExprContext::new(&inputs, &s, &c, &e).with_artifact_resolver(&resolver);
+        assert_eq!(
+            eval_value("artifact.features.all_passing", &ctx).unwrap(),
+            json!(true),
+        );
+        assert_eq!(
+            eval_value("artifact.features.passing_count", &ctx).unwrap(),
+            json!(7),
+        );
+    }
+
+    #[test]
+    fn artifact_scope_without_resolver_errors() {
+        let (i, s, c, e) = ctx_with_inputs(Value::Null);
+        let ctx = make_ctx(&i, &s, &c, &e);
+        let err = eval_value("artifact.features.all_passing", &ctx).unwrap_err();
+        assert!(err.to_string().contains("only available inside"));
     }
 }

@@ -55,9 +55,10 @@ use tmg_tools::ToolRegistry;
 use crate::config::WorkflowConfig;
 use crate::def::{InputDef, StepDef, StepResult, WorkflowDef, WorkflowOutputs};
 use crate::error::{Result, WorkflowError};
-use crate::expr;
+use crate::expr::{self, ArtifactResolver};
 use crate::progress::WorkflowProgress;
 use crate::steps;
+use std::path::PathBuf;
 
 /// Shared index of discovered workflows, keyed by id.
 ///
@@ -111,6 +112,56 @@ pub(crate) struct EngineCtx {
     /// nested `WorkflowEngine::run` call to prevent runaway recursion
     /// when a pipeline misconfigures stage references.
     pub(crate) workflow_depth: u32,
+    /// Optional named artifact paths exposed to expressions as
+    /// `${{ artifacts.<name> }}`. Populated only by long-running
+    /// workflows when the executor calls
+    /// [`WorkflowEngine::run_with_extras`].
+    pub(crate) artifacts: Option<Arc<BTreeMap<String, PathBuf>>>,
+    /// Optional [`ArtifactResolver`] used by the
+    /// `${{ artifact.<name>.<method> }}` form. Populated only by
+    /// long-running workflows when the executor calls
+    /// [`WorkflowEngine::run_with_extras`].
+    pub(crate) artifact_resolver: Option<Arc<dyn ArtifactResolver>>,
+}
+
+/// Build a fully-populated [`expr::ExprContext`] from `ctx`,
+/// `step_results`, and a `stages_snapshot` borrowed from the caller.
+///
+/// Centralises the optional `artifacts` / `artifact_resolver` plumbing
+/// so every step handler picks up the long-running scopes uniformly.
+/// Callers must hold `stages_snapshot` for the lifetime of the
+/// returned context.
+pub(crate) fn build_eval_ctx<'a>(
+    ctx: &'a EngineCtx,
+    step_results: &'a BTreeMap<String, StepResult>,
+    stages_snapshot: &'a BTreeMap<String, WorkflowOutputs>,
+) -> expr::ExprContext<'a> {
+    let mut eval_ctx =
+        expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env)
+            .with_stages(stages_snapshot);
+    if let Some(art) = ctx.artifacts.as_ref() {
+        eval_ctx = eval_ctx.with_artifacts(art.as_ref());
+    }
+    if let Some(res) = ctx.artifact_resolver.as_ref() {
+        eval_ctx = eval_ctx.with_artifact_resolver(res.as_ref());
+    }
+    eval_ctx
+}
+
+/// Optional extension knobs for a long-running workflow phase.
+///
+/// Long-running mode (`mode: long_running`) needs to thread the run's
+/// artifact paths and a live `artifact.*` resolver into iterate-phase
+/// step handlers so step expressions can reference
+/// `${{ artifacts.progress_file }}` / `${{ artifact.features.passing_count }}`.
+/// Plain workflows leave both fields `None` and see the historical
+/// scope set.
+#[derive(Default)]
+pub struct EngineExtras {
+    /// Artifact-name -> path map exposed via `${{ artifacts.<name> }}`.
+    pub artifacts: Option<Arc<BTreeMap<String, PathBuf>>>,
+    /// Optional resolver for `${{ artifact.<name>.<method> }}`.
+    pub artifact_resolver: Option<Arc<dyn ArtifactResolver>>,
 }
 
 /// Workflow executor.
@@ -218,6 +269,11 @@ pub(crate) async fn run_nested_workflow(
         // borrow rather than a clone.
         stages: Arc::new(RwLock::new(BTreeMap::new())),
         workflow_depth: parent_ctx.workflow_depth + 1,
+        // Inherit long-running scopes so a nested pipeline-style stage
+        // sees the same `${{ artifacts.* }}` / `${{ artifact.* }}` view
+        // its parent saw.
+        artifacts: parent_ctx.artifacts.clone(),
+        artifact_resolver: parent_ctx.artifact_resolver.clone(),
     };
 
     let mut step_results: BTreeMap<String, StepResult> = BTreeMap::new();
@@ -271,13 +327,7 @@ pub(crate) async fn run_nested_workflow(
     let stages_snapshot = nested_ctx.stages.read().await.clone();
     let mut output_values: BTreeMap<String, String> = BTreeMap::new();
     for (name, template) in &workflow.outputs {
-        let inner_ctx = expr::ExprContext::new(
-            &nested_ctx.inputs,
-            &step_results,
-            &nested_ctx.config_json,
-            &nested_ctx.env,
-        )
-        .with_stages(&stages_snapshot);
+        let inner_ctx = build_eval_ctx(&nested_ctx, &step_results, &stages_snapshot);
         let rendered = expr::eval_string(template, &inner_ctx)?;
         output_values.insert(name.clone(), rendered);
     }
@@ -337,6 +387,17 @@ impl WorkflowEngine {
         self.workflow_index.clone()
     }
 
+    /// Return a cheaply-cloned handle to the [`SandboxContext`] this
+    /// engine was built with.
+    ///
+    /// Long-running mode reuses this so its own bootstrap shell
+    /// commands run under the same Landlock / timeout / OOM-score
+    /// policy the engine applies to `shell` steps.
+    #[must_use]
+    pub fn sandbox(&self) -> Arc<SandboxContext> {
+        Arc::clone(&self.sandbox)
+    }
+
     /// Run the given workflow with the given input map.
     ///
     /// The supplied `progress_tx` receives one [`WorkflowProgress`]
@@ -378,6 +439,32 @@ impl WorkflowEngine {
         progress_tx: mpsc::Sender<WorkflowProgress>,
         cancel: CancellationToken,
     ) -> Result<WorkflowOutputs> {
+        self.run_with_extras(
+            workflow,
+            inputs,
+            progress_tx,
+            cancel,
+            EngineExtras::default(),
+        )
+        .await
+    }
+
+    /// Like [`Self::run_with_cancel`] but additionally accepts an
+    /// [`EngineExtras`] bundle so long-running workflows can inject
+    /// their per-run artifact map and `artifact.*` resolver.
+    ///
+    /// This is the entry point used by [`crate::LongRunningExecutor`]
+    /// when running iterate-phase steps so any step expression
+    /// referencing `${{ artifacts.<name> }}` or
+    /// `${{ artifact.<name>.<method> }}` resolves correctly.
+    pub async fn run_with_extras(
+        &self,
+        workflow: &WorkflowDef,
+        inputs: BTreeMap<String, Value>,
+        progress_tx: mpsc::Sender<WorkflowProgress>,
+        cancel: CancellationToken,
+        extras: EngineExtras,
+    ) -> Result<WorkflowOutputs> {
         // Resolve inputs (apply defaults / required check).
         let resolved_inputs = resolve_inputs(&workflow.inputs, inputs)?;
         let inputs_value = Value::Object(resolved_inputs);
@@ -411,6 +498,8 @@ impl WorkflowEngine {
             workflow_index: self.workflow_index.clone(),
             stages: Arc::new(RwLock::new(BTreeMap::new())),
             workflow_depth: 0,
+            artifacts: extras.artifacts,
+            artifact_resolver: extras.artifact_resolver,
         };
 
         let mut step_results: BTreeMap<String, StepResult> = BTreeMap::new();
@@ -489,9 +578,7 @@ impl WorkflowEngine {
         let stages_snapshot = ctx.stages.read().await.clone();
         let mut output_values: BTreeMap<String, String> = BTreeMap::new();
         for (name, template) in &workflow.outputs {
-            let inner_ctx =
-                expr::ExprContext::new(&ctx.inputs, &step_results, &ctx.config_json, &ctx.env)
-                    .with_stages(&stages_snapshot);
+            let inner_ctx = build_eval_ctx(&ctx, &step_results, &stages_snapshot);
             let rendered = expr::eval_string(template, &inner_ctx)?;
             output_values.insert(name.clone(), rendered);
         }
@@ -539,9 +626,7 @@ async fn dispatch_step_inner(
     // Evaluate `when` clause for leaf steps that support it.
     if let Some(expr_src) = step.when() {
         let stages_snapshot = ctx.stages.read().await.clone();
-        let eval_ctx =
-            expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env)
-                .with_stages(&stages_snapshot);
+        let eval_ctx = build_eval_ctx(ctx, step_results, &stages_snapshot);
         let cond = expr::eval_bool(expr_src, &eval_ctx).map_err(|e| WorkflowError::StepFailed {
             step_id: step_id.clone(),
             message: format!("when-expression error: {e}"),
@@ -586,9 +671,7 @@ async fn dispatch_step_inner(
                     message: "agent semaphore was closed".to_owned(),
                 })?;
             let stages_snapshot = ctx.stages.read().await.clone();
-            let eval_ctx =
-                expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env)
-                    .with_stages(&stages_snapshot);
+            let eval_ctx = build_eval_ctx(ctx, step_results, &stages_snapshot);
             let result = steps::agent::execute(steps::agent::AgentStepArgs {
                 subagent_manager: &ctx.subagent_manager,
                 sandbox: &ctx.sandbox,
@@ -610,9 +693,7 @@ async fn dispatch_step_inner(
             when: _,
         } => {
             let stages_snapshot = ctx.stages.read().await.clone();
-            let eval_ctx =
-                expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env)
-                    .with_stages(&stages_snapshot);
+            let eval_ctx = build_eval_ctx(ctx, step_results, &stages_snapshot);
             steps::shell::execute(
                 &ctx.sandbox,
                 ctx.config.default_shell_timeout,
@@ -628,9 +709,7 @@ async fn dispatch_step_inner(
             content,
         } => {
             let stages_snapshot = ctx.stages.read().await.clone();
-            let eval_ctx =
-                expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env)
-                    .with_stages(&stages_snapshot);
+            let eval_ctx = build_eval_ctx(ctx, step_results, &stages_snapshot);
             steps::write_file::execute(&ctx.sandbox, path, content, &eval_ctx).await
         }
         StepDef::Loop { .. } => {

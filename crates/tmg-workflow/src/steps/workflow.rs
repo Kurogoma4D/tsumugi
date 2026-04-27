@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use serde_json::{Value, json};
 
 use crate::def::{LoopSpec, StepDef, StepResult, WorkflowOutputs};
-use crate::engine::{EngineCtx, StepOutcome, run_nested_workflow};
+use crate::engine::{EngineCtx, StepOutcome, build_eval_ctx, run_nested_workflow};
 use crate::error::{Result, WorkflowError};
 use crate::expr;
 use crate::progress::WorkflowProgress;
@@ -123,9 +123,7 @@ async fn run_with_loop(
         // Evaluate `until` with stages visible so the typical pattern
         // `${{ stages.<id>.outputs.findings_count == 0 }}` works.
         let stages_snapshot = ctx.stages.read().await.clone();
-        let inner_ctx =
-            expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env)
-                .with_stages(&stages_snapshot);
+        let inner_ctx = build_eval_ctx(ctx, step_results, &stages_snapshot);
         let cond =
             expr::eval_bool(&spec.until, &inner_ctx).map_err(|e| WorkflowError::StepFailed {
                 step_id: stage_id.to_owned(),
@@ -173,8 +171,7 @@ async fn render_inputs(
     step_results: &BTreeMap<String, StepResult>,
 ) -> Result<BTreeMap<String, Value>> {
     let stages_snapshot = ctx.stages.read().await.clone();
-    let eval_ctx = expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env)
-        .with_stages(&stages_snapshot);
+    let eval_ctx = build_eval_ctx(ctx, step_results, &stages_snapshot);
     let mut resolved: BTreeMap<String, Value> = BTreeMap::new();
     for (key, tmpl) in inputs_template {
         let rendered =
