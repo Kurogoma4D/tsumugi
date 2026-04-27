@@ -4,8 +4,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use clap::Parser;
 use tmg_harness::{
-    ProgressAppendTool, RunRunner, RunStore, RunSummary, SessionBootstrapTool, SessionEndTrigger,
-    SessionSummarySaveTool,
+    RunRunner, RunStore, RunSummary, SessionBootstrapTool, SessionEndTrigger, register_run_tools,
 };
 use tmg_llm::ToolCallingMode;
 use tokio::sync::Mutex;
@@ -298,17 +297,16 @@ fn run_tui(
         )));
 
         // Create the tool registry: built-ins, then spawn_agent, then
-        // the three Run-scoped harness tools. Order matters for the
-        // sorted-by-name registration but later registrations would
-        // shadow same-named earlier ones; we don't expect collisions.
+        // the Run-scoped harness tools. `register_run_tools` is the
+        // single authoritative place where the harnessed-vs-ad-hoc
+        // tool set is decided; the CLI does not branch on `scope()`
+        // itself so the gating logic lives in one place.
         let mut registry = tmg_tools::default_registry();
         registry.register(tmg_agents::SpawnAgentTool::with_custom_agents(
             Arc::clone(&subagent_manager),
             custom_agent_defs.clone(),
         ));
-        registry.register(ProgressAppendTool::new(Arc::clone(&runner)));
-        registry.register(SessionBootstrapTool::new(Arc::clone(&runner)));
-        registry.register(SessionSummarySaveTool::new(Arc::clone(&runner)));
+        register_run_tools(&mut registry, Arc::clone(&runner)).await;
 
         let mut agent = tmg_core::AgentLoop::with_context_config(
             client,

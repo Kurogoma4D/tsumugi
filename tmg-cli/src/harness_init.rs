@@ -74,6 +74,7 @@ mod tests {
             runs_dir: store.runs_dir().to_path_buf(),
             auto_resume_on_start: true,
             bootstrap_max_tokens: tmg_harness::DEFAULT_BOOTSTRAP_MAX_TOKENS,
+            ..HarnessConfig::default()
         };
         let resolved =
             resolve_startup_run(&cfg, &store, workspace.clone()).unwrap_or_else(|e| panic!("{e}"));
@@ -95,6 +96,7 @@ mod tests {
             runs_dir: store.runs_dir().to_path_buf(),
             auto_resume_on_start: false,
             bootstrap_max_tokens: tmg_harness::DEFAULT_BOOTSTRAP_MAX_TOKENS,
+            ..HarnessConfig::default()
         };
         let resolved =
             resolve_startup_run(&cfg, &store, workspace.clone()).unwrap_or_else(|e| panic!("{e}"));
@@ -124,6 +126,7 @@ mod tests {
             runs_dir: store.runs_dir().to_path_buf(),
             auto_resume_on_start: true,
             bootstrap_max_tokens: tmg_harness::DEFAULT_BOOTSTRAP_MAX_TOKENS,
+            ..HarnessConfig::default()
         };
         let resolved =
             resolve_startup_run(&cfg, &store, workspace.clone()).unwrap_or_else(|e| panic!("{e}"));
@@ -144,6 +147,7 @@ mod tests {
             runs_dir: store.runs_dir().to_path_buf(),
             auto_resume_on_start: true,
             bootstrap_max_tokens: tmg_harness::DEFAULT_BOOTSTRAP_MAX_TOKENS,
+            ..HarnessConfig::default()
         };
         let resolved =
             resolve_startup_run(&cfg, &store, workspace.clone()).unwrap_or_else(|e| panic!("{e}"));
@@ -171,6 +175,7 @@ mod tests {
             runs_dir: store.runs_dir().to_path_buf(),
             auto_resume_on_start: true,
             bootstrap_max_tokens: tmg_harness::DEFAULT_BOOTSTRAP_MAX_TOKENS,
+            ..HarnessConfig::default()
         };
 
         // Starting in workspace_b should NOT resume run_a; instead a
@@ -201,6 +206,7 @@ mod tests {
             runs_dir: store.runs_dir().to_path_buf(),
             auto_resume_on_start: true,
             bootstrap_max_tokens: tmg_harness::DEFAULT_BOOTSTRAP_MAX_TOKENS,
+            ..HarnessConfig::default()
         };
 
         // First launch: create a fresh run, begin and end one session,

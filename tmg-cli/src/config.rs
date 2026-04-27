@@ -125,6 +125,17 @@ struct PartialHarnessConfig {
     pub runs_dir: Option<PathBuf>,
     pub auto_resume_on_start: Option<bool>,
     pub bootstrap_max_tokens: Option<usize>,
+    pub smoke_test_every_n_sessions: Option<u32>,
+    pub default_max_sessions: Option<u32>,
+    /// Wall-clock budget for one session in the harnessed runner.
+    ///
+    /// Stored as a string in TOML (`"30m"`, `"2h30m"`, ...). Parsed via
+    /// [`humantime::parse_duration`] in [`Self::into_final`]; an
+    /// invalid value produces a [`ConfigError::InvalidValue`] at
+    /// resolution time so config errors surface as soon as
+    /// [`load_config`] runs rather than only when the harness tries to
+    /// schedule a session.
+    pub default_session_timeout: Option<String>,
 }
 
 impl PartialHarnessConfig {
@@ -139,12 +150,26 @@ impl PartialHarnessConfig {
         if other.bootstrap_max_tokens.is_some() {
             self.bootstrap_max_tokens = other.bootstrap_max_tokens;
         }
+        if other.smoke_test_every_n_sessions.is_some() {
+            self.smoke_test_every_n_sessions = other.smoke_test_every_n_sessions;
+        }
+        if other.default_max_sessions.is_some() {
+            self.default_max_sessions = other.default_max_sessions;
+        }
+        if other.default_session_timeout.is_some() {
+            self.default_session_timeout
+                .clone_from(&other.default_session_timeout);
+        }
     }
 
     /// Convert to final `HarnessConfig`, filling in defaults for unset
     /// fields.
-    fn into_final(self) -> HarnessConfig {
-        HarnessConfig {
+    fn into_final(self) -> Result<HarnessConfig, ConfigError> {
+        let default_session_timeout = match self.default_session_timeout.as_deref() {
+            Some(raw) => parse_humantime_duration("harness.default_session_timeout", raw)?,
+            None => default_session_timeout(),
+        };
+        Ok(HarnessConfig {
             runs_dir: self.runs_dir.unwrap_or_else(default_runs_dir),
             auto_resume_on_start: self
                 .auto_resume_on_start
@@ -152,8 +177,30 @@ impl PartialHarnessConfig {
             bootstrap_max_tokens: self
                 .bootstrap_max_tokens
                 .unwrap_or_else(default_bootstrap_max_tokens),
-        }
+            smoke_test_every_n_sessions: self
+                .smoke_test_every_n_sessions
+                .unwrap_or_else(default_smoke_test_every_n_sessions),
+            default_max_sessions: self
+                .default_max_sessions
+                .unwrap_or_else(default_default_max_sessions),
+            default_session_timeout,
+        })
     }
+}
+
+/// Parse a humantime-style duration string (e.g. `"30m"`, `"2h"`) into
+/// a [`std::time::Duration`].
+///
+/// Surfaced as a free function so env-override and TOML-conversion
+/// paths share the same error formatting.
+fn parse_humantime_duration(field: &str, value: &str) -> Result<std::time::Duration, ConfigError> {
+    humantime::parse_duration(value)
+        .map(|d| std::time::Duration::from_secs(d.as_secs()))
+        .map_err(|e| ConfigError::InvalidValue {
+            field: field.to_owned(),
+            value: value.to_owned(),
+            reason: e.to_string(),
+        })
 }
 
 /// Partial top-level config used for deserialization and merging.
@@ -270,18 +317,41 @@ impl PartialTsumugiConfig {
             })?;
             self.harness.bootstrap_max_tokens = Some(n);
         }
+        if let Some(v) = env_fn("TMG_HARNESS_SMOKE_TEST_EVERY_N_SESSIONS") {
+            let n = v.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
+                field: "TMG_HARNESS_SMOKE_TEST_EVERY_N_SESSIONS".to_owned(),
+                value: v,
+                reason: "must be a non-negative integer".to_owned(),
+            })?;
+            self.harness.smoke_test_every_n_sessions = Some(n);
+        }
+        if let Some(v) = env_fn("TMG_HARNESS_DEFAULT_MAX_SESSIONS") {
+            let n = v.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
+                field: "TMG_HARNESS_DEFAULT_MAX_SESSIONS".to_owned(),
+                value: v,
+                reason: "must be a non-negative integer".to_owned(),
+            })?;
+            self.harness.default_max_sessions = Some(n);
+        }
+        if let Some(v) = env_fn("TMG_HARNESS_DEFAULT_SESSION_TIMEOUT") {
+            // Validate now so a bad string is reported with a precise
+            // env-var name; the parsed value is re-derived in
+            // `into_final` so the storage shape stays a `String`.
+            let _ = parse_humantime_duration("TMG_HARNESS_DEFAULT_SESSION_TIMEOUT", &v)?;
+            self.harness.default_session_timeout = Some(v);
+        }
         Ok(())
     }
 
     /// Convert to final [`TsumugiConfig`], filling defaults for unset fields.
-    fn into_final(self) -> TsumugiConfig {
-        TsumugiConfig {
+    fn into_final(self) -> Result<TsumugiConfig, ConfigError> {
+        Ok(TsumugiConfig {
             llm: self.llm.into_final(),
             sandbox: self.sandbox,
             tui: self.tui,
             skills: self.skills.into_final(),
-            harness: self.harness.into_final(),
-        }
+            harness: self.harness.into_final()?,
+        })
     }
 }
 
@@ -386,7 +456,7 @@ pub struct TuiConfig {
 }
 
 /// Harness settings from `[harness]` section.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessConfig {
     /// Directory where run state is persisted (relative to cwd).
     pub runs_dir: PathBuf,
@@ -403,6 +473,26 @@ pub struct HarnessConfig {
     /// budget; older `progress.md` sessions and tail-end git log lines
     /// are shed until the serialized payload fits.
     pub bootstrap_max_tokens: usize,
+
+    /// Frequency at which `session_bootstrap` invokes the tester
+    /// subagent for a smoke-test pass.
+    ///
+    /// Interpretation: run the tester every Nth session (1 = every
+    /// session). The tester subagent itself is not yet implemented;
+    /// this knob is wired ahead of time so CLI configuration is stable
+    /// when the tester lands.
+    pub smoke_test_every_n_sessions: u32,
+
+    /// Default cap on the number of sessions in a harnessed run that
+    /// does not specify its own `max_sessions`.
+    pub default_max_sessions: u32,
+
+    /// Default wall-clock budget for one session in a harnessed run.
+    ///
+    /// Stored as a [`std::time::Duration`] internally; written in
+    /// `tsumugi.toml` as a humantime string (e.g. `"30m"`, `"1h30m"`).
+    #[serde(with = "humantime_serde")]
+    pub default_session_timeout: std::time::Duration,
 }
 
 fn default_runs_dir() -> PathBuf {
@@ -417,12 +507,27 @@ fn default_bootstrap_max_tokens() -> usize {
     tmg_harness::DEFAULT_BOOTSTRAP_MAX_TOKENS
 }
 
+const fn default_smoke_test_every_n_sessions() -> u32 {
+    1
+}
+
+const fn default_default_max_sessions() -> u32 {
+    50
+}
+
+fn default_session_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(30 * 60)
+}
+
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
             runs_dir: default_runs_dir(),
             auto_resume_on_start: default_auto_resume_on_start(),
             bootstrap_max_tokens: default_bootstrap_max_tokens(),
+            smoke_test_every_n_sessions: default_smoke_test_every_n_sessions(),
+            default_max_sessions: default_default_max_sessions(),
+            default_session_timeout: default_session_timeout(),
         }
     }
 }
@@ -625,7 +730,7 @@ pub fn load_config_with_env(
     // Apply environment variable overrides.
     config.apply_env_overrides(env_fn)?;
 
-    Ok(config.into_final())
+    config.into_final()
 }
 
 // ---------------------------------------------------------------------------
@@ -654,7 +759,7 @@ mod tests {
         // model stays None, should not override global
 
         global.merge_from(&project);
-        let final_config = global.into_final();
+        let final_config = global.into_final().unwrap_or_else(|e| panic!("{e}"));
 
         assert_eq!(final_config.llm.endpoint, "http://project:9090");
         assert_eq!(final_config.llm.model, "global-model");
@@ -672,7 +777,7 @@ mod tests {
         project.llm.max_context_tokens = Some(default_max_context_tokens());
 
         global.merge_from(&project);
-        let final_config = global.into_final();
+        let final_config = global.into_final().unwrap_or_else(|e| panic!("{e}"));
 
         assert_eq!(
             final_config.llm.max_context_tokens,
@@ -692,7 +797,7 @@ mod tests {
         // compat_agent_skills not set in project, should remain true.
 
         global.merge_from(&project);
-        let final_config = global.into_final();
+        let final_config = global.into_final().unwrap_or_else(|e| panic!("{e}"));
 
         assert!(!final_config.skills.compat_claude);
         assert!(final_config.skills.compat_agent_skills);
@@ -708,7 +813,7 @@ mod tests {
         project.skills.compat_claude = Some(true);
 
         global.merge_from(&project);
-        let final_config = global.into_final();
+        let final_config = global.into_final().unwrap_or_else(|e| panic!("{e}"));
 
         assert!(final_config.skills.compat_claude);
     }
@@ -729,7 +834,7 @@ mod tests {
         config
             .apply_env_overrides(&env_fn)
             .unwrap_or_else(|e| panic!("{e}"));
-        let final_config = config.into_final();
+        let final_config = config.into_final().unwrap_or_else(|e| panic!("{e}"));
 
         assert_eq!(final_config.llm.endpoint, "http://env:1234");
         assert_eq!(final_config.llm.model, "env-model");
@@ -874,7 +979,7 @@ compat_claude = false
 "#;
         let partial: PartialTsumugiConfig =
             toml::from_str(toml_str).unwrap_or_else(|e| panic!("{e}"));
-        let config = partial.into_final();
+        let config = partial.into_final().unwrap_or_else(|e| panic!("{e}"));
 
         assert_eq!(config.llm.endpoint, "http://custom:1234");
         assert_eq!(config.llm.model, "my-model");
@@ -936,7 +1041,7 @@ compat_claude = false
         // timeout_secs is None, should not override
 
         base.merge_from(&overlay);
-        let final_config = base.into_final();
+        let final_config = base.into_final().unwrap_or_else(|e| panic!("{e}"));
 
         assert_eq!(final_config.sandbox.mode, Some(SandboxMode::ReadOnly));
         assert_eq!(final_config.sandbox.timeout_secs, Some(30));
@@ -951,7 +1056,7 @@ compat_claude = false
         overlay.tui.show_token_usage = Some(true);
 
         base.merge_from(&overlay);
-        let final_config = base.into_final();
+        let final_config = base.into_final().unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(final_config.tui.show_token_usage, Some(true));
     }
 
@@ -997,6 +1102,98 @@ compat_claude = false
             config.harness.bootstrap_max_tokens,
             tmg_harness::DEFAULT_BOOTSTRAP_MAX_TOKENS
         );
+        assert_eq!(config.harness.smoke_test_every_n_sessions, 1);
+        assert_eq!(config.harness.default_max_sessions, 50);
+        assert_eq!(
+            config.harness.default_session_timeout,
+            std::time::Duration::from_secs(30 * 60),
+        );
+    }
+
+    #[test]
+    fn harness_default_session_timeout_round_trips_via_humantime_serde() {
+        let toml_str = r#"
+[harness]
+default_session_timeout = "45m"
+"#;
+        let partial: PartialTsumugiConfig =
+            toml::from_str(toml_str).unwrap_or_else(|e| panic!("{e}"));
+        let config = partial.into_final().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            config.harness.default_session_timeout,
+            std::time::Duration::from_secs(45 * 60),
+        );
+    }
+
+    #[test]
+    fn harness_default_session_timeout_invalid_string_is_error() {
+        let toml_str = r#"
+[harness]
+default_session_timeout = "not-a-duration"
+"#;
+        let partial: PartialTsumugiConfig =
+            toml::from_str(toml_str).unwrap_or_else(|e| panic!("{e}"));
+        let result = partial.into_final();
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue { ref field, .. })
+                if field == "harness.default_session_timeout"
+        ));
+    }
+
+    #[test]
+    fn harness_smoke_test_every_n_sessions_round_trip() {
+        let toml_str = r"
+[harness]
+smoke_test_every_n_sessions = 3
+default_max_sessions = 100
+";
+        let partial: PartialTsumugiConfig =
+            toml::from_str(toml_str).unwrap_or_else(|e| panic!("{e}"));
+        let config = partial.into_final().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(config.harness.smoke_test_every_n_sessions, 3);
+        assert_eq!(config.harness.default_max_sessions, 100);
+    }
+
+    #[test]
+    fn harness_env_overrides_new_fields_apply() {
+        let mut config = PartialTsumugiConfig::default();
+        let env_fn = |key: &str| -> Option<String> {
+            match key {
+                "TMG_HARNESS_SMOKE_TEST_EVERY_N_SESSIONS" => Some("5".to_owned()),
+                "TMG_HARNESS_DEFAULT_MAX_SESSIONS" => Some("75".to_owned()),
+                "TMG_HARNESS_DEFAULT_SESSION_TIMEOUT" => Some("2h".to_owned()),
+                _ => None,
+            }
+        };
+        config
+            .apply_env_overrides(&env_fn)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let final_config = config.into_final().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(final_config.harness.smoke_test_every_n_sessions, 5);
+        assert_eq!(final_config.harness.default_max_sessions, 75);
+        assert_eq!(
+            final_config.harness.default_session_timeout,
+            std::time::Duration::from_secs(2 * 60 * 60),
+        );
+    }
+
+    #[test]
+    fn harness_env_override_invalid_session_timeout_returns_error() {
+        let mut config = PartialTsumugiConfig::default();
+        let env_fn = |key: &str| -> Option<String> {
+            if key == "TMG_HARNESS_DEFAULT_SESSION_TIMEOUT" {
+                Some("not-humantime".to_owned())
+            } else {
+                None
+            }
+        };
+        let result = config.apply_env_overrides(&env_fn);
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue { ref field, .. })
+                if field == "TMG_HARNESS_DEFAULT_SESSION_TIMEOUT"
+        ));
     }
 
     #[test]
@@ -1009,7 +1206,7 @@ bootstrap_max_tokens = 1024
 "#;
         let partial: PartialTsumugiConfig =
             toml::from_str(toml_str).unwrap_or_else(|e| panic!("{e}"));
-        let config = partial.into_final();
+        let config = partial.into_final().unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(config.harness.runs_dir, PathBuf::from("/tmp/tsumugi-runs"));
         assert!(!config.harness.auto_resume_on_start);
         assert_eq!(config.harness.bootstrap_max_tokens, 1024);
@@ -1028,7 +1225,7 @@ bootstrap_max_tokens = 1024
         // runs_dir stays None: should not override.
 
         base.merge_from(&overlay);
-        let final_config = base.into_final();
+        let final_config = base.into_final().unwrap_or_else(|e| panic!("{e}"));
 
         assert_eq!(
             final_config.harness.runs_dir,
@@ -1052,7 +1249,7 @@ bootstrap_max_tokens = 1024
         config
             .apply_env_overrides(&env_fn)
             .unwrap_or_else(|e| panic!("{e}"));
-        let final_config = config.into_final();
+        let final_config = config.into_final().unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(final_config.harness.runs_dir, PathBuf::from("/var/tsumugi"));
         assert!(!final_config.harness.auto_resume_on_start);
         assert_eq!(final_config.harness.bootstrap_max_tokens, 12345);

@@ -29,9 +29,9 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
-use crate::artifacts::{ProgressLog, SessionLog};
+use crate::artifacts::{FeatureList, InitScript, ProgressLog, SessionLog};
 use crate::error::HarnessError;
-use crate::run::{Run, RunSummary};
+use crate::run::{Run, RunScope, RunSummary};
 use crate::session::{Session, SessionEndTrigger, SessionHandle};
 use crate::store::RunStore;
 
@@ -51,6 +51,17 @@ pub struct RunRunner {
     store: Arc<RunStore>,
     progress: ProgressLog,
     session_log: SessionLog,
+    /// Handle to the harnessed-only `features.json`.
+    ///
+    /// Constructed eagerly from the store's path layout for both ad-hoc
+    /// and harnessed runs; the underlying file only exists for harnessed
+    /// runs whose initializer has populated it. Callers must check
+    /// [`scope`](Self::scope) before assuming the file exists.
+    features: FeatureList,
+    /// Handle to the harnessed-only `init.sh`.
+    ///
+    /// Same eager-construction contract as [`features`](Self::features).
+    init_script: InitScript,
     /// Active in-flight session, populated between
     /// [`begin_session`](RunRunner::begin_session) and
     /// [`end_session`](RunRunner::end_session).
@@ -71,11 +82,15 @@ impl RunRunner {
     pub fn new(run: Run, store: Arc<RunStore>) -> Self {
         let progress = ProgressLog::new(store.progress_file(&run.id));
         let session_log = SessionLog::new(store.session_log_dir(&run.id));
+        let features = FeatureList::new(store.features_file(&run.id));
+        let init_script = InitScript::new(store.init_script_file(&run.id));
         Self {
             run,
             store,
             progress,
             session_log,
+            features,
+            init_script,
             active_session: None,
             bootstrap_max_tokens: DEFAULT_BOOTSTRAP_MAX_TOKENS,
         }
@@ -134,6 +149,40 @@ impl RunRunner {
     #[must_use]
     pub fn session_log(&self) -> &SessionLog {
         &self.session_log
+    }
+
+    /// Borrow the run's [`FeatureList`] handle.
+    ///
+    /// The underlying file (`features.json`) only exists for harnessed
+    /// runs after the `initializer` subagent has created it. Use
+    /// [`scope`](Self::scope) to gate access at the call site.
+    #[must_use]
+    pub fn features(&self) -> &FeatureList {
+        &self.features
+    }
+
+    /// Borrow the run's [`InitScript`] handle.
+    ///
+    /// Like [`features`](Self::features), the underlying file
+    /// (`init.sh`) only exists for harnessed runs.
+    #[must_use]
+    pub fn init_script(&self) -> &InitScript {
+        &self.init_script
+    }
+
+    /// Borrow the run's [`RunScope`].
+    ///
+    /// Convenience method for tools that need to gate registration or
+    /// behaviour on whether the run is ad-hoc or harnessed.
+    #[must_use]
+    pub fn scope(&self) -> &RunScope {
+        &self.run.scope
+    }
+
+    /// Whether the active run is harnessed.
+    #[must_use]
+    pub fn is_harnessed(&self) -> bool {
+        matches!(self.run.scope, RunScope::Harnessed { .. })
     }
 
     /// Borrow the workspace path for this run.
