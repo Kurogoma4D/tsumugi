@@ -140,6 +140,15 @@ impl SessionLog {
     /// the live `session_NNN.json` files do not carry a hint (e.g. all
     /// recent sessions ended without explicitly setting one), the
     /// aggregate is parsed and its newest non-empty hint is returned.
+    ///
+    /// **Cost:** `O(N)` worst case in the number of live
+    /// `session_NNN.json` files: the implementation calls
+    /// [`Self::list`] once and then `load`s the individual session
+    /// files newest-first until a non-empty hint is found. When every
+    /// recent session lacks a hint, the entire live set is read off
+    /// disk and the compacted aggregate is parsed once on top.
+    /// Optimisation (e.g. caching the hint pointer in `run.toml` or
+    /// a small index file) is tracked as a follow-up.
     pub fn last_hint(&self) -> Result<Option<String>, HarnessError> {
         let mut entries = self.list()?;
         entries.sort_by_key(|e| std::cmp::Reverse(e.index));
@@ -325,6 +334,23 @@ pub struct SessionSummaryAggregate {
 
 /// One compacted session entry inside a
 /// [`SessionSummaryAggregate`].
+///
+/// **Field-loss notice:** [`Self::from_session`] preserves only the
+/// SPEC §9.11 minimum (identity + summary + hint). The following
+/// [`Session`] fields are intentionally **not** carried into the
+/// aggregate:
+///
+/// - [`Session::tool_calls_count`]
+/// - [`Session::files_modified`]
+/// - [`Session::features_marked_passing`]
+/// - [`Session::context_usage_peak`]
+///
+/// Once the live `session_NNN.json` is removed by
+/// [`SessionLog::compress_old_sessions`] these values are no longer
+/// recoverable. **TODO:** include in a future SPEC §9.11 enhancement
+/// when consumers (e.g. analytics dashboards or post-mortem tooling)
+/// need them. Until then, callers that require these fields must
+/// snapshot them before compaction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummaryEntry {
     /// Session sequence number within the parent run.

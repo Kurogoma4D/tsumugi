@@ -185,6 +185,29 @@ impl SessionState {
         self.file_edits.clear();
         self.last_user_message.clear();
     }
+
+    /// Reset the per-session signals across a session-rotation
+    /// boundary (SPEC §9.4) so the successor session starts with
+    /// clean state.
+    ///
+    /// Conceptually this clears every signal that was scoped to "the
+    /// previous session's turn observations": the size-keyword latch,
+    /// the workflow-loop counter, the per-file edit tally, and the
+    /// session-cumulative diff line count. The active run scope is
+    /// preserved (the rotation does not flip ad-hoc <-> harnessed),
+    /// and [`context_usage`](Self::context_usage) is reset so the
+    /// fresh session starts at `0.0` until the first new turn fires
+    /// `observe`.
+    pub fn reset_for_new_session(&mut self) {
+        self.last_user_input_size_signal = false;
+        self.context_usage = 0.0;
+        self.pending_subtasks = 0;
+        self.session_diff_lines = 0;
+        self.workflow_loop_count = 0;
+        self.same_file_edit_count = 0;
+        self.last_user_message.clear();
+        self.file_edits.clear();
+    }
 }
 
 #[cfg(test)]

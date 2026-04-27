@@ -150,7 +150,7 @@ struct PartialHarnessConfig {
     /// aggregates older entries. Must be `>= 1` after merging.
     pub session_log_compress_after: Option<usize>,
     /// Context-usage threshold above which
-    /// [`RunRunner::maybe_force_rotate`](tmg_harness::RunRunner::maybe_force_rotate)
+    /// [`RunRunner::should_force_rotate`](tmg_harness::RunRunner::should_force_rotate)
     /// reports `true` (SPEC §2.3). Must be in `(0.0, 1.0]`.
     pub context_force_rotate_threshold: Option<f64>,
     /// `[harness.escalator]` overrides for the scope-escalation
@@ -901,7 +901,7 @@ pub struct HarnessConfig {
     pub session_log_compress_after: usize,
 
     /// Context-usage threshold above which
-    /// [`RunRunner::maybe_force_rotate`](tmg_harness::RunRunner::maybe_force_rotate)
+    /// [`RunRunner::should_force_rotate`](tmg_harness::RunRunner::should_force_rotate)
     /// returns `true` and the harness rotates to a fresh session
     /// (SPEC §2.3). Must be in `(0.0, 1.0]`.
     pub context_force_rotate_threshold: f64,

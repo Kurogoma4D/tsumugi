@@ -158,7 +158,11 @@ pub enum SessionEndTrigger {
     /// SPEC §9.4 case 3: the per-session wall-clock budget configured
     /// via [`HarnessConfig::default_session_timeout`] elapsed without
     /// the session completing. Fired by the watchdog spawned in
-    /// [`RunRunner::begin_session`](crate::runner::RunRunner::begin_session).
+    /// [`RunRunner::arm_session_timeout_watchdog`](crate::runner::RunRunner::arm_session_timeout_watchdog),
+    /// which is invoked automatically from
+    /// [`RunRunner::begin_session`](crate::runner::RunRunner::begin_session)
+    /// when a `timeout_config` was registered via
+    /// [`RunRunner::set_session_timeout_config`](crate::runner::RunRunner::set_session_timeout_config).
     Timeout,
     /// SPEC §9.4 case 4: the user explicitly rolled to a new session
     /// (e.g. via the `/run new-session` command).

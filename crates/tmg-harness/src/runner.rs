@@ -100,7 +100,7 @@ pub type RunProgressReceiver = mpsc::Receiver<RunProgressEvent>;
 pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Default context-usage threshold above which
-/// [`RunRunner::maybe_force_rotate`] returns `true` and the harness
+/// [`RunRunner::should_force_rotate`] returns `true` and the harness
 /// rotates to a new session (SPEC §2.3).
 ///
 /// Mirrors the CLI's `[harness] context_force_rotate_threshold`
@@ -206,7 +206,7 @@ pub struct RunRunner {
     /// Defaults to [`DEFAULT_SESSION_TIMEOUT`].
     default_session_timeout: Duration,
 
-    /// Threshold above which [`Self::maybe_force_rotate`] reports a
+    /// Threshold above which [`Self::should_force_rotate`] reports a
     /// force-rotate is required.
     ///
     /// Reads from `[harness] context_force_rotate_threshold` in
@@ -233,6 +233,21 @@ pub struct RunRunner {
     /// watchdog is implemented with `tokio::time::sleep` so abort is
     /// the cleanest way to disarm it).
     timeout_watchdog: Option<tokio::task::JoinHandle<()>>,
+
+    /// Optional `(sender, duration)` registered by the CLI startup
+    /// path so the runner can re-arm the per-session timeout
+    /// watchdog automatically on every [`Self::begin_session`].
+    ///
+    /// When `Some`, [`Self::begin_session`] invokes
+    /// [`Self::arm_session_timeout_watchdog`] for harnessed runs
+    /// using a clone of the sender; the configured duration is
+    /// applied verbatim. The CLI registers this config exactly once
+    /// at startup (see [`Self::set_session_timeout_config`]); without
+    /// it, sessions rotated via [`Self::end_session_with_rotation`]
+    /// would inherit no watchdog after the first rotation because the
+    /// initial one-shot arm happened only against the original
+    /// session.
+    timeout_config: Option<(mpsc::Sender<SessionEndTrigger>, Duration)>,
 
     /// Aggregate state observed across the active session, fed by the
     /// harness's [`AgentLoop::set_turn_observer`](tmg_core::AgentLoop::set_turn_observer)
@@ -290,6 +305,7 @@ impl RunRunner {
             context_force_rotate_threshold: DEFAULT_CONTEXT_FORCE_ROTATE_THRESHOLD,
             session_log_compress_after: DEFAULT_SESSION_LOG_COMPRESS_AFTER,
             timeout_watchdog: None,
+            timeout_config: None,
             session_state,
             progress_tx: None,
             escalation_in_progress: AtomicBool::new(false),
@@ -343,7 +359,7 @@ impl RunRunner {
     }
 
     /// Set the context-usage threshold above which
-    /// [`Self::maybe_force_rotate`] reports `true`.
+    /// [`Self::should_force_rotate`] reports `true`.
     ///
     /// Values are clamped to `(0.0, 1.0]`; non-positive or non-finite
     /// inputs reset the threshold to
@@ -477,6 +493,28 @@ impl RunRunner {
         Ok(())
     }
 
+    /// Register the per-session timeout watchdog configuration so
+    /// every subsequent [`Self::begin_session`] (including the
+    /// implicit one inside [`Self::end_session_with_rotation`])
+    /// re-arms the watchdog automatically.
+    ///
+    /// Without this configuration the CLI startup path can only arm
+    /// the watchdog once for the first session; rotations via
+    /// [`Self::end_session_with_rotation`] would then leave the
+    /// successor session unprotected. Calling this setter once at
+    /// startup makes the harness re-arm on every session boundary.
+    ///
+    /// Re-arming happens only when [`Self::is_harnessed`] is `true`;
+    /// ad-hoc runs inherit no wall-clock deadline regardless of this
+    /// configuration. Pass `None` to clear a previously registered
+    /// configuration.
+    pub fn set_session_timeout_config(
+        &mut self,
+        config: Option<(mpsc::Sender<SessionEndTrigger>, Duration)>,
+    ) {
+        self.timeout_config = config;
+    }
+
     /// Begin a new session.
     ///
     /// - Increments `session_count` and stamps `last_session_at` on the run.
@@ -485,6 +523,11 @@ impl RunRunner {
     ///   `progress.md`.
     /// - Writes the initial `session_NNN.json` so external readers see a
     ///   consistent record (with `ended_at = None`) immediately.
+    /// - When [`Self::is_harnessed`] is `true` and a
+    ///   `timeout_config` was registered via
+    ///   [`Self::set_session_timeout_config`], the per-session
+    ///   timeout watchdog is automatically armed so rotated sessions
+    ///   inherit the same wall-clock budget as the first one.
     pub fn begin_session(&mut self) -> Result<SessionHandle, HarnessError> {
         let now = Utc::now();
         self.run.session_count = self.run.session_count.saturating_add(1);
@@ -505,6 +548,16 @@ impl RunRunner {
             index: session.index,
         };
         self.active_session = Some(session);
+
+        // Auto-arm the per-session timeout watchdog so rotated
+        // sessions inherit the same deadline as the original.
+        // Ad-hoc runs are skipped — they have no wall-clock budget.
+        if self.is_harnessed()
+            && let Some((tx, duration)) = self.timeout_config.clone()
+        {
+            self.arm_session_timeout_watchdog(duration, tx);
+        }
+
         Ok(handle)
     }
 
@@ -547,9 +600,13 @@ impl RunRunner {
         if let Some(mut session) = self.active_session.take() {
             session.end(trigger);
             self.session_log.save(&session)?;
+            // Cancel the timeout watchdog only when we actually
+            // closed the active session. On an early-return path
+            // (no active session, or `SessionMismatch` rejected
+            // above) we leave any watchdog armed so the underlying
+            // session retains its wall-clock budget.
+            self.disarm_timeout_watchdog();
         }
-        // Cancel the timeout watchdog if it was armed for this session.
-        self.disarm_timeout_watchdog();
         self.store.save(&self.run)?;
         Ok(())
     }
@@ -558,43 +615,57 @@ impl RunRunner {
     // Force-rotate and unified session-boundary handling (issue #38)
     // -----------------------------------------------------------------
 
-    /// Whether the latest observed `usage` exceeds the configured
-    /// [`Self::context_force_rotate_threshold`] and a force-rotate
-    /// should fire (SPEC §2.3).
+    /// Record the latest observed context usage on the active
+    /// session (SPEC §2.3 force-rotate observability).
     ///
     /// Stamps the active session's
     /// [`Session::context_usage_peak`](crate::session::Session::context_usage_peak)
     /// with `usage` whenever the new value is higher than the
-    /// previously-recorded peak so the saved `session_NNN.json` carries
-    /// the highest observed usage even when no rotation fires.
+    /// previously-recorded peak so the saved `session_NNN.json`
+    /// carries the highest observed usage even when no rotation
+    /// fires.
     ///
     /// `usage` is interpreted as a fraction `[0.0, 1.0]`. Non-finite
-    /// values are treated as `0.0` (no rotation).
+    /// or negative values are treated as `0.0`.
     ///
-    /// # Errors
-    ///
-    /// This method is currently infallible (the signature returns
-    /// `Result` so a future revision can fail the rotation gate
-    /// without changing call sites). Callers should treat any error
-    /// as "rotation suppressed for this turn".
-    pub fn maybe_force_rotate(&mut self, usage: f32) -> Result<bool, HarnessError> {
+    /// This method has **no side effect on rotation**; pair it with
+    /// [`Self::should_force_rotate`] to drive the actual rotation
+    /// decision.
+    pub fn record_context_usage(&mut self, usage: f32) {
         let normalized = if usage.is_finite() && usage >= 0.0 {
             usage
         } else {
             0.0
         };
 
-        // Track peak usage on the active session so the saved record
-        // always carries the highest observed value, regardless of
-        // whether the rotation actually fires.
         if let Some(session) = self.active_session.as_mut() {
             let peak = f64::from(normalized);
             if peak > session.context_usage_peak {
                 session.context_usage_peak = peak;
             }
         }
+    }
 
-        Ok(normalized > self.context_force_rotate_threshold)
+    /// Whether the supplied `usage` exceeds the configured
+    /// [`Self::context_force_rotate_threshold`] and a force-rotate
+    /// should fire (SPEC §2.3).
+    ///
+    /// Pure check: this method does **not** mutate any state. Callers
+    /// that also want to record the observed usage on the active
+    /// session should call [`Self::record_context_usage`] alongside
+    /// it.
+    ///
+    /// `usage` is interpreted as a fraction `[0.0, 1.0]`. Non-finite
+    /// or negative values are treated as `0.0` and never fire
+    /// rotation.
+    #[must_use]
+    pub fn should_force_rotate(&self, usage: f32) -> bool {
+        let normalized = if usage.is_finite() && usage >= 0.0 {
+            usage
+        } else {
+            0.0
+        };
+        normalized > self.context_force_rotate_threshold
     }
 
     /// End the active session with `trigger`, persist it, and (for
@@ -631,27 +702,47 @@ impl RunRunner {
         &mut self,
         trigger: SessionEndTrigger,
     ) -> Result<bool, HarnessError> {
+        // Refuse to rotate without an active session: emitting a
+        // `SessionEnded` event and starting a fresh session would
+        // create a `session_count` hole (no `session_NNN.json` for
+        // the just-incremented index would have a predecessor on
+        // disk). The caller should
+        // [`begin_session`](Self::begin_session) first.
+        if self.active_session.is_none() {
+            return Err(HarnessError::NoActiveSession);
+        }
+
         // Disarm any active watchdog so a late `Timeout` event cannot
         // race the rotation we are about to perform.
         self.disarm_timeout_watchdog();
 
-        // Step 1+2: finalize the active session with the trigger. Use
-        // `Session::end` directly so a missing-active-session case
-        // still calls `store.save` (the legacy `end_session` path
-        // returned early without persisting).
-        let trigger_for_event = trigger.clone();
-        if let Some(mut session) = self.active_session.take() {
+        // Bind a cheap copy of the variant tag for the
+        // `UserExit`-vs-rotate decision so we can move `trigger`
+        // itself into the persisted session without a redundant
+        // intermediate `clone()`.
+        let is_user_exit = matches!(trigger, SessionEndTrigger::UserExit);
+
+        // Step 1+2: finalize the active session with the trigger.
+        // We just verified `active_session.is_some()` so the take
+        // here is guaranteed to succeed.
+        let saved_trigger = if let Some(mut session) = self.active_session.take() {
             // Capture the current `next_session_hint` already set by
             // tools (`session_summary_save`); leave None as-is for now.
             // The LLM-generated summary path is a TODO until the
             // compaction-turn machinery is plumbed through.
             session.end(trigger);
             self.session_log.save(&session)?;
+            // The `Session::end_trigger` is now `Some(trigger)`; clone
+            // it back out for the published event.
+            session
+                .end_trigger
+                .clone()
+                .unwrap_or(SessionEndTrigger::Completed)
         } else {
-            tracing::warn!(
-                "end_session_with_rotation called without an active session; recording trigger only",
-            );
-        }
+            // Unreachable due to the guard above; keep a defensive
+            // path so a future refactor cannot silently regress.
+            return Err(HarnessError::NoActiveSession);
+        };
 
         // Step 3: compact the log if it has grown past the cap.
         if let Err(e) = self
@@ -666,13 +757,20 @@ impl RunRunner {
         // Step 5 (publish event before begin_session so a UI consumer
         // sees "old session ended" before "new session began").
         self.publish_progress(RunProgressEvent::SessionEnded {
-            trigger: trigger_for_event.clone(),
+            trigger: saved_trigger,
         });
 
         // Step 4: begin a new session unless the trigger ends the run.
-        if matches!(trigger_for_event, SessionEndTrigger::UserExit) {
+        if is_user_exit {
             return Ok(false);
         }
+
+        // Reset per-session signals so the successor session starts
+        // with clean state (size-keyword latch, workflow-loop
+        // counter, per-file edit tally, ...). Done before
+        // `begin_session` so observers that fire on the very first
+        // turn of the new session see the cleared state.
+        self.session_state.reset_for_new_session();
 
         let _handle = self.begin_session()?;
         Ok(true)
@@ -695,6 +793,13 @@ impl RunRunner {
         timeout: Duration,
         tx: mpsc::Sender<SessionEndTrigger>,
     ) {
+        if self.active_session.is_none() {
+            tracing::warn!(
+                "arming session timeout watchdog without an active session; \
+                 the watchdog will fire against whatever session is active when \
+                 the deadline elapses",
+            );
+        }
         if self.timeout_watchdog.is_some() {
             tracing::warn!(
                 "arm_session_timeout_watchdog called while a watchdog is active; \
@@ -704,6 +809,15 @@ impl RunRunner {
         }
         let handle = tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
+            // Log *before* `try_send` so the firing is observable
+            // independently of whether a consumer is listening on the
+            // other end of the channel. Operators see the deadline
+            // elapsed even if a downstream pipeline (e.g. the live
+            // rotation hand-off in #46) has not been wired yet.
+            tracing::info!(
+                ?timeout,
+                "session timeout watchdog firing SessionEndTrigger::Timeout",
+            );
             // Use `try_send` so a closed receiver does not stall the
             // task; the watchdog is best-effort.
             if let Err(err) = tx.try_send(SessionEndTrigger::Timeout) {
@@ -976,6 +1090,24 @@ impl RunRunner {
     #[must_use]
     pub fn run_id(&self) -> &crate::run::RunId {
         &self.run.id
+    }
+}
+
+impl Drop for RunRunner {
+    /// Abort any live timeout watchdog so the spawned tokio task does
+    /// not outlive the runner.
+    ///
+    /// Without this impl an early-return / panic path that drops the
+    /// runner before [`Self::end_session`] /
+    /// [`Self::end_session_with_rotation`] would leak the watchdog
+    /// task: it would keep sleeping until its deadline fires, then
+    /// `try_send` against a now-orphaned channel. The impl is
+    /// idempotent — [`Self::disarm_timeout_watchdog`] is a no-op when
+    /// no watchdog is armed.
+    fn drop(&mut self) {
+        if let Some(handle) = self.timeout_watchdog.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -1428,14 +1560,13 @@ mod tests {
 
     /// Acceptance: a 95.5% usage report fires force-rotate.
     #[test]
-    fn maybe_force_rotate_fires_above_threshold() {
+    fn should_force_rotate_fires_above_threshold() {
         let (_tmp, mut runner) = make_runner();
         let _ = runner.begin_session().unwrap_or_else(|e| panic!("{e}"));
         // Default threshold is 0.95.
+        runner.record_context_usage(0.955);
         assert!(
-            runner
-                .maybe_force_rotate(0.955)
-                .unwrap_or_else(|e| panic!("{e}")),
+            runner.should_force_rotate(0.955),
             "0.955 must exceed the 0.95 default threshold",
         );
         // The session record must carry the latest peak.
@@ -1446,50 +1577,35 @@ mod tests {
     }
 
     #[test]
-    fn maybe_force_rotate_below_threshold_returns_false() {
+    fn should_force_rotate_below_threshold_returns_false() {
         let (_tmp, mut runner) = make_runner();
         let _ = runner.begin_session().unwrap_or_else(|e| panic!("{e}"));
-        assert!(
-            !runner
-                .maybe_force_rotate(0.5)
-                .unwrap_or_else(|e| panic!("{e}")),
-        );
+        runner.record_context_usage(0.5);
+        assert!(!runner.should_force_rotate(0.5));
     }
 
-    /// Custom threshold honoured by `maybe_force_rotate`.
+    /// Custom threshold honoured by `should_force_rotate`.
     #[test]
-    fn maybe_force_rotate_custom_threshold() {
+    fn should_force_rotate_custom_threshold() {
         let (_tmp, mut runner) = make_runner();
         runner.set_context_force_rotate_threshold(0.5);
         let _ = runner.begin_session().unwrap_or_else(|e| panic!("{e}"));
-        assert!(
-            runner
-                .maybe_force_rotate(0.51)
-                .unwrap_or_else(|e| panic!("{e}")),
-        );
-        assert!(
-            !runner
-                .maybe_force_rotate(0.49)
-                .unwrap_or_else(|e| panic!("{e}")),
-        );
+        assert!(runner.should_force_rotate(0.51));
+        assert!(!runner.should_force_rotate(0.49));
     }
 
     /// Non-finite usage values do not cause a panic and never fire
     /// rotation.
     #[test]
-    fn maybe_force_rotate_handles_non_finite() {
+    fn should_force_rotate_handles_non_finite() {
         let (_tmp, mut runner) = make_runner();
         let _ = runner.begin_session().unwrap_or_else(|e| panic!("{e}"));
-        assert!(
-            !runner
-                .maybe_force_rotate(f32::NAN)
-                .unwrap_or_else(|e| panic!("{e}")),
-        );
-        assert!(
-            !runner
-                .maybe_force_rotate(-1.0)
-                .unwrap_or_else(|e| panic!("{e}")),
-        );
+        // Both `record_context_usage` and `should_force_rotate`
+        // tolerate non-finite / negative inputs without panicking.
+        runner.record_context_usage(f32::NAN);
+        runner.record_context_usage(-1.0);
+        assert!(!runner.should_force_rotate(f32::NAN));
+        assert!(!runner.should_force_rotate(-1.0));
     }
 
     /// `set_context_force_rotate_threshold` rejects garbage by
@@ -1684,5 +1800,134 @@ mod tests {
         let (_tmp, mut runner) = make_runner();
         runner.set_session_log_compress_after(0);
         assert_eq!(runner.session_log_compress_after(), 1);
+    }
+
+    /// Build a runner promoted to a harnessed scope so the watchdog
+    /// auto-arm path is exercised without going through the full
+    /// escalation flow.
+    fn make_harnessed_runner() -> (tempfile::TempDir, RunRunner) {
+        let (tmp, mut runner) = make_runner();
+        let store = Arc::clone(&runner.store);
+        let upgraded = store
+            .upgrade_to_harnessed(&runner.run().id, runner.run().session_count, "test setup")
+            .unwrap_or_else(|e| panic!("{e}"));
+        runner.run = upgraded;
+        runner.session_state.set_scope(runner.run.scope.clone());
+        (tmp, runner)
+    }
+
+    /// `end_session_with_rotation` re-arms the timeout watchdog on
+    /// the successor session (Fix 1): registering a
+    /// `timeout_config` once at startup is enough — every rotated
+    /// session inherits the same wall-clock budget.
+    #[tokio::test]
+    async fn rotation_re_arms_timeout_watchdog_for_new_session() {
+        let (_tmp, mut runner) = make_harnessed_runner();
+        let (tx, mut rx) = mpsc::channel::<SessionEndTrigger>(4);
+        // Configure a tiny duration so the re-armed watchdog fires
+        // promptly on the successor session.
+        runner.set_session_timeout_config(Some((tx, Duration::from_millis(150))));
+
+        // Begin the first session — auto-arm fires here.
+        let _ = runner.begin_session().unwrap_or_else(|e| panic!("{e}"));
+        // Immediately rotate, which must (a) disarm the first
+        // watchdog and (b) re-arm the watchdog for the new session.
+        let started_new = runner
+            .end_session_with_rotation(SessionEndTrigger::ContextRotation)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(started_new);
+        assert_eq!(runner.run().session_count, 2);
+
+        // The re-armed watchdog on the successor session must fire
+        // its Timeout trigger within the test budget.
+        let received = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("watchdog did not fire on successor session"))
+            .unwrap_or_else(|| panic!("channel closed before delivering Timeout"));
+        assert_eq!(received, SessionEndTrigger::Timeout);
+    }
+
+    /// Without a registered `timeout_config`, rotation does not arm
+    /// any watchdog (callers opt in explicitly).
+    #[tokio::test]
+    async fn rotation_without_timeout_config_does_not_arm_watchdog() {
+        let (_tmp, mut runner) = make_harnessed_runner();
+        let _ = runner.begin_session().unwrap_or_else(|e| panic!("{e}"));
+        // No `set_session_timeout_config` call — the runner must not
+        // auto-arm.
+        runner
+            .end_session_with_rotation(SessionEndTrigger::ContextRotation)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(runner.timeout_watchdog.is_none());
+    }
+
+    /// `end_session_with_rotation` with no active session returns
+    /// `NoActiveSession` and leaves the runner untouched (Fix 4).
+    #[tokio::test]
+    async fn rotation_without_active_session_returns_no_active_session() {
+        let (_tmp, mut runner) = make_runner();
+        let mut rx = runner.progress_channel();
+        // No `begin_session` call — the runner has no active session.
+        assert_eq!(runner.run().session_count, 0);
+
+        let err = runner
+            .end_session_with_rotation(SessionEndTrigger::ContextRotation)
+            .err()
+            .unwrap_or_else(|| panic!("expected NoActiveSession error"));
+        assert!(
+            matches!(err, HarnessError::NoActiveSession),
+            "expected NoActiveSession, got {err:?}",
+        );
+        // No state mutation: no SessionEnded event, no session count
+        // increment, no on-disk session log entry.
+        assert_eq!(runner.run().session_count, 0);
+        let listed = runner
+            .session_log()
+            .list()
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(listed.is_empty(), "no session_NNN.json must be persisted");
+        let result = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "no SessionEnded event must be published on the bail path; got {result:?}",
+        );
+    }
+
+    /// `SessionState::reset_for_new_session` clears every session-
+    /// scoped signal across the rotation boundary (Fix 5).
+    #[tokio::test]
+    async fn rotation_resets_session_state_signals() {
+        let (_tmp, mut runner) = make_runner();
+        let _ = runner.begin_session().unwrap_or_else(|e| panic!("{e}"));
+
+        // Seed every session-scoped signal so rotation has something
+        // to clear.
+        let summary = TurnSummary {
+            tokens_used: 4096,
+            tool_calls: 5,
+            files_modified: vec!["src/foo.rs".to_owned(), "src/foo.rs".to_owned()],
+            diff_lines: 200,
+            user_message: "アプリ全体 を フルスクラッチ で書き直したい".to_owned(),
+        };
+        runner.after_turn(&summary, 8192);
+        runner.after_turn(&summary, 8192);
+        // Sanity: every signal we expect to clear is currently non-default.
+        let pre = runner.session_state();
+        assert!(pre.last_user_input_size_signal);
+        assert!(pre.pending_subtasks > 0);
+        assert!(pre.session_diff_lines > 0);
+        assert!(pre.workflow_loop_count > 0);
+        assert!(pre.same_file_edit_count > 0);
+
+        runner
+            .end_session_with_rotation(SessionEndTrigger::UserNewSession)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let post = runner.session_state();
+        assert!(!post.last_user_input_size_signal);
+        assert_eq!(post.pending_subtasks, 0);
+        assert_eq!(post.session_diff_lines, 0);
+        assert_eq!(post.workflow_loop_count, 0);
+        assert_eq!(post.same_file_edit_count, 0);
     }
 }
