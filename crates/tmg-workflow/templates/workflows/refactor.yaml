@@ -1,0 +1,58 @@
+id: refactor
+description: "Implement a refactor and review it (implement + review combined)"
+mode: normal
+
+inputs:
+  target:
+    type: string
+    required: true
+    description: "What to refactor (path, module, or description)"
+  budget:
+    type: integer
+    default: 50
+
+steps:
+  - id: plan
+    type: agent
+    subagent: plan
+    prompt: |
+      Plan the refactor of: ${{ inputs.target }}.
+      List the files to touch and the order to do them in.
+
+  - id: implement
+    type: agent
+    subagent: worker
+    prompt: |
+      Carry out this refactor plan, preserving behaviour.
+
+      ${{ steps.plan.output }}
+
+  - id: verify
+    type: shell
+    command: "cargo test --workspace"
+    timeout: "10m"
+
+  - id: fix_errors
+    type: agent
+    subagent: worker
+    prompt: |
+      The verification step produced this output. If exit_code is
+      non-zero, fix the failures; otherwise reply "OK" and make no
+      changes.
+
+      stdout:
+      ${{ steps.verify.stdout }}
+      stderr:
+      ${{ steps.verify.stderr }}
+
+  - id: review_loop
+    type: loop
+    max_iterations: 3
+    until: "steps.verify.exit_code == 0"
+    steps:
+      - ref: verify
+      - ref: fix_errors
+
+outputs:
+  passed: "${{ steps.verify.exit_code }}"
+  plan_summary: "${{ steps.plan.output }}"

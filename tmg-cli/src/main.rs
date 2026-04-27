@@ -13,7 +13,9 @@ use tokio::sync::Mutex;
 mod config;
 mod error;
 mod harness_init;
+mod init_command;
 mod run_commands;
+mod workflow_commands;
 
 use config::{HarnessConfig, SandboxConfigSection, TsumugiConfig};
 
@@ -78,8 +80,7 @@ struct Cli {
     command: Option<Command>,
 }
 
-/// Top-level subcommand surface. Workflow / Init are scoped to #44 /
-/// #46 and intentionally omitted here.
+/// Top-level subcommand surface.
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Run management (`tmg run <op>`). See SPEC §9.8.
@@ -88,6 +89,52 @@ enum Command {
         #[command(subcommand)]
         op: RunCommand,
     },
+    /// Workflow management (`tmg workflow <op>`). See SPEC §8.13.
+    Workflow {
+        /// Sub-operation on the workflow catalogue or runtime.
+        #[command(subcommand)]
+        op: WorkflowCommand,
+    },
+    /// Scaffold a `.tsumugi/` directory from the built-in templates.
+    Init(InitArgs),
+}
+
+/// Operations under `tmg workflow`. SPEC §8.13.
+#[derive(Subcommand, Debug)]
+enum WorkflowCommand {
+    /// List discovered workflows in a fixed-width table.
+    List,
+    /// Parse every discovered workflow and report failures.
+    ///
+    /// Exits non-zero when at least one workflow fails to parse.
+    Validate,
+    /// Run the named workflow with `--input k=v` pairs.
+    Run {
+        /// Workflow id (matches the `id:` field in the YAML).
+        workflow: String,
+        /// Repeatable `--input k=v` pair. The value is parsed as JSON
+        /// when it looks like JSON, falling back to a plain string.
+        #[arg(long = "input")]
+        inputs: Vec<String>,
+    },
+}
+
+/// Flags for `tmg init`.
+#[derive(clap::Args, Debug)]
+struct InitArgs {
+    /// Workflow templates to install (comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    workflows: Vec<String>,
+    /// Long-running harness templates to install (comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    harness: Vec<String>,
+    /// Install every built-in template.
+    #[arg(long)]
+    all: bool,
+    /// Overwrite existing files when conflicts are detected. Without
+    /// this flag, `tmg init` aborts and prints the conflict list.
+    #[arg(long)]
+    force: bool,
 }
 
 /// Operations under `tmg run`. SPEC §9.8.
@@ -190,6 +237,10 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::Run { op }) => dispatch_run_command(op, &config),
+        Some(Command::Workflow { op }) => dispatch_workflow_command(op, &config),
+        Some(Command::Init(args)) => {
+            init_command::cmd_init(&args.workflows, &args.harness, args.all, args.force)
+        }
         None => {
             if let Some(prompt) = cli.prompt {
                 run_prompt(
@@ -227,6 +278,19 @@ fn resolve_runs_dir(harness_config: &HarnessConfig) -> anyhow::Result<(PathBuf, 
         canonical_cwd.join(&harness_config.runs_dir)
     };
     Ok((runs_dir, canonical_cwd))
+}
+
+/// Dispatch one `tmg workflow <op>` invocation. None of these
+/// operations attach to an active TUI; they all read or run workflows
+/// against the configured discovery scope.
+fn dispatch_workflow_command(op: WorkflowCommand, config: &TsumugiConfig) -> anyhow::Result<()> {
+    match op {
+        WorkflowCommand::List => workflow_commands::cmd_list(config),
+        WorkflowCommand::Validate => workflow_commands::cmd_validate(config),
+        WorkflowCommand::Run { workflow, inputs } => {
+            workflow_commands::cmd_run(&workflow, &inputs, config)
+        }
+    }
 }
 
 /// Dispatch one `tmg run <op>` invocation. The TUI-bound operations

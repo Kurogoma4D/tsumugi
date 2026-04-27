@@ -1,0 +1,61 @@
+id: build_app
+description: "Build a new application from scratch (SPEC §8.12 / §9.12)"
+mode: long_running
+
+inputs:
+  app_description:
+    type: string
+    required: true
+    description: "What the application should do"
+
+init:
+  artifacts:
+    progress_file: ".tsumugi/runs/RUNID/progress.md"
+    features_file: ".tsumugi/runs/RUNID/features.json"
+  steps:
+    - id: bootstrap_init
+      type: agent
+      subagent: initializer
+      prompt: |
+        Read the workspace and produce features.json, init.sh, and an
+        initial progress.md for the following application.
+
+        Application: ${{ inputs.app_description }}
+
+iterate:
+  bootstrap:
+    - run: "git status --porcelain"
+    - read: "${{ artifacts.progress_file }}"
+    - smoke_test:
+        id: smoke
+        type: shell
+        command: "cargo check --workspace"
+  steps:
+    - id: implement
+      type: agent
+      subagent: worker
+      prompt: |
+        Pick the next failing feature from features.json and implement
+        it. Update progress.md when done.
+
+        Bootstrap context:
+        ${{ inputs.bootstrap_context }}
+
+    - id: verify
+      type: shell
+      command: "cargo test --workspace"
+      timeout: "15m"
+
+    - id: qa
+      type: agent
+      subagent: qa
+      prompt: |
+        Inspect features.json and mark each newly-passing feature via
+        feature_list_mark_passing. Reply with a one-line summary.
+
+        Test output:
+        ${{ steps.verify.stdout }}
+
+  until: "artifact.features.all_passing"
+  max_sessions: 20
+  session_timeout: "30m"

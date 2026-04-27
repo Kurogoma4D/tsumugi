@@ -1,0 +1,63 @@
+id: add_feature
+description: "Add a feature to an existing project iteratively"
+mode: long_running
+
+inputs:
+  feature_description:
+    type: string
+    required: true
+    description: "What feature to add"
+
+init:
+  artifacts:
+    progress_file: ".tsumugi/runs/RUNID/progress.md"
+    features_file: ".tsumugi/runs/RUNID/features.json"
+  steps:
+    - id: scaffold
+      type: agent
+      subagent: initializer
+      prompt: |
+        Decompose the requested feature into smaller features and
+        produce features.json.  Re-use the project's existing build /
+        test commands for init.sh.
+
+        Feature: ${{ inputs.feature_description }}
+
+iterate:
+  bootstrap:
+    - run: "git status --porcelain"
+    - read: "${{ artifacts.progress_file }}"
+    - smoke_test:
+        id: smoke
+        type: shell
+        command: "cargo check --workspace"
+  steps:
+    - id: implement
+      type: agent
+      subagent: worker
+      prompt: |
+        Implement the next failing sub-feature.
+
+        Feature: ${{ inputs.feature_description }}
+
+        Bootstrap context:
+        ${{ inputs.bootstrap_context }}
+
+    - id: verify
+      type: shell
+      command: "cargo test --workspace"
+      timeout: "15m"
+
+    - id: qa
+      type: agent
+      subagent: qa
+      prompt: |
+        Mark passing sub-features in features.json.  Reply with a
+        brief summary of progress so far.
+
+        Verify stdout:
+        ${{ steps.verify.stdout }}
+
+  until: "artifact.features.all_passing"
+  max_sessions: 15
+  session_timeout: "30m"

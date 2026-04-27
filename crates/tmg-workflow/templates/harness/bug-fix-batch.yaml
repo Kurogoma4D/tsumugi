@@ -1,0 +1,58 @@
+id: bug_fix_batch
+description: "Fix a batch of bugs, one per feature in features.json"
+mode: long_running
+
+inputs:
+  bug_list_description:
+    type: string
+    required: true
+    description: "Free-form description or path to the bug list"
+
+init:
+  artifacts:
+    progress_file: ".tsumugi/runs/RUNID/progress.md"
+    features_file: ".tsumugi/runs/RUNID/features.json"
+  steps:
+    - id: triage
+      type: agent
+      subagent: initializer
+      prompt: |
+        Read the supplied bug list and convert each bug into a feature
+        in features.json.  Acceptance criteria per feature: the bug's
+        regression test passes.
+
+        Bug list: ${{ inputs.bug_list_description }}
+
+iterate:
+  bootstrap:
+    - run: "git status --porcelain"
+    - read: "${{ artifacts.progress_file }}"
+  steps:
+    - id: fix
+      type: agent
+      subagent: worker
+      prompt: |
+        Pick the next failing bug-feature and fix it.  Add a
+        regression test if one is missing.
+
+        Bootstrap context:
+        ${{ inputs.bootstrap_context }}
+
+    - id: verify
+      type: shell
+      command: "cargo test --workspace"
+      timeout: "15m"
+
+    - id: qa
+      type: agent
+      subagent: qa
+      prompt: |
+        Mark fixed bug-features as passing.  Reply with a brief
+        summary.
+
+        Verify stdout:
+        ${{ steps.verify.stdout }}
+
+  until: "artifact.features.all_passing"
+  max_sessions: 30
+  session_timeout: "30m"

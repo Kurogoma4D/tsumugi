@@ -1,0 +1,36 @@
+id: implement
+description: "Implement a feature with agent + verify (SPEC §8.3)"
+mode: normal
+
+inputs:
+  feature_id:
+    type: string
+    required: true
+    description: "Target feature id"
+  budget:
+    type: integer
+    default: 50
+    description: "Soft cap on tool calls"
+
+steps:
+  - id: plan
+    type: agent
+    subagent: plan
+    prompt: "Plan the implementation of feature ${{ inputs.feature_id }}."
+
+  - id: implement
+    type: agent
+    subagent: worker
+    prompt: |
+      Implement based on this plan:
+
+      ${{ steps.plan.output }}
+
+  - id: verify
+    type: shell
+    command: "cargo test --workspace"
+    timeout: "10m"
+
+outputs:
+  plan_summary: "${{ steps.plan.output }}"
+  test_exit:   "${{ steps.verify.exit_code }}"
