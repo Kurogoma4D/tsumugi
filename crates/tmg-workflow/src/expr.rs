@@ -58,7 +58,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::def::StepResult;
+use crate::def::{StepResult, WorkflowOutputs};
 use crate::error::{Result, WorkflowError};
 
 /// Compute a 1-based `(line, col)` for a byte offset into `src`.
@@ -84,7 +84,14 @@ fn line_col(src: &str, pos: usize) -> (usize, usize) {
     (line, col)
 }
 
-/// The four scopes available to expressions.
+/// The four+ scopes available to expressions.
+///
+/// `stages` is an optional fifth scope used by declarative-pipeline
+/// (`stages:`) workflows added in issue #41. It carries the per-stage
+/// [`WorkflowOutputs`] map keyed by stage id; pipelines can reference
+/// `${{ stages.<id>.outputs.<key> }}` between stages. Plain workflows
+/// (no `stages:`) leave it as `None`, which matches the historical
+/// scope set (`inputs`, `steps`, `config`, `env`) exactly.
 pub struct ExprContext<'a> {
     /// Workflow inputs as a JSON object.
     pub inputs: &'a Value,
@@ -94,10 +101,19 @@ pub struct ExprContext<'a> {
     pub config: &'a Value,
     /// Environment variables.
     pub env: &'a BTreeMap<String, String>,
+    /// Outputs of completed pipeline stages (only populated when the
+    /// outer workflow has `stages:` and is dispatching a `workflow`
+    /// step). `None` outside that context.
+    pub stages: Option<&'a BTreeMap<String, WorkflowOutputs>>,
 }
 
 impl<'a> ExprContext<'a> {
     /// Construct a new context.
+    ///
+    /// The `stages` scope is left empty (`None`) — equivalent to the
+    /// historical four-scope context used by single-workflow runs. Use
+    /// [`Self::with_stages`] to attach a stages map for pipeline
+    /// dispatch.
     #[must_use]
     pub fn new(
         inputs: &'a Value,
@@ -110,7 +126,17 @@ impl<'a> ExprContext<'a> {
             steps,
             config,
             env,
+            stages: None,
         }
+    }
+
+    /// Attach a `stages` map to this context. Used by the pipeline
+    /// dispatcher (issue #41) so workflow-step `inputs:` templates can
+    /// reference `${{ stages.<id>.outputs.<key> }}`.
+    #[must_use]
+    pub fn with_stages(mut self, stages: &'a BTreeMap<String, WorkflowOutputs>) -> Self {
+        self.stages = Some(stages);
+        self
     }
 }
 
@@ -687,9 +713,14 @@ fn resolve_path(segs: &[PathSeg], ctx: &ExprContext) -> Result<Value> {
             // we need. The next segment must be the step id.
             return resolve_steps_path(&segs[1..], ctx);
         }
+        "stages" => {
+            // Same lazy-materialization pattern as `steps`. Only valid
+            // when the engine attached a stages map (pipeline dispatch).
+            return resolve_stages_path(&segs[1..], ctx);
+        }
         other => {
             return Err(WorkflowError::expression(format!(
-                "unknown top-level identifier '{other}' (allowed: inputs, steps, config, env)"
+                "unknown top-level identifier '{other}' (allowed: inputs, steps, stages, config, env)"
             )));
         }
     };
@@ -736,6 +767,49 @@ fn resolve_steps_path(rest: &[PathSeg], ctx: &ExprContext) -> Result<Value> {
     let snapshot = Value::Object(obj);
 
     walk_path(&snapshot, &rest[1..], &format!("steps.{step_id}"))
+}
+
+/// Resolve a `stages.<id>.outputs.<key>`-style path against the
+/// optional [`ExprContext::stages`] map.
+///
+/// Each [`WorkflowOutputs`] is materialised on demand into the JSON
+/// shape `{ "outputs": { "<name>": "<rendered>", ... } }` — a thin
+/// wrapper that mirrors the user-facing `stages.<id>.outputs.<key>`
+/// path naming. We do *not* surface engine-internal fields (like raw
+/// step results) on the stages scope; the contract is "outputs only".
+fn resolve_stages_path(rest: &[PathSeg], ctx: &ExprContext) -> Result<Value> {
+    let Some(stages) = ctx.stages else {
+        return Err(WorkflowError::expression(
+            "'stages' is only available inside a pipeline (declarative `stages:` workflow); plain workflows have no stages scope",
+        ));
+    };
+
+    let Some(first) = rest.first() else {
+        // Bare `stages` reference — return empty object snapshot.
+        return Ok(Value::Object(serde_json::Map::new()));
+    };
+    let stage_id = match first {
+        PathSeg::Ident(s) | PathSeg::Index(s) => s,
+    };
+
+    let Some(outputs) = stages.get(stage_id) else {
+        return Err(WorkflowError::expression(format!(
+            "unknown stage '{stage_id}' in 'stages' (no such stage has run yet)"
+        )));
+    };
+
+    // Materialise the WorkflowOutputs into a JSON object whose only
+    // key is `outputs` — matching the pipeline grammar
+    // `stages.<id>.outputs.<key>`.
+    let mut outputs_obj = serde_json::Map::new();
+    for (k, v) in &outputs.values {
+        outputs_obj.insert(k.clone(), Value::String(v.clone()));
+    }
+    let mut stage_obj = serde_json::Map::new();
+    stage_obj.insert("outputs".to_owned(), Value::Object(outputs_obj));
+    let snapshot = Value::Object(stage_obj);
+
+    walk_path(&snapshot, &rest[1..], &format!("stages.{stage_id}"))
 }
 
 fn walk_path(start: &Value, segs: &[PathSeg], base_label: &str) -> Result<Value> {
@@ -806,6 +880,50 @@ mod tests {
         env: &'a BTreeMap<String, String>,
     ) -> ExprContext<'a> {
         ExprContext::new(inputs, steps, config, env)
+    }
+
+    /// A `stages` map referenced via `${{ stages.<id>.outputs.<key> }}`
+    /// must surface the raw output strings.
+    #[test]
+    fn stages_outputs_resolution() {
+        let inputs = Value::Null;
+        let s = BTreeMap::new();
+        let c = Value::Null;
+        let e = BTreeMap::new();
+        let mut stages: BTreeMap<String, WorkflowOutputs> = BTreeMap::new();
+        let mut values = BTreeMap::new();
+        values.insert("plan".to_owned(), "draft v1".to_owned());
+        stages.insert("plan_stage".to_owned(), WorkflowOutputs { values });
+        let ctx = ExprContext::new(&inputs, &s, &c, &e).with_stages(&stages);
+        assert_eq!(
+            eval_value("stages.plan_stage.outputs.plan", &ctx).unwrap(),
+            json!("draft v1")
+        );
+    }
+
+    /// Referencing `stages.*` outside a pipeline context (no map
+    /// attached) raises a clear error.
+    #[test]
+    fn stages_without_pipeline_errors() {
+        let (i, s, c, e) = ctx_with_inputs(Value::Null);
+        let ctx = make_ctx(&i, &s, &c, &e);
+        let err = eval_value("stages.foo.outputs.x", &ctx).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("pipeline"), "{msg}");
+    }
+
+    /// Referencing an undefined stage name surfaces a clear error.
+    #[test]
+    fn stages_unknown_stage_errors() {
+        let inputs = Value::Null;
+        let s = BTreeMap::new();
+        let c = Value::Null;
+        let e = BTreeMap::new();
+        let stages: BTreeMap<String, WorkflowOutputs> = BTreeMap::new();
+        let ctx = ExprContext::new(&inputs, &s, &c, &e).with_stages(&stages);
+        let err = eval_value("stages.missing.outputs.x", &ctx).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown stage 'missing'"), "{msg}");
     }
 
     #[test]

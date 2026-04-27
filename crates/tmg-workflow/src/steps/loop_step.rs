@@ -141,9 +141,13 @@ pub(crate) async fn execute(
 
         completed = iteration;
 
-        // Evaluate `until` after the iteration body.
+        // Evaluate `until` after the iteration body. Stages snapshot
+        // is included so a pipeline-aware loop body can branch on
+        // upstream stage outputs (issue #41).
+        let stages_snapshot = ctx.stages.read().await.clone();
         let inner_ctx =
-            expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env);
+            expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env)
+                .with_stages(&stages_snapshot);
         let cond = expr::eval_bool(until, &inner_ctx).map_err(|e| WorkflowError::StepFailed {
             step_id: id.clone(),
             message: format!("until-expression error: {e}"),

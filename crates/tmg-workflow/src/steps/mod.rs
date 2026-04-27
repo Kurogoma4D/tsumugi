@@ -16,4 +16,5 @@ pub(crate) mod loop_step;
 pub(crate) mod parallel;
 pub(crate) mod path_util;
 pub(crate) mod shell;
+pub(crate) mod workflow;
 pub(crate) mod write_file;

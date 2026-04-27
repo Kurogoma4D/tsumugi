@@ -3,11 +3,13 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tmg_agents::{AgentType, CustomAgentDef, SubagentManager, SubagentSummary, truncate_str};
 use tmg_core::{AgentLoop, CoreError, StreamSink, format_context_usage};
 use tmg_harness::{HarnessStreamSink, RunRunner, RunSummary};
 use tmg_llm::Role;
+use tmg_workflow::WorkflowProgress;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -180,6 +182,39 @@ pub struct App {
     /// [`HarnessStreamSink`], so the active session's `tool_calls_count`
     /// and `files_modified` reflect actual tool activity.
     runner: Option<Arc<Mutex<RunRunner>>>,
+
+    /// Optional receiver of [`WorkflowProgress`] events from a running
+    /// workflow.
+    ///
+    /// Wired in issue #41 as a minimal hook so the TUI can show *that*
+    /// a workflow is running and which step is current. The detailed
+    /// rendering (progress bar, stage list, elapsed) is tracked under
+    /// issue #45; for now we surface a single line in the activity
+    /// pane and update it as events arrive.
+    workflow_progress_rx: Option<mpsc::Receiver<WorkflowProgress>>,
+
+    /// Display state for the currently-running workflow, if any.
+    workflow_status: Option<WorkflowStatusLine>,
+}
+
+/// Minimal in-app state for the workflow progress hook.
+///
+/// We don't try to render full per-stage detail here — that lives in
+/// the dedicated TUI work (#45). What we *do* track is enough to draw
+/// a single status line: the current step id, optional iteration
+/// counter, and the wall-clock time the workflow started so the
+/// activity pane can show "elapsed" without waking on a timer.
+#[derive(Debug, Clone)]
+pub struct WorkflowStatusLine {
+    /// Most recent step id seen on the channel.
+    pub current_step: String,
+    /// `(iteration, max)` if the latest event was a `LoopIteration`.
+    pub loop_progress: Option<(u32, u32)>,
+    /// Wall-clock instant the workflow started (set when the first
+    /// event arrives).
+    pub started_at: Instant,
+    /// `true` once a `WorkflowCompleted` event has been observed.
+    pub completed: bool,
 }
 
 impl App {
@@ -216,7 +251,78 @@ impl App {
             event_log_path: event_log,
             current_run: None,
             runner: None,
+            workflow_progress_rx: None,
+            workflow_status: None,
         }
+    }
+
+    /// Attach a workflow progress receiver. The CLI calls this when a
+    /// foreground workflow tool call dispatches the engine; the TUI
+    /// drains the channel from its event loop and updates a small
+    /// status section.
+    pub fn set_workflow_progress_rx(&mut self, rx: mpsc::Receiver<WorkflowProgress>) {
+        self.workflow_progress_rx = Some(rx);
+        self.workflow_status = None;
+    }
+
+    /// Drain pending workflow progress events. Returns `true` when at
+    /// least one event was consumed (the event loop should redraw).
+    ///
+    /// We update [`Self::workflow_status`] in place. The detailed
+    /// rendering is intentionally minimal — issue #45 owns the full
+    /// activity-pane layout; this is the wiring deliverable for #41.
+    pub fn drain_workflow_progress(&mut self) -> bool {
+        let Some(rx) = self.workflow_progress_rx.as_mut() else {
+            return false;
+        };
+        let mut changed = false;
+        loop {
+            match rx.try_recv() {
+                Ok(ev) => {
+                    let entry = self
+                        .workflow_status
+                        .get_or_insert_with(|| WorkflowStatusLine {
+                            current_step: String::new(),
+                            loop_progress: None,
+                            started_at: Instant::now(),
+                            completed: false,
+                        });
+                    match ev {
+                        WorkflowProgress::StepStarted { step_id, .. } => {
+                            entry.current_step = step_id;
+                            entry.loop_progress = None;
+                        }
+                        WorkflowProgress::LoopIteration {
+                            step_id,
+                            iteration,
+                            max,
+                        } => {
+                            entry.current_step = step_id;
+                            entry.loop_progress = Some((iteration, max));
+                        }
+                        WorkflowProgress::WorkflowCompleted { .. } => {
+                            entry.completed = true;
+                        }
+                        // Other variants are not surfaced in the
+                        // minimal wire-up; #45 expands this.
+                        _ => {}
+                    }
+                    changed = true;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => return changed,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.workflow_progress_rx = None;
+                    return changed;
+                }
+            }
+        }
+    }
+
+    /// Return the current workflow status line, if any. The renderer
+    /// can format this into the activity pane.
+    #[must_use]
+    pub fn workflow_status(&self) -> Option<&WorkflowStatusLine> {
+        self.workflow_status.as_ref()
     }
 
     /// Set the active run for header display.
