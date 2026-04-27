@@ -25,7 +25,7 @@
 //!   for diff previews where each line stands on its own.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -78,12 +78,44 @@ pub enum DiffLineKind {
 /// renders one file at a time; multi-file diffs are not interesting in
 /// the preview surface and would push more material than the pane has
 /// vertical room for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// ## Render cache
+///
+/// [`Self::render_lines`] memoises its output keyed on `max_lines`. A
+/// `DiffPreview` is replaced wholesale whenever a new diff arrives, so
+/// the cache lifetime is bounded by the struct's own lifetime — the
+/// data fields (`file` / `hunks`) are never mutated in place.
+/// `max_lines` can change across renders (when the activity pane
+/// resizes), so the cache key tracks it and recomputes on miss.
+///
+/// `Clone`, `PartialEq`, and `Eq` are intentionally *not* derived: the
+/// `Mutex<Option<...>>` cache cell is neither cloneable in a meaningful
+/// way nor comparable. Callers that previously needed those traits
+/// should compare on `(file, hunks)` directly.
+#[derive(Debug)]
 pub struct DiffPreview {
     /// File path inferred from the `+++ b/<path>` header (or `--- a/<path>` if absent).
     pub file: PathBuf,
     /// Hunks belonging to this file.
     pub hunks: Vec<DiffHunk>,
+    /// Cached output of [`Self::render_lines`] keyed by `max_lines`.
+    /// `Mutex` rather than `OnceLock` because the `max_lines` cap can
+    /// change between renders (terminal resize), so the cache must
+    /// support invalidation; a single `OnceLock` would either pin the
+    /// first observed cap forever or require a wholesale struct
+    /// replacement on every resize. Contention is irrelevant — only
+    /// the render path acquires this lock and only briefly.
+    cached_lines: Mutex<Option<(usize, Vec<Line<'static>>)>>,
+}
+
+impl Default for DiffPreview {
+    fn default() -> Self {
+        Self {
+            file: PathBuf::new(),
+            hunks: Vec::new(),
+            cached_lines: Mutex::new(None),
+        }
+    }
 }
 
 impl DiffPreview {
@@ -96,6 +128,19 @@ impl DiffPreview {
     #[must_use]
     pub fn parse(diff_text: &str) -> Option<Self> {
         parse_unified_diff(diff_text)
+    }
+
+    /// Build a `DiffPreview` from already-parsed hunks. The cache cell
+    /// is initialised empty; callers that previously used the struct
+    /// literal directly should switch to this constructor so the
+    /// private cache field stays encapsulated.
+    #[must_use]
+    pub fn with_hunks(file: impl Into<PathBuf>, hunks: Vec<DiffHunk>) -> Self {
+        Self {
+            file: file.into(),
+            hunks,
+            cached_lines: Mutex::new(None),
+        }
     }
 
     /// Synthesise a single-hunk preview from a `file_write` tool call.
@@ -124,6 +169,7 @@ impl DiffPreview {
                 header_context: String::new(),
                 lines,
             }],
+            cached_lines: Mutex::new(None),
         }
     }
 
@@ -144,8 +190,41 @@ impl DiffPreview {
     /// `max_lines` caps the number of body lines (not counting the
     /// file header / hunk headers); excess lines are truncated and
     /// replaced with a single "... (N more lines)" indicator.
+    ///
+    /// The result is memoised on `(self, max_lines)`; the activity
+    /// pane re-renders every tick, so caching avoids paying the
+    /// per-line `syntect` highlight cost on every frame. The cache
+    /// invalidates whenever `max_lines` changes (e.g. terminal
+    /// resize); the underlying diff data is never mutated in place.
     #[must_use]
     pub fn render_lines(&self, max_lines: usize) -> Vec<Line<'static>> {
+        // Fast path: return a clone of the cached lines if the cap
+        // matches. We deliberately clone (rather than handing out a
+        // shared `Arc<Vec<Line>>`) so callers can keep using the
+        // existing `Vec<Line<'static>>` API — the per-frame clone is
+        // O(N) on a vector that has already been built without any
+        // syntect work.
+        if let Ok(guard) = self.cached_lines.lock() {
+            if let Some((cached_max, lines)) = guard.as_ref() {
+                if *cached_max == max_lines {
+                    return lines.clone();
+                }
+            }
+        }
+
+        let lines = self.render_lines_uncached(max_lines);
+
+        // Refresh the cache. A poisoned mutex is non-fatal — it just
+        // means a previous panic happened during cache update; we
+        // skip caching this round and the caller still gets the
+        // freshly-rendered lines.
+        if let Ok(mut guard) = self.cached_lines.lock() {
+            *guard = Some((max_lines, lines.clone()));
+        }
+        lines
+    }
+
+    fn render_lines_uncached(&self, max_lines: usize) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
 
         // File header.
@@ -231,14 +310,14 @@ impl DiffPreview {
 
 /// Wrapper around `syntect`'s `SyntaxSet` and `ThemeSet`. Lazily
 /// initialised on first use.
-struct SyntaxBundle {
+pub(crate) struct SyntaxBundle {
     syntaxes: SyntaxSet,
     theme: syntect::highlighting::Theme,
 }
 
 impl SyntaxBundle {
     /// Return the process-wide bundle, initialising it on first call.
-    fn get() -> &'static Self {
+    pub(crate) fn get() -> &'static Self {
         static BUNDLE: OnceLock<SyntaxBundle> = OnceLock::new();
         BUNDLE.get_or_init(|| {
             let syntaxes = SyntaxSet::load_defaults_newlines();
@@ -370,7 +449,11 @@ fn parse_unified_diff(text: &str) -> Option<DiffPreview> {
     }
 
     let file = current_path.unwrap_or_else(|| PathBuf::from("(unknown)"));
-    Some(DiffPreview { file, hunks })
+    Some(DiffPreview {
+        file,
+        hunks,
+        cached_lines: Mutex::new(None),
+    })
 }
 
 fn parse_minus_header(line: &str) -> Option<PathBuf> {
@@ -419,6 +502,18 @@ fn parse_range(s: &str) -> Option<(u32, u32)> {
     let start = iter.next()?.parse::<u32>().ok()?;
     let count = iter.next().map_or(Some(1), |v| v.parse::<u32>().ok())?;
     Some((start, count))
+}
+
+/// Pre-warm the process-wide [`SyntaxBundle`].
+///
+/// The bundle's first-use load is ~30 ms; deferring it to a background
+/// blocking task at TUI startup keeps that cost off the rendering
+/// thread so the first diff preview frame doesn't stall. Subsequent
+/// calls to [`SyntaxBundle::get`] are O(1) — `OnceLock` resolves once.
+pub fn prewarm_syntax_bundle() {
+    // Deliberately no `&'static`-binding so the compiler can drop the
+    // reference; the `OnceLock` inside `get` keeps the bundle alive.
+    let _ = SyntaxBundle::get();
 }
 
 /// Try to extract a unified diff out of a shell-tool result whose
@@ -537,5 +632,34 @@ mod tests {
     fn parse_range_no_count_defaults_to_one() {
         assert_eq!(parse_range("5"), Some((5, 1)));
         assert_eq!(parse_range("5,3"), Some((5, 3)));
+    }
+
+    #[test]
+    fn render_lines_caches_when_max_lines_unchanged() {
+        let preview = DiffPreview::parse(SAMPLE).expect("parse");
+        // Cache miss on the first call.
+        let first = preview.render_lines(50);
+        // Verify the cache is populated.
+        {
+            let guard = preview.cached_lines.lock().expect("lock");
+            let (cached_max, cached_lines) = guard.as_ref().expect("cache populated");
+            assert_eq!(*cached_max, 50);
+            assert_eq!(cached_lines.len(), first.len());
+        }
+        // Second call must return an equivalent vector.
+        let second = preview.render_lines(50);
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+    }
+
+    #[test]
+    fn render_lines_invalidates_when_max_lines_changes() {
+        let preview = DiffPreview::parse(SAMPLE).expect("parse");
+        let first = preview.render_lines(2);
+        let second = preview.render_lines(50);
+        // Different caps must produce different cached vectors.
+        assert_ne!(first.len(), second.len());
+        let guard = preview.cached_lines.lock().expect("lock");
+        let (cached_max, _) = guard.as_ref().expect("cache populated");
+        assert_eq!(*cached_max, 50);
     }
 }

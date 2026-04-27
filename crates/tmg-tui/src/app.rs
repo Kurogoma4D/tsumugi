@@ -107,28 +107,6 @@ struct TurnHandle {
     _join: JoinHandle<()>,
 }
 
-/// Aggregated event emitted from background tasks into the App's main
-/// loop. Replaces the previous `drain_turn_messages` model with a
-/// single drain that handles all three channels (turn / run / workflow).
-///
-/// Not `Debug`: [`TurnMessage`] carries an owned [`AgentLoop`] which
-/// is intentionally not `Debug` (the LLM client and tool registry
-/// inside it have no useful diagnostic representation). Callers that
-/// need to log an event should match on the variant directly.
-///
-/// `Turn` is boxed because [`TurnMessage`] embeds the `AgentLoop`
-/// (`~400 B`) — leaving it inline would make every `AppEvent` carry
-/// the worst-case payload regardless of variant.
-pub enum AppEvent {
-    /// A streaming/result message from the active conversation turn.
-    Turn(Box<TurnMessage>),
-    /// A run-scoped progress event from [`tmg_harness::RunRunner`].
-    Run(RunProgressEvent),
-    /// A workflow-engine progress event from
-    /// [`tmg_workflow::WorkflowEngine`].
-    Workflow(WorkflowProgress),
-}
-
 /// The main application state.
 #[expect(
     clippy::struct_excessive_bools,
@@ -219,6 +197,14 @@ pub struct App {
     /// workflow. Wired by the foreground `run_workflow` path so the
     /// engine's events reach the activity pane.
     workflow_progress_rx: Option<mpsc::Receiver<WorkflowProgress>>,
+
+    /// Whether the most recent `shell_exec` tool *call* was a `git diff`
+    /// invocation. Set on `ToolCall { name == "shell_exec" }` and read
+    /// in the matching `ToolResult` so we only run unified-diff
+    /// extraction on outputs that are actually likely to be diffs —
+    /// stray `git log -p` / `cat foo.diff` blobs no longer overwrite a
+    /// legitimate `file_write` / `file_patch` preview.
+    last_shell_exec_was_git_diff: bool,
 }
 
 impl App {
@@ -257,6 +243,7 @@ impl App {
             runner: None,
             run_progress_rx: None,
             workflow_progress_rx: None,
+            last_shell_exec_was_git_diff: false,
         }
     }
 
@@ -844,6 +831,17 @@ impl App {
                     // log entry, just no preview update.
                     capture_diff_from_call(&mut self.activity.diff_preview, &name, &arguments);
 
+                    // Latch whether this `shell_exec` is a `git diff`
+                    // invocation. The matching `ToolResult` consults
+                    // the flag so we only extract a unified diff out
+                    // of outputs that are actually likely to contain
+                    // one — `git log -p`, `cat diff.txt`, and other
+                    // stray diff-looking blobs no longer overwrite a
+                    // legitimate `file_write` / `file_patch` preview.
+                    if name == "shell_exec" {
+                        self.last_shell_exec_was_git_diff = shell_exec_is_git_diff(&arguments);
+                    }
+
                     let summary = truncate_for_display(&arguments, 120);
                     self.activity.tool_log.push(ToolActivityEntry {
                         tool_name: name,
@@ -857,13 +855,20 @@ impl App {
                     output,
                     is_error,
                 }) => {
-                    // For `shell_exec` results that look like a git
-                    // diff, try to extract the unified diff. Failure
-                    // is silent — the tool log entry still lands.
-                    if !is_error && name == "shell_exec" {
+                    // For `shell_exec` results whose original command
+                    // was `git diff` (latched on the matching
+                    // `ToolCall`), try to extract the unified diff.
+                    // Failure is silent — the tool log entry still
+                    // lands.
+                    if !is_error && name == "shell_exec" && self.last_shell_exec_was_git_diff {
                         if let Some(preview) = crate::diff::try_extract_from_shell_output(&output) {
                             self.activity.diff_preview = Some(preview);
                         }
+                    }
+                    if name == "shell_exec" {
+                        // Reset the latch — each `git diff` call must
+                        // re-arm it on a fresh `ToolCall`.
+                        self.last_shell_exec_was_git_diff = false;
                     }
 
                     let summary = truncate_for_display(&output, 200);
@@ -993,18 +998,21 @@ impl App {
                     }
                     changed = true;
                 }
-                Ok(RunProgressEvent::SessionEnded { trigger: _ }) => {
+                Ok(RunProgressEvent::SessionEnded { trigger }) => {
                     // The runner moves to a fresh successor session
                     // for everything except `UserExit`; bumping the
                     // header counter is best-effort because the CLI
                     // re-attaches the new run summary on the next
-                    // idle pass.
-                    if let Some(header) = self.run_header.as_mut() {
-                        header.session_num = header.session_num.saturating_add(1);
+                    // idle pass. On `UserExit` no successor session
+                    // exists, so the counter must stay put.
+                    if !matches!(trigger, tmg_harness::SessionEndTrigger::UserExit) {
+                        if let Some(header) = self.run_header.as_mut() {
+                            header.session_num = header.session_num.saturating_add(1);
+                        }
+                        self.activity.run_progress.session_num =
+                            self.activity.run_progress.session_num.saturating_add(1);
+                        self.activity.run_progress.turns = 0;
                     }
-                    self.activity.run_progress.session_num =
-                        self.activity.run_progress.session_num.saturating_add(1);
-                    self.activity.run_progress.turns = 0;
                     changed = true;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => return changed,
@@ -1136,6 +1144,38 @@ fn capture_diff_from_call(current: &mut Option<DiffPreview>, name: &str, argumen
     }
 }
 
+/// Inspect a `shell_exec` tool-call argument blob and report whether
+/// the requested command is a `git diff` invocation.
+///
+/// The `shell_exec` tool's input shape is `{"command": "..."}`. We
+/// JSON-parse best-effort, trim leading whitespace from the command,
+/// and check (case-insensitively) for a `git diff` prefix. Anything
+/// non-conforming is treated as "not a git diff" so the TUI falls
+/// back to leaving the existing diff preview alone.
+fn shell_exec_is_git_diff(arguments: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return false;
+    };
+    let Some(command) = value.get("command").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let trimmed = command.trim_start();
+    // Match `git diff` and `git diff <args>` while letting `git
+    // difftool` or `git diffstat` slip through (the next char must be
+    // whitespace or end-of-string). Case-insensitive on the leading
+    // command so `GIT DIFF` (rare, but legal in some shells via
+    // aliases) still matches.
+    let lower = trimmed.to_ascii_lowercase();
+    let prefix = "git diff";
+    if !lower.starts_with(prefix) {
+        return false;
+    }
+    matches!(
+        lower.as_bytes().get(prefix.len()),
+        None | Some(b' ' | b'\t')
+    )
+}
+
 /// Build a tiny synthesised hunk for a `file_patch` call. This is
 /// best-effort — we do not have access to the surrounding file
 /// content at the TUI layer — so the hunk markers are zero, and the
@@ -1159,9 +1199,9 @@ fn synthesise_patch_preview(path: &str, search: &str, replace: &str) -> DiffPrev
     }
     let removed = u32::try_from(search.lines().count()).unwrap_or(u32::MAX);
     let added = u32::try_from(replace.lines().count()).unwrap_or(u32::MAX);
-    DiffPreview {
-        file: PathBuf::from(path),
-        hunks: vec![DiffHunk {
+    DiffPreview::with_hunks(
+        PathBuf::from(path),
+        vec![DiffHunk {
             old_start: 0,
             old_lines: removed,
             new_start: 0,
@@ -1169,7 +1209,7 @@ fn synthesise_patch_preview(path: &str, search: &str, replace: &str) -> DiffPrev
             header_context: "file_patch".to_owned(),
             lines,
         }],
-    }
+    )
 }
 
 /// Truncate a string for display, replacing middle with ellipsis if
@@ -1362,5 +1402,50 @@ mod tests {
         let mut current: Option<DiffPreview> = None;
         capture_diff_from_call(&mut current, "file_write", "not json {");
         assert!(current.is_none());
+    }
+
+    #[test]
+    fn shell_exec_is_git_diff_matches_plain_command() {
+        let args = serde_json::json!({"command": "git diff"}).to_string();
+        assert!(shell_exec_is_git_diff(&args));
+    }
+
+    #[test]
+    fn shell_exec_is_git_diff_matches_with_args_and_whitespace() {
+        let args = serde_json::json!({"command": "  git diff --stat HEAD~1"}).to_string();
+        assert!(shell_exec_is_git_diff(&args));
+    }
+
+    #[test]
+    fn shell_exec_is_git_diff_is_case_insensitive() {
+        let args = serde_json::json!({"command": "GIT DIFF"}).to_string();
+        assert!(shell_exec_is_git_diff(&args));
+    }
+
+    #[test]
+    fn shell_exec_is_git_diff_rejects_other_commands() {
+        for cmd in [
+            "ls",
+            "git log -p",
+            "git status",
+            "cat foo.diff",
+            "git difftool",
+            "git diffstat",
+        ] {
+            let args = serde_json::json!({ "command": cmd }).to_string();
+            assert!(
+                !shell_exec_is_git_diff(&args),
+                "expected `{cmd}` to not match git diff",
+            );
+        }
+    }
+
+    #[test]
+    fn shell_exec_is_git_diff_rejects_malformed() {
+        assert!(!shell_exec_is_git_diff("not json {"));
+        assert!(!shell_exec_is_git_diff("{}"));
+        assert!(!shell_exec_is_git_diff(
+            &serde_json::json!({"command": 42}).to_string(),
+        ));
     }
 }

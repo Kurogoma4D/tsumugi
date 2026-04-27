@@ -32,7 +32,13 @@ pub struct ToolActivityEntry {
 }
 
 /// Aggregated state for the Activity Pane.
-#[derive(Debug, Clone)]
+///
+/// `Clone` is intentionally not derived: the pane is owned by the
+/// `App` for the lifetime of a TUI session, mutated in place by the
+/// drain methods, and never duplicated. Adding `Clone` would also
+/// require it on [`crate::diff::DiffPreview`], which now holds a
+/// `Mutex`-backed render cache that is not meaningfully cloneable.
+#[derive(Debug)]
 pub struct ActivityPane {
     /// Always present: progress for the active run.
     pub run_progress: RunProgressSection,
@@ -87,7 +93,15 @@ impl ActivityPane {
                 entry.current_step.clone_from(step_id);
                 entry.iteration = Some((*iteration, *max));
             }
-            tmg_workflow::WorkflowProgress::WorkflowCompleted { .. } => {
+            tmg_workflow::WorkflowProgress::WorkflowCompleted { .. }
+            | tmg_workflow::WorkflowProgress::StepFailed { .. } => {
+                // The engine emits `StepFailed` when a step fails; the
+                // run aborts unless the failure is wrapped in a
+                // `Group { on_failure: continue }`. There is no
+                // separate `WorkflowFailed` variant, so we treat any
+                // unhandled `StepFailed` as a terminal signal and
+                // clear the section so the activity pane stops
+                // showing stale progress.
                 self.workflow_progress = None;
             }
             _ => {}
@@ -194,7 +208,12 @@ impl Default for RunProgressSection {
 }
 
 /// Per-workflow progress data driving the workflow-progress sub-section.
-#[derive(Debug, Clone)]
+///
+/// `Clone` is intentionally not derived: this section is created by
+/// [`ActivityPane::apply_workflow_event`] on the first relevant
+/// progress event and replaced wholesale (or cleared) on terminal
+/// events; no caller needs to duplicate it.
+#[derive(Debug)]
 pub struct WorkflowProgressSection {
     /// Workflow id (mirrors `WorkflowDef::id`).
     pub workflow_id: String,
@@ -433,6 +452,29 @@ mod tests {
         // WorkflowCompleted should clear the section.
         pane.apply_workflow_event(&WorkflowProgress::WorkflowCompleted {
             outputs: WorkflowOutputs::default(),
+        });
+        assert!(pane.workflow_progress.is_none());
+    }
+
+    #[test]
+    fn workflow_section_appears_on_step_started_and_clears_on_step_failed() {
+        use tmg_workflow::WorkflowProgress;
+
+        let mut pane = ActivityPane::new();
+        assert!(pane.workflow_progress.is_none());
+
+        pane.apply_workflow_event(&WorkflowProgress::StepStarted {
+            step_id: "build".to_owned(),
+            step_type: "shell",
+        });
+        assert!(pane.workflow_progress.is_some());
+
+        // StepFailed should clear the section since the engine does
+        // not emit a separate `WorkflowFailed` variant — an unhandled
+        // step failure aborts the run.
+        pane.apply_workflow_event(&WorkflowProgress::StepFailed {
+            step_id: "build".to_owned(),
+            error: "oops".to_owned(),
         });
         assert!(pane.workflow_progress.is_none());
     }

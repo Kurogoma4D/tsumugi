@@ -13,7 +13,7 @@ pub mod ui;
 pub use activity::{
     ActivityPane, RunHeader, RunProgressSection, ToolActivityEntry, WorkflowProgressSection,
 };
-pub use app::{App, AppEvent};
+pub use app::App;
 pub use diff::DiffPreview;
 pub use error::TuiError;
 
@@ -28,7 +28,8 @@ use crossterm::execute;
 use tmg_agents::{CustomAgentDef, SubagentManager};
 use tmg_core::AgentLoop;
 use tmg_harness::{RunProgressReceiver, RunRunner, RunSummary};
-use tokio::sync::Mutex;
+use tmg_workflow::WorkflowProgress;
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 /// Run the TUI application.
@@ -55,6 +56,11 @@ use tokio_util::sync::CancellationToken;
 /// * `run_progress_rx` - Optional [`RunProgressReceiver`] subscribed
 ///   to the runner's progress channel; the activity pane drains it on
 ///   every tick to refresh the run header / progress section.
+/// * `workflow_progress_rx` - Optional receiver paired with a
+///   foreground `run_workflow` observer (see
+///   [`tmg_workflow::register_workflow_tools_with_observer`]); the
+///   activity pane drains it every tick to surface live workflow
+///   progress events.
 ///
 /// # Errors
 ///
@@ -75,7 +81,19 @@ pub async fn run(
     current_run: Option<RunSummary>,
     runner: Option<Arc<Mutex<RunRunner>>>,
     run_progress_rx: Option<RunProgressReceiver>,
+    workflow_progress_rx: Option<mpsc::Receiver<WorkflowProgress>>,
 ) -> Result<(), TuiError> {
+    // Pre-warm the syntect bundle off the rendering thread. Loading
+    // `SyntaxSet::load_defaults_newlines` + `ThemeSet::load_defaults`
+    // is ~30 ms locally; running it on a `spawn_blocking` task keeps
+    // the first diff preview frame from stalling. The task is fire-
+    // and-forget — the `OnceLock` inside `SyntaxBundle::get` is the
+    // synchronisation surface — so any panic during load is logged
+    // but does not block startup.
+    tokio::task::spawn_blocking(|| {
+        diff::prewarm_syntax_bundle();
+    });
+
     let mut terminal = ratatui::init();
 
     // Enable mouse capture for scroll wheel support.
@@ -126,6 +144,10 @@ pub async fn run(
 
     if let Some(rx) = run_progress_rx {
         app.set_run_progress_rx(rx);
+    }
+
+    if let Some(rx) = workflow_progress_rx {
+        app.set_workflow_progress_rx(rx);
     }
 
     let result = event::run_event_loop(&mut terminal, &mut app, cancel).await;
