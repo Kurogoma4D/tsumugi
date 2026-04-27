@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use serde_json::json;
 
 use crate::def::{StepDef, StepResult};
-use crate::engine::{EngineCtx, StepOutcome, dispatch_step};
+use crate::engine::{EngineCtx, StepOutcome, build_eval_ctx, dispatch_step};
 use crate::error::{Result, WorkflowError};
 use crate::expr;
 use crate::progress::WorkflowProgress;
@@ -40,9 +40,7 @@ pub(crate) async fn execute(
 
     let stages_snapshot = ctx.stages.read().await.clone();
     for (idx, (when_expr, _)) in conditions.iter().enumerate() {
-        let inner_ctx =
-            expr::ExprContext::new(&ctx.inputs, step_results, &ctx.config_json, &ctx.env)
-                .with_stages(&stages_snapshot);
+        let inner_ctx = build_eval_ctx(ctx, step_results, &stages_snapshot);
         let cond =
             expr::eval_bool(when_expr, &inner_ctx).map_err(|e| WorkflowError::StepFailed {
                 step_id: id.clone(),

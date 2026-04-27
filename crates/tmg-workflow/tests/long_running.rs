@@ -312,6 +312,275 @@ iterate:
     assert_eq!(r.run().session_count, 1);
 }
 
+/// PR #66 review fix #2: an empty `features.json` must not let
+/// `until: artifact.features.all_passing` complete the run silently
+/// on iteration 1. The resolver now reports an error which surfaces as
+/// `RunStatus::Failed`.
+#[tokio::test]
+async fn empty_features_rejects_all_passing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let runs_dir = tmp.path().join("runs");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&runs_dir).unwrap();
+
+    let (engine, runner) = build_harness(&workspace, &runs_dir);
+
+    // Empty features.json (init has not yet declared the work).
+    let features_path = {
+        let r = runner.lock().await;
+        r.features().path().to_path_buf()
+    };
+    if let Some(parent) = features_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&features_path, r#"{"features":[]}"#).unwrap();
+
+    let yaml = r#"
+id: lr_empty_features
+mode: long_running
+
+init:
+  steps: []
+
+iterate:
+  bootstrap: []
+  steps:
+    - id: noop
+      type: shell
+      command: "true"
+  until: "artifact.features.all_passing"
+  max_sessions: 2
+  session_timeout: "5s"
+"#;
+    let wf = parse_workflow_str(yaml, "<inline>").unwrap();
+    let exec = LongRunningExecutor::new(engine, Arc::clone(&runner));
+    let status = exec.run(&wf, BTreeMap::new()).await.unwrap();
+    match status {
+        RunStatus::Failed { error } => {
+            assert!(
+                error.contains("no features declared yet"),
+                "expected 'no features declared yet' message, got: {error}"
+            );
+        }
+        other => panic!("expected Failed for empty features.json, got {other:?}"),
+    }
+}
+
+/// PR #66 review fix #3: an iterate-phase step's `write_file.path`
+/// can resolve `${{ artifacts.<name> }}` (the named-artifact map is
+/// plumbed through to iterate-phase steps via `EngineExtras`).
+#[tokio::test]
+async fn iterate_step_resolves_artifacts_path_template() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let runs_dir = tmp.path().join("runs");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&runs_dir).unwrap();
+    let canonical_workspace = std::fs::canonicalize(&workspace).unwrap();
+
+    let (engine, runner) = build_harness(&workspace, &runs_dir);
+
+    // Use a workspace-local path so the sandbox accepts the write.
+    let progress_target = "progress.md";
+    let yaml = format!(
+        r#"
+id: lr_artifact_in_iterate
+mode: long_running
+
+init:
+  artifacts:
+    progress_file: "{progress_target}"
+  steps: []
+
+iterate:
+  bootstrap: []
+  steps:
+    - id: write_progress
+      type: write_file
+      path: "${{{{ artifacts.progress_file }}}}"
+      content: "session-${{{{ inputs.session_index }}}}"
+  until: "true"
+  max_sessions: 1
+  session_timeout: "5s"
+"#,
+    );
+    let wf = parse_workflow_str(&yaml, "<inline>").unwrap();
+    let exec = LongRunningExecutor::new(engine, Arc::clone(&runner));
+    let status = exec.run(&wf, BTreeMap::new()).await.unwrap();
+    assert_eq!(status, RunStatus::Completed);
+
+    let written = canonical_workspace.join(progress_target);
+    let body = std::fs::read_to_string(&written)
+        .unwrap_or_else(|e| panic!("read {}: {e}", written.display()));
+    assert!(body.contains("session-1"), "unexpected body: {body}");
+}
+
+/// PR #66 review fix #3: an iterate-phase step's `when:` can reference
+/// `${{ artifact.<name>.<method> }}` so step gating reflects the live
+/// run state (the resolver is plumbed through to iterate steps).
+#[tokio::test]
+async fn iterate_step_when_uses_artifact_resolver() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let runs_dir = tmp.path().join("runs");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&runs_dir).unwrap();
+    let canonical_workspace = std::fs::canonicalize(&workspace).unwrap();
+
+    let (engine, runner) = build_harness(&workspace, &runs_dir);
+
+    // Pre-populate features.json with two passing features so
+    // `passing_count == 2` is observable from the iterate step's
+    // `when:` expression.
+    let features_path = {
+        let r = runner.lock().await;
+        r.features().path().to_path_buf()
+    };
+    if let Some(parent) = features_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(
+        &features_path,
+        r#"{"features":[
+            {"id":"a","category":"x","description":"d","steps":["s"],"passes":true},
+            {"id":"b","category":"x","description":"d","steps":["s"],"passes":true}
+        ]}"#,
+    )
+    .unwrap();
+
+    let marker_path = canonical_workspace.join("marker.txt");
+    let never_path = canonical_workspace.join("never.txt");
+    let yaml = format!(
+        r#"
+id: lr_when_artifact
+mode: long_running
+
+init:
+  steps: []
+
+iterate:
+  bootstrap: []
+  steps:
+    - id: marker_when_two
+      type: shell
+      command: "echo TWO_PASSING > {marker}"
+      when: "artifact.features.passing_count == 2"
+    - id: marker_never
+      type: shell
+      command: "echo NEVER > {never}"
+      when: "artifact.features.passing_count == 99"
+  until: "true"
+  max_sessions: 1
+  session_timeout: "5s"
+"#,
+        marker = marker_path.display(),
+        never = never_path.display(),
+    );
+    let wf = parse_workflow_str(&yaml, "<inline>").unwrap();
+    let exec = LongRunningExecutor::new(engine, Arc::clone(&runner));
+    let status = exec.run(&wf, BTreeMap::new()).await.unwrap();
+    assert_eq!(status, RunStatus::Completed);
+
+    assert!(
+        marker_path.exists(),
+        "expected marker.txt (when-true gate) at {}",
+        marker_path.display()
+    );
+    assert!(
+        !never_path.exists(),
+        "never.txt should not exist (when-false gate) at {}",
+        never_path.display()
+    );
+}
+
+/// PR #66 review fix #14: a non-trivial `features.json` followed by
+/// an iterate loop that marks each feature passing should drive
+/// `artifact.features.all_passing` to true and stop with
+/// `RunStatus::Completed`. The iterate phase mutates the file via a
+/// shell step on each session until every feature flips to `passes:
+/// true`. This exercises the end-to-end loop the long-running mode is
+/// designed for.
+#[tokio::test]
+async fn init_writes_features_iterate_marks_passing_until_done() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let runs_dir = tmp.path().join("runs");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&runs_dir).unwrap();
+
+    let (engine, runner) = build_harness(&workspace, &runs_dir);
+
+    // Seed three failing features. We pre-write directly so the test
+    // doesn't depend on the sandbox accepting writes outside the
+    // workspace; the iterate-phase shell step (which uses the sandbox
+    // and runs without a fixed cwd) reads/writes the file via its
+    // absolute path.
+    let features_path = {
+        let r = runner.lock().await;
+        r.features().path().to_path_buf()
+    };
+    if let Some(parent) = features_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(
+        &features_path,
+        r#"{"features":[
+{"id":"alpha","category":"x","description":"d","steps":["s"],"passes":false},
+{"id":"beta","category":"x","description":"d","steps":["s"],"passes":false},
+{"id":"gamma","category":"x","description":"d","steps":["s"],"passes":false}
+]}"#,
+    )
+    .unwrap();
+
+    // The mark-passing helper script (a tiny python program) is
+    // staged on disk and invoked from the iterate-phase shell step.
+    // Each invocation flips the first still-failing feature's
+    // `passes` flag to true and exits 0.
+    let helper_path = workspace.join("mark_one.py");
+    std::fs::write(
+        &helper_path,
+        format!(
+            "import json\np=r'{p}'\nd=json.load(open(p))\nfor f in d['features']:\n    if not f['passes']:\n        f['passes']=True\n        json.dump(d, open(p,'w'))\n        break\n",
+            p = features_path.display(),
+        ),
+    )
+    .unwrap();
+
+    let yaml = format!(
+        r#"
+id: lr_full_loop
+mode: long_running
+
+iterate:
+  bootstrap: []
+  steps:
+    - id: mark_one
+      type: shell
+      command: "python3 {helper}"
+  until: "artifact.features.all_passing"
+  max_sessions: 5
+  session_timeout: "10s"
+"#,
+        helper = helper_path.display(),
+    );
+
+    let wf = parse_workflow_str(&yaml, "<inline>")
+        .unwrap_or_else(|e| panic!("parse failed: {e}\nyaml:\n{yaml}"));
+    let exec = LongRunningExecutor::new(engine, Arc::clone(&runner));
+    let status = exec.run(&wf, BTreeMap::new()).await.unwrap();
+    assert_eq!(status, RunStatus::Completed, "expected Completed");
+
+    // Three iterations were needed (one per feature) before
+    // all_passing flipped true.
+    let r = runner.lock().await;
+    let count = r.run().session_count;
+    assert_eq!(
+        count, 3,
+        "expected 3 iterations (one per feature), got {count}"
+    );
+}
+
 /// Session timeout fires when the iterate steps take longer than the
 /// configured `session_timeout`.
 #[tokio::test(flavor = "multi_thread")]

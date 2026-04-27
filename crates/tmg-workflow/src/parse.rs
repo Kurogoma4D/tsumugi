@@ -101,15 +101,71 @@ struct RawIteratePhase {
     session_timeout: RawTimeout,
 }
 
-/// One entry of `iterate.bootstrap:`. Untagged so the YAML can use the
-/// shorthand `{run: ...}` / `{read: ...}` / `{smoke_test: ...}` without
-/// a wrapping `kind:` discriminator.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+/// One entry of `iterate.bootstrap:`. Uses a manual `Deserialize` impl
+/// (rather than `#[serde(untagged)]`) so a malformed entry produces a
+/// precise error: zero or multiple of `run:` / `read:` / `smoke_test:`
+/// keys are rejected with a clear message naming the offending keys.
+#[derive(Debug)]
 enum RawBootstrapItem {
     Run { run: String },
     Read { read: String },
     SmokeTest { smoke_test: Box<RawStep> },
+}
+
+impl<'de> Deserialize<'de> for RawBootstrapItem {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Helper struct that captures *all three* shorthand keys so we
+        // can detect "none" and "more than one" cases ourselves rather
+        // than relying on serde(untagged)'s generic
+        // "data did not match any variant" message.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Helper {
+            #[serde(default)]
+            run: Option<String>,
+            #[serde(default)]
+            read: Option<String>,
+            #[serde(default)]
+            smoke_test: Option<Box<RawStep>>,
+        }
+        let helper = Helper::deserialize(deserializer)?;
+        let mut present: Vec<&'static str> = Vec::new();
+        if helper.run.is_some() {
+            present.push("run");
+        }
+        if helper.read.is_some() {
+            present.push("read");
+        }
+        if helper.smoke_test.is_some() {
+            present.push("smoke_test");
+        }
+        match present.len() {
+            0 => Err(serde::de::Error::custom(
+                "bootstrap entry must declare exactly one of `run:`, `read:`, or `smoke_test:`; found none",
+            )),
+            1 => {
+                if let Some(run) = helper.run {
+                    Ok(Self::Run { run })
+                } else if let Some(read) = helper.read {
+                    Ok(Self::Read { read })
+                } else if let Some(smoke_test) = helper.smoke_test {
+                    Ok(Self::SmokeTest { smoke_test })
+                } else {
+                    // Unreachable: present.len() == 1 implies exactly
+                    // one is_some() above.
+                    Err(serde::de::Error::custom(
+                        "internal error: present-count desync in bootstrap entry parser",
+                    ))
+                }
+            }
+            _ => Err(serde::de::Error::custom(format!(
+                "bootstrap entry must declare exactly one of `run:`, `read:`, or `smoke_test:`; found {present:?}"
+            ))),
+        }
+    }
 }
 
 /// One entry in a pipeline's `stages:` list.
@@ -621,11 +677,25 @@ fn convert_bootstrap_item(
             // doesn't collide with anything else.
             let mut seen: BTreeSet<String> = BTreeSet::new();
             let step = convert_step(*smoke_test, path_display, &mut seen, outer_registry)?;
+            // Reject non-shell smoke_test step types until shared
+            // resource semantics (agent_semaphore contention with the
+            // iterate phase, sandbox plumbing for write_file) are
+            // pinned down. See `LongRunningExecutor::run_smoke_test`'s
+            // doc comment for the rationale.
+            if !matches!(step, StepDef::Shell { .. }) {
+                return Err(WorkflowError::invalid_workflow(
+                    path_display,
+                    format!(
+                        "iterate.bootstrap.smoke_test: only `type: shell` steps are \
+                         supported (got '{kind}')",
+                        kind = step.step_type(),
+                    ),
+                ));
+            }
             Ok(BootstrapItem::SmokeTest(Box::new(step)))
         }
     }
 }
-
 
 #[expect(
     clippy::too_many_lines,
@@ -1929,6 +1999,96 @@ steps:
             err.to_string()
                 .contains("does not currently support 'when'"),
             "{err}"
+        );
+    }
+
+    /// PR #66 review fix #6: a bootstrap entry that declares none of
+    /// `run:` / `read:` / `smoke_test:` produces a precise error
+    /// message naming all three keys.
+    #[test]
+    fn bootstrap_entry_with_no_keys_is_rejected() {
+        let yaml = r#"
+id: lr_bad_bootstrap
+mode: long_running
+
+iterate:
+  bootstrap:
+    - {}
+  steps:
+    - id: noop
+      type: shell
+      command: "true"
+  until: "true"
+  max_sessions: 1
+  session_timeout: "5s"
+"#;
+        let err = parse_workflow_str(yaml, p()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`run:`") && msg.contains("`read:`") && msg.contains("`smoke_test:`"),
+            "missing key list in error: {msg}"
+        );
+        assert!(msg.contains("found none"), "wrong wording: {msg}");
+    }
+
+    /// PR #66 review fix #6: a bootstrap entry that declares more than
+    /// one key (e.g. both `run:` and `read:`) is rejected with a list
+    /// of the offending keys.
+    #[test]
+    fn bootstrap_entry_with_multiple_keys_is_rejected() {
+        let yaml = r#"
+id: lr_bad_bootstrap_multi
+mode: long_running
+
+iterate:
+  bootstrap:
+    - run: "echo a"
+      read: "b.txt"
+  steps:
+    - id: noop
+      type: shell
+      command: "true"
+  until: "true"
+  max_sessions: 1
+  session_timeout: "5s"
+"#;
+        let err = parse_workflow_str(yaml, p()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("\"run\"") && msg.contains("\"read\""),
+            "expected key names in error: {msg}"
+        );
+    }
+
+    /// PR #66 review fix #7: `smoke_test` entries must be `type: shell`
+    /// — non-shell steps are rejected at parse time until shared
+    /// resource semantics are pinned down.
+    #[test]
+    fn bootstrap_smoke_test_rejects_non_shell_steps() {
+        let yaml = r#"
+id: lr_smoke_non_shell
+mode: long_running
+
+iterate:
+  bootstrap:
+    - smoke_test:
+        id: bad
+        type: write_file
+        path: "x"
+        content: "y"
+  steps:
+    - id: noop
+      type: shell
+      command: "true"
+  until: "true"
+  max_sessions: 1
+  session_timeout: "5s"
+"#;
+        let err = parse_workflow_str(yaml, p()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("only `type: shell`") || msg.contains("only `type: shell` steps"),
+            "expected shell-only restriction: {msg}"
         );
     }
 }

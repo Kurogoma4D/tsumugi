@@ -15,8 +15,10 @@
 //!    context block, runs `iterate.steps`, then evaluates the `until`
 //!    expression. Sessions stop the loop on:
 //!    - `until` truthy → [`RunStatus::Completed`]
-//!    - `session_count >= max_sessions` →
-//!      [`RunStatus::Exhausted { reason: "max_sessions" }`]
+//!    - `session_count > max_sessions` (i.e. the *next* index would
+//!      strictly exceed the cap) → [`RunStatus::Exhausted { reason:
+//!      "max_sessions" }`]. With `max_sessions: N` the executor
+//!      consumes exactly `N` sessions before giving up.
 //!    - `session_timeout` exceeded → fires
 //!      [`tmg_harness::SessionEndTrigger::Timeout`] via the existing
 //!      watchdog channel and continues with the next iteration.
@@ -30,17 +32,20 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use tmg_harness::{RunRunner, SessionEndTrigger};
+use tmg_sandbox::SandboxContext;
 
 use crate::def::{BootstrapItem, StepDef, StepResult, WorkflowDef, WorkflowMode};
-use crate::engine::WorkflowEngine;
+use crate::engine::{EngineExtras, WorkflowEngine};
 use crate::error::{Result, WorkflowError};
 use crate::expr::{self, ArtifactResolver, ExprContext};
 use crate::progress::WorkflowProgress;
@@ -147,7 +152,8 @@ impl LongRunningExecutor {
                     &workflow.inputs,
                     &init_artifacts,
                 );
-                if let Err(err) = self.run_phase(&init_workflow, init_inputs).await {
+                let extras = self.build_extras(&init_artifacts);
+                if let Err(err) = self.run_phase(&init_workflow, init_inputs, extras).await {
                     return Ok(RunStatus::Failed {
                         error: err.to_string(),
                     });
@@ -188,11 +194,15 @@ impl LongRunningExecutor {
             {
                 Ok(b) => b,
                 Err(err) => {
+                    let message = format!("bootstrap failed: {err}");
                     let mut runner = self.run_runner.lock().await;
-                    let _ = runner.end_session(&session_handle, SessionEndTrigger::UserExit);
-                    return Ok(RunStatus::Failed {
-                        error: format!("bootstrap failed: {err}"),
-                    });
+                    let _ = runner.end_session(
+                        &session_handle,
+                        SessionEndTrigger::Errored {
+                            message: message.clone(),
+                        },
+                    );
+                    return Ok(RunStatus::Failed { error: message });
                 }
             };
 
@@ -227,29 +237,56 @@ impl LongRunningExecutor {
                 .await;
 
             let exec_future =
-                run_engine_drain(Arc::clone(&self.engine), iter_workflow, iterate_inputs);
+                self.run_iterate_engine(iter_workflow, iterate_inputs, &init_artifacts);
 
             let exec_outcome = tokio::time::timeout(iterate.session_timeout, exec_future).await;
 
-            // Drain the watchdog channel non-blockingly to see whether
-            // it fired. If it did, the session ended on a Timeout.
-            let watchdog_fired = matches!(timeout_rx.try_recv(), Ok(SessionEndTrigger::Timeout));
-            let timeout_fired = exec_outcome.is_err() || watchdog_fired;
-            // If the steps returned an error (not a timeout), surface
-            // it as Failed rather than continuing.
-            if let Ok(Err(err)) = exec_outcome {
-                let mut runner = self.run_runner.lock().await;
-                runner.disarm_timeout_watchdog();
-                let _ = runner.end_session(&session_handle, SessionEndTrigger::UserExit);
-                return Ok(RunStatus::Failed {
-                    error: err.to_string(),
-                });
-            }
-
-            // Disarm the watchdog and end the session.
+            // Disarm the watchdog *before* draining the channel so the
+            // race window (watchdog fires after the engine returned
+            // cleanly but before we noticed) collapses. After this
+            // point the watchdog cannot deliver any more triggers.
             {
                 let mut runner = self.run_runner.lock().await;
                 runner.disarm_timeout_watchdog();
+            }
+
+            // The local `tokio::time::timeout` is the source of truth
+            // for whether the session timed out from the executor's
+            // perspective. The watchdog channel is checked only for
+            // diagnostic purposes — a stray watchdog event delivered
+            // *after* a clean engine completion is logged as a warning
+            // so the operator can spot misbehaving session-timeout
+            // configuration without it polluting the trigger
+            // attribution.
+            let timeout_fired = exec_outcome.is_err();
+            let watchdog_fired = matches!(timeout_rx.try_recv(), Ok(SessionEndTrigger::Timeout));
+            if watchdog_fired && !timeout_fired {
+                tracing::warn!(
+                    session_idx,
+                    "watchdog fired after engine completed cleanly; treating as benign race"
+                );
+            }
+
+            // If the steps returned an error (not a timeout), surface
+            // it as Failed rather than continuing.
+            if let Ok(Err(err)) = exec_outcome {
+                let message = err.to_string();
+                let mut runner = self.run_runner.lock().await;
+                let _ = runner.end_session(
+                    &session_handle,
+                    SessionEndTrigger::Errored {
+                        message: message.clone(),
+                    },
+                );
+                return Ok(RunStatus::Failed { error: message });
+            }
+
+            // End the session. The trigger attribution is `Timeout`
+            // only when the executor's own deadline fired; a stray
+            // watchdog event (handled above) does not promote a clean
+            // completion to a timeout.
+            {
+                let mut runner = self.run_runner.lock().await;
                 let trigger = if timeout_fired {
                     SessionEndTrigger::Timeout
                 } else {
@@ -279,12 +316,14 @@ impl LongRunningExecutor {
             let until_ctx = ExprContext::new(&inputs_value, &empty_steps, &Value::Null, &env)
                 .with_artifacts(&init_artifacts)
                 .with_artifact_resolver(&resolver);
-            let stop = expr::eval_bool(&iterate.until, &until_ctx).map_err(|e| {
-                WorkflowError::StepFailed {
-                    step_id: "iterate.until".to_owned(),
-                    message: e.to_string(),
+            let stop = match expr::eval_bool(&iterate.until, &until_ctx) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(RunStatus::Failed {
+                        error: format!("iterate.until: {e}"),
+                    });
                 }
-            })?;
+            };
             if stop {
                 return Ok(RunStatus::Completed);
             }
@@ -317,8 +356,8 @@ impl LongRunningExecutor {
         // empty bytes.
         let features_path = runner.features().path().to_path_buf();
         let init_path = runner.init_script().path().to_path_buf();
-        let features_json = read_or_default(&features_path, "{\"features\":[]}");
-        let init_script = read_or_default(&init_path, "#!/bin/sh\n");
+        let features_json = read_or_default(&features_path, "{\"features\":[]}")?;
+        let init_script = read_or_default(&init_path, "#!/bin/sh\n")?;
 
         let decision = tmg_harness::EscalationDecision::Escalate {
             reason: "mode: long_running forced harnessed scope".to_owned(),
@@ -335,21 +374,33 @@ impl LongRunningExecutor {
 
     /// Run a single phase (init or iterate) by delegating to the
     /// engine's standard `run` path.
+    ///
+    /// `extras` is forwarded to [`WorkflowEngine::run_with_extras`] so
+    /// step expressions inside the phase see the long-running
+    /// `${{ artifacts.* }}` / `${{ artifact.* }}` scopes. The progress
+    /// channel is drained synchronously inside the same future via
+    /// `tokio::join!` (no spawn-then-abort): the engine never blocks on
+    /// a slow consumer because the local drain runs concurrently, and
+    /// when the engine returns the receiver is closed which terminates
+    /// the drain naturally.
     async fn run_phase(
         &self,
         phase_workflow: &WorkflowDef,
         inputs: BTreeMap<String, Value>,
+        extras: EngineExtras,
     ) -> Result<()> {
         let (tx, mut rx) = mpsc::channel::<WorkflowProgress>(64);
-        // Spawn a drain task so the engine can keep emitting progress
-        // even when no UI is attached.
-        let drain = tokio::spawn(async move {
+        let cancel = CancellationToken::new();
+        let drain = async move {
             while rx.recv().await.is_some() {
                 // Discard for now; SPEC §8.10 wires this to the TUI.
             }
-        });
-        let _outputs = self.engine.run(phase_workflow, inputs, tx).await?;
-        drain.abort();
+        };
+        let exec = self
+            .engine
+            .run_with_extras(phase_workflow, inputs, tx, cancel, extras);
+        let (outcome, ()) = tokio::join!(exec, drain);
+        let _outputs = outcome?;
         Ok(())
     }
 
@@ -381,7 +432,8 @@ impl LongRunningExecutor {
                     let runner = self.run_runner.lock().await;
                     let workspace = runner.workspace_path_owned();
                     drop(runner);
-                    let output = run_shell_in(&workspace, &cmd).await?;
+                    let sandbox = self.engine.sandbox();
+                    let output = run_shell_in(&sandbox, &workspace, &cmd).await?;
                     let _ = writeln!(buf, "$ {cmd}");
                     let _ = writeln!(buf, "{}", output.trim_end());
                 }
@@ -404,8 +456,22 @@ impl LongRunningExecutor {
                     }
                 }
                 BootstrapItem::SmokeTest(step) => {
-                    let summary = self.run_smoke_test(step, inputs).await?;
-                    let _ = writeln!(buf, "# smoke_test: {summary}");
+                    let outcome = self.run_smoke_test(step, inputs).await?;
+                    let _ = writeln!(buf, "# smoke_test: {summary}", summary = outcome.summary);
+                    if !outcome.passed {
+                        // SPEC §8.12: a failing smoke_test surfaces as
+                        // a workflow error so the operator (and the
+                        // `until` expression — which can react to the
+                        // bootstrap_context string) can distinguish a
+                        // green session from a flagged-as-broken one.
+                        return Err(WorkflowError::StepFailed {
+                            step_id: step.id().to_owned(),
+                            message: format!(
+                                "smoke_test failed: {summary}",
+                                summary = outcome.summary
+                            ),
+                        });
+                    }
                 }
             }
         }
@@ -413,12 +479,38 @@ impl LongRunningExecutor {
     }
 
     /// Dispatch a single smoke-test step through a one-shot synthetic
-    /// workflow and return a short summary string.
+    /// workflow and return a [`SmokeTestOutcome`] summary.
+    ///
+    /// ## Shared resources
+    ///
+    /// The smoke-test step runs through the same [`WorkflowEngine`]
+    /// instance as the iterate phase and therefore competes for the
+    /// engine's `agent_semaphore` (the cap configured by
+    /// `[workflow] max_parallel_agents`). For shell-typed smoke tests
+    /// this is irrelevant — `shell` and `write_file` steps don't take
+    /// a permit. For agent-typed smoke tests, however, an in-flight
+    /// iterate-phase agent step would block the smoke test until it
+    /// drops its permit (and vice versa).
+    ///
+    /// `convert_bootstrap_item` rejects non-shell `smoke_test` step types
+    /// at parse time so the contention question never arises in
+    /// practice; this docs section is here so the constraint is
+    /// surfaced if the rejection is ever relaxed.
+    ///
+    /// ## Error propagation
+    ///
+    /// Engine-level failures (parse / validation / runtime) and
+    /// non-zero process exits both flow back as
+    /// `outcome.passed == false` with a descriptive `summary`. The
+    /// caller (`resolve_bootstrap`) maps a failed outcome to a
+    /// [`WorkflowError::StepFailed`] so the iterate session ends with
+    /// `RunStatus::Failed` instead of a silently-broken bootstrap
+    /// context.
     async fn run_smoke_test(
         &self,
         step: &StepDef,
         inputs: &BTreeMap<String, Value>,
-    ) -> Result<String> {
+    ) -> Result<SmokeTestOutcome> {
         let phase = synthesize_phase_workflow(
             "smoke_test",
             "smoke_test",
@@ -428,7 +520,7 @@ impl LongRunningExecutor {
         );
         let (tx, mut rx) = mpsc::channel::<WorkflowProgress>(32);
         let id = step.id().to_owned();
-        let drain = tokio::spawn(async move {
+        let drain = async {
             // Capture a one-line summary from the StepCompleted event.
             let mut last_exit: Option<i32> = None;
             while let Some(evt) = rx.recv().await {
@@ -439,16 +531,22 @@ impl LongRunningExecutor {
                 }
             }
             last_exit
-        });
-        let outcome = self.engine.run(&phase, inputs.clone(), tx).await;
-        let exit = drain.await.unwrap_or(None);
+        };
+        let exec = self.engine.run(&phase, inputs.clone(), tx);
+        let (outcome, exit) = tokio::join!(exec, drain);
         match outcome {
-            Ok(_) => Ok(format!(
-                "{step_id} exit={exit}",
-                step_id = step.id(),
-                exit = exit.map_or_else(|| "?".to_owned(), |c| c.to_string()),
-            )),
-            Err(e) => Ok(format!("{step_id} ERROR: {e}", step_id = step.id())),
+            Ok(_) => {
+                let exit_code = exit.unwrap_or(-1);
+                let passed = exit_code == 0;
+                Ok(SmokeTestOutcome {
+                    summary: format!("{step_id} exit={exit_code}", step_id = step.id()),
+                    passed,
+                })
+            }
+            Err(e) => Ok(SmokeTestOutcome {
+                summary: format!("{step_id} ERROR: {e}", step_id = step.id()),
+                passed: false,
+            }),
         }
     }
 
@@ -458,24 +556,55 @@ impl LongRunningExecutor {
         let mut runner = self.run_runner.lock().await;
         runner.arm_session_timeout_watchdog(duration, tx);
     }
-}
 
-/// Run the workflow engine and drain the progress channel locally so
-/// the engine stays unblocked even when no UI is attached.
-async fn run_engine_drain(
-    engine: Arc<WorkflowEngine>,
-    workflow: WorkflowDef,
-    inputs: BTreeMap<String, Value>,
-) -> Result<crate::def::WorkflowOutputs> {
-    let (tx, mut rx) = mpsc::channel::<WorkflowProgress>(64);
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let outputs = engine.run(&workflow, inputs, tx).await?;
-    drain.abort();
-    Ok(outputs)
+    /// Build an [`EngineExtras`] bundle that exposes the run's
+    /// artifacts and a live `artifact.*` resolver. Used by both init
+    /// and iterate phases so any inner step expression can read
+    /// `${{ artifacts.<name> }}` / `${{ artifact.<name>.<method> }}`.
+    fn build_extras(&self, artifacts: &BTreeMap<String, PathBuf>) -> EngineExtras {
+        let resolver: Arc<dyn ArtifactResolver> = Arc::new(RunRunnerArtifactResolver {
+            runner: Arc::clone(&self.run_runner),
+        });
+        EngineExtras {
+            artifacts: Some(Arc::new(artifacts.clone())),
+            artifact_resolver: Some(resolver),
+        }
+    }
+
+    /// Drive the engine for one iterate-phase session.
+    ///
+    /// Drains the progress channel locally so the engine never blocks
+    /// on a slow UI; uses the same `tokio::join!` pattern as
+    /// [`Self::run_phase`] (no spawn-then-abort).
+    async fn run_iterate_engine(
+        &self,
+        workflow: WorkflowDef,
+        inputs: BTreeMap<String, Value>,
+        artifacts: &BTreeMap<String, PathBuf>,
+    ) -> Result<crate::def::WorkflowOutputs> {
+        let (tx, mut rx) = mpsc::channel::<WorkflowProgress>(64);
+        let cancel = CancellationToken::new();
+        let extras = self.build_extras(artifacts);
+        let drain = async move { while rx.recv().await.is_some() {} };
+        let exec = self
+            .engine
+            .run_with_extras(&workflow, inputs, tx, cancel, extras);
+        let (outcome, ()) = tokio::join!(exec, drain);
+        outcome
+    }
 }
 
 /// Synthesize a single-phase [`WorkflowDef`] from `steps` so the
 /// engine's existing `run()` path can drive it.
+///
+/// `artifacts` is *not* embedded in the synthesized workflow: the
+/// `${{ artifacts.* }}` / `${{ artifact.* }}` scopes are wired in
+/// separately via the [`EngineExtras`] passed to
+/// [`WorkflowEngine::run_with_extras`]. We still accept the parameter
+/// here so the call site reads symmetrically with the parent
+/// workflow's artifact map; future grammar additions (e.g. embedding
+/// init artifacts in `WorkflowMeta`) can plug into this without
+/// reshuffling callers.
 fn synthesize_phase_workflow(
     parent_id: &str,
     phase: &str,
@@ -498,18 +627,42 @@ fn synthesize_phase_workflow(
     }
 }
 
+/// Outcome of a single smoke-test bootstrap step.
+struct SmokeTestOutcome {
+    /// One-line summary embedded into the bootstrap context block.
+    summary: String,
+    /// Whether the test passed (exit code 0 for shell-typed steps).
+    passed: bool,
+}
+
 /// Bridge a [`tmg_harness::RunRunner`] into the [`ArtifactResolver`]
 /// trait, exposing the run-level data sources to the expression
 /// evaluator.
 ///
 /// Currently supported `tail` values:
 ///
-/// - `features.all_passing` → bool (vacuously true on an empty list).
+/// - `features.all_passing` → bool. **An empty feature list is rejected
+///   as an error**, not treated as vacuously true. This is critical for
+///   long-running workflows: an iterate-phase `until:
+///   artifact.features.all_passing` against an empty `features.json`
+///   would otherwise complete the run on the very first session before
+///   any work happens. The init phase is expected to populate
+///   `features.json` with the work to do; if it didn't, the iterate
+///   phase must surface that as a workflow authoring error.
 /// - `features.passing_count` → integer.
 ///
 /// Unknown tails return a clear error message that lists the known
 /// names. To extend: add another arm in `resolve` and document it
 /// here.
+///
+/// ## Concurrent access
+///
+/// The resolver is invoked from the synchronous expression-evaluation
+/// path while the executor temporarily releases the `Mutex<RunRunner>`.
+/// In rare contended cases (e.g. a parallel agent step racing the
+/// `until` evaluator), `try_lock` returns an error and `resolve` reports
+/// it back to the caller. Callers that re-evaluate `until` shortly
+/// after typically resolve the contention naturally.
 struct RunRunnerArtifactResolver {
     runner: Arc<Mutex<RunRunner>>,
 }
@@ -524,15 +677,30 @@ impl ArtifactResolver for RunRunnerArtifactResolver {
         let guard = self.runner.try_lock().map_err(|_| {
             WorkflowError::expression(
                 "could not acquire RunRunner lock for artifact.* resolution; \
-                 the long_running executor releases the lock before evaluating expressions",
+                 the long_running executor releases the lock before evaluating \
+                 expressions, but a concurrent step may have re-acquired it. \
+                 Re-evaluation on the next iteration typically succeeds.",
             )
         })?;
         match tail {
             "features.all_passing" => {
-                let v = guard
+                // Reject empty feature lists explicitly. SPEC §8.12
+                // expects long-running workflows to declare their
+                // backlog in `features.json`; an empty file means the
+                // init phase failed to produce one and the iterate
+                // loop has nothing to drive.
+                let parsed = guard
                     .features()
-                    .all_passing()
+                    .read()
                     .map_err(|e| WorkflowError::expression(format!("features.all_passing: {e}")))?;
+                if parsed.features.is_empty() {
+                    return Err(WorkflowError::expression(
+                        "artifact.features.all_passing: no features declared yet \
+                         (features.json is empty); the init phase must populate \
+                         the feature list before the iterate phase can complete",
+                    ));
+                }
+                let v = parsed.features.iter().all(|f| f.passes);
                 Ok(json!(v))
             }
             "features.passing_count" => {
@@ -557,27 +725,52 @@ fn map_to_obj(map: &BTreeMap<String, Value>) -> serde_json::Map<String, Value> {
     map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
-/// Run a shell command in `workspace` and return combined stdout/stderr.
-async fn run_shell_in(workspace: &Path, cmd: &str) -> Result<String> {
-    let output = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(workspace)
-        .output()
+/// Run a shell command via the engine's [`SandboxContext`] and return
+/// combined stdout/stderr.
+///
+/// Routing through the sandbox layer means bootstrap commands inherit
+/// the same Landlock filesystem rules, command timeout, and OOM-score
+/// adjustment as `shell` steps elsewhere in the workflow. The
+/// `_workspace` parameter is documented for API symmetry; the sandbox
+/// itself was constructed with the workspace path and `sh -c` runs in
+/// the inherited cwd of the parent process (which the harness wires to
+/// the workspace).
+async fn run_shell_in(sandbox: &SandboxContext, _workspace: &Path, cmd: &str) -> Result<String> {
+    let output = sandbox
+        .run_command(cmd)
         .await
-        .map_err(|e| WorkflowError::io(format!("running bootstrap command '{cmd}'"), e))?;
-    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        .map_err(WorkflowError::from)?;
+    let success = output.success();
+    let exit_code = output.exit_code;
+    let mut combined = output.stdout;
     if !output.stderr.is_empty() {
         combined.push_str("\n--- stderr ---\n");
-        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        combined.push_str(&output.stderr);
+    }
+    if !success {
+        let _ = writeln!(combined, "\n--- exit code ---\n{exit_code}");
     }
     Ok(combined)
 }
 
 /// Read a file or fall back to a default literal when the file is
-/// missing / unreadable.
-fn read_or_default(path: &Path, fallback: &str) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|_| fallback.to_owned())
+/// missing.
+///
+/// `NotFound` is the only I/O error we translate to the fallback —
+/// every other error (permission denied, invalid UTF-8, etc.) is
+/// propagated as a [`WorkflowError::Io`]. This avoids the silent-clobber
+/// hazard the previous swallow-all behaviour created: an unreadable
+/// existing `features.json` would otherwise be replaced with the
+/// fallback contents during the harness escalation step.
+fn read_or_default(path: &Path, fallback: &str) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(fallback.to_owned()),
+        Err(e) => Err(WorkflowError::io(
+            format!("read_or_default: {}", path.display()),
+            e,
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -620,5 +813,31 @@ mod tests {
         assert_eq!(wf.id, "build_app__init");
         assert_eq!(wf.mode, WorkflowMode::Normal);
         assert_eq!(wf.steps.len(), 1);
+    }
+
+    /// PR #66 review fix #9: `read_or_default` returns the fallback
+    /// only for `NotFound`; any other I/O error propagates.
+    #[test]
+    fn read_or_default_returns_fallback_for_missing_file() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let missing = dir.path().join("nope.txt");
+        let body = read_or_default(&missing, "fallback").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(body, "fallback");
+    }
+
+    /// PR #66 review fix #9: a path that points at a *directory* (not a
+    /// regular file) is not `NotFound`, so the function must propagate
+    /// the I/O error rather than silently returning the fallback.
+    #[test]
+    fn read_or_default_propagates_non_not_found_errors() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        // Reading a directory as a string returns IsADirectory /
+        // InvalidInput depending on the platform — either way it's
+        // *not* `NotFound`, which is exactly what we want to test.
+        let result = read_or_default(dir.path(), "fallback");
+        assert!(
+            matches!(result, Err(WorkflowError::Io { .. })),
+            "expected propagated I/O error, got {result:?}"
+        );
     }
 }

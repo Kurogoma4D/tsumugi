@@ -354,7 +354,14 @@ impl StepDef {
 }
 
 /// A fully-validated workflow definition.
+///
+/// Marked `#[non_exhaustive]` because future SPEC additions are
+/// expected to grow optional fields (e.g. per-workflow telemetry tags).
+/// External crates must use [`WorkflowDef::new`] (and the builder
+/// methods) instead of struct literals so growing the struct is not a
+/// breaking change.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct WorkflowDef {
     /// Unique workflow identifier (snake_case-ish).
     pub id: String,
@@ -384,6 +391,77 @@ pub struct WorkflowDef {
     /// [`IteratePhase::steps`], and evaluates [`IteratePhase::until`]
     /// to decide whether to stop.
     pub iterate: Option<IteratePhase>,
+}
+
+impl WorkflowDef {
+    /// Build a new [`WorkflowDef`] with default fields.
+    ///
+    /// All optional fields (`description`, `mode`, `inputs`, `steps`,
+    /// `outputs`, `init`, `iterate`) start empty. Use the builder
+    /// methods or direct field assignment (within the crate) to
+    /// populate them.
+    #[must_use]
+    pub fn new(id: String) -> Self {
+        Self {
+            id,
+            description: None,
+            mode: WorkflowMode::Normal,
+            inputs: BTreeMap::new(),
+            steps: Vec::new(),
+            outputs: BTreeMap::new(),
+            init: None,
+            iterate: None,
+        }
+    }
+
+    /// Set the workflow's [`WorkflowMode`].
+    #[must_use]
+    pub fn with_mode(mut self, mode: WorkflowMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Set the workflow description.
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Set the workflow's input declarations.
+    #[must_use]
+    pub fn with_inputs(mut self, inputs: BTreeMap<String, InputDef>) -> Self {
+        self.inputs = inputs;
+        self
+    }
+
+    /// Set the workflow's top-level steps.
+    #[must_use]
+    pub fn with_steps(mut self, steps: Vec<StepDef>) -> Self {
+        self.steps = steps;
+        self
+    }
+
+    /// Set the workflow's output templates.
+    #[must_use]
+    pub fn with_outputs(mut self, outputs: BTreeMap<String, String>) -> Self {
+        self.outputs = outputs;
+        self
+    }
+
+    /// Attach an `init:` phase.
+    #[must_use]
+    pub fn with_init(mut self, init: InitPhase) -> Self {
+        self.init = Some(init);
+        self
+    }
+
+    /// Attach an `iterate:` phase.
+    #[must_use]
+    pub fn with_iterate(mut self, iterate: IteratePhase) -> Self {
+        self.iterate = Some(iterate);
+        self
+    }
 }
 
 /// `init:` phase configuration for a `mode: long_running` workflow.
