@@ -1,4 +1,4 @@
-//! Linux-specific sandbox implementation using Landlock and network namespaces.
+//! Linux Landlock filesystem restriction.
 //!
 //! This module is only compiled on `target_os = "linux"`.
 
@@ -104,53 +104,6 @@ fn add_path_rule(
         })?;
 
     Ok(ruleset)
-}
-
-/// Create a new network namespace using `unshare(CLONE_NEWNET)`.
-///
-/// After this call, the current process has its own empty network
-/// namespace with only a loopback interface. All network access is
-/// blocked unless iptables rules are subsequently added.
-///
-/// # Errors
-///
-/// Returns [`SandboxError::NetworkNamespace`] if the `unshare` syscall fails
-/// (e.g., due to insufficient privileges).
-///
-/// # Safety
-///
-/// Calls `libc::unshare(CLONE_NEWNET)` which is safe to call but modifies
-/// the process's network namespace. This is an irreversible operation for
-/// the current process.
-#[expect(
-    unsafe_code,
-    reason = "FFI call to libc::unshare for network namespace isolation"
-)]
-pub fn create_network_namespace() -> Result<(), SandboxError> {
-    // SAFETY: `unshare(CLONE_NEWNET)` is a Linux syscall that creates a new
-    // network namespace for the calling process. It does not access any memory
-    // unsafely; it only modifies kernel-level namespace state. The return value
-    // is checked for errors.
-    let ret = unsafe { libc::unshare(libc::CLONE_NEWNET) };
-    if ret != 0 {
-        return Err(SandboxError::NetworkNamespace {
-            source: std::io::Error::last_os_error(),
-        });
-    }
-    Ok(())
-}
-
-/// Adjust the OOM score for a given process.
-///
-/// Writes to `/proc/{pid}/oom_score_adj` to influence the kernel's
-/// OOM killer behavior.
-///
-/// # Errors
-///
-/// Returns [`SandboxError::OomAdjust`] if the write fails.
-pub fn adjust_oom_score(pid: u32, score: i32) -> Result<(), SandboxError> {
-    let path = format!("/proc/{pid}/oom_score_adj");
-    std::fs::write(&path, score.to_string()).map_err(|e| SandboxError::OomAdjust { source: e })
 }
 
 /// Get the tsumugi configuration directory path.

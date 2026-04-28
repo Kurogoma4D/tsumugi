@@ -54,8 +54,9 @@ pub mod mode;
 mod platform;
 pub mod process;
 
-pub use config::SandboxConfig;
+pub use config::{NetworkConfig, SandboxConfig};
 pub use context::SandboxContext;
 pub use error::SandboxError;
 pub use mode::SandboxMode;
+pub use platform::NetworkAcl;
 pub use process::CommandOutput;

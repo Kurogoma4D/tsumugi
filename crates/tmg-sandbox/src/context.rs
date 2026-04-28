@@ -70,8 +70,11 @@ impl SandboxContext {
     ///
     /// On Linux, this:
     /// 1. Applies Landlock filesystem rules
-    /// 2. Creates an isolated network namespace that blocks all external
-    ///    network access
+    /// 2. Creates an isolated network namespace via
+    ///    `unshare(CLONE_NEWNET)`
+    /// 3. If `allowed_domains` is non-empty, brings up loopback in the
+    ///    netns, resolves each domain, and installs an `iptables`
+    ///    ACCEPT/DROP rule chain that permits only the resolved IPs
     ///
     /// On non-Linux platforms, this emits warnings and returns `Ok(())`.
     ///
@@ -84,19 +87,24 @@ impl SandboxContext {
     /// empty network namespace via `unshare(CLONE_NEWNET)`. The new namespace
     /// contains only a loopback interface with no external connectivity.
     ///
-    /// The `allowed_domains` configuration field is accepted but **not yet
-    /// enforced** -- selective domain allowlisting requires veth pair setup
-    /// or Landlock v4+ network access rules, which are planned for future
-    /// work. Currently, when any network restriction is active, **all**
-    /// external network access is blocked.
+    /// When `allowed_domains` (legacy top-level field or
+    /// `[sandbox.network]`) is non-empty, the agent additionally
+    /// installs an `iptables` ACL inside the netns. Only outbound
+    /// traffic to the resolved IPs (plus DNS on port 53 and loopback)
+    /// is allowed; everything else hits the default `DROP` policy.
+    ///
+    /// `iptables` requires `CAP_NET_ADMIN`. When the capability is
+    /// missing, behavior depends on
+    /// [`NetworkConfig::strict`](crate::config::NetworkConfig::strict):
+    ///
+    /// - `strict = true`: activation fails with
+    ///   [`SandboxError::NetworkAcl`].
+    /// - `strict = false` (the default): a warning is emitted and the
+    ///   agent continues with no network restriction.
     ///
     /// # Errors
     ///
     /// Returns [`SandboxError`] if any OS-level restriction fails to apply.
-    #[expect(
-        clippy::unused_async,
-        reason = "kept async for API stability; future network allowlist implementation will require async"
-    )]
     pub async fn activate(&self) -> Result<(), SandboxError> {
         // Use `SeqCst` for the load/store pair so the "first activator
         // wins" check is sequentially consistent with the activation
@@ -117,11 +125,77 @@ impl SandboxContext {
         platform::apply_landlock(&self.config)?;
 
         // Apply network restrictions: create an empty network namespace
-        // that blocks all external connectivity.
-        platform::create_network_namespace()?;
+        // that blocks all external connectivity, then optionally install
+        // an iptables ACL inside it for the configured allowed domains.
+        self.activate_network().await?;
 
         self.activated.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Apply the network restriction phase of [`activate`](Self::activate).
+    ///
+    /// Splits out so the activation path stays linear. The behavior is:
+    ///
+    /// 1. Always create an empty netns (existing behavior).
+    /// 2. If `effective_allowed_domains` is empty, stop here -- the
+    ///    netns alone already blocks all outbound traffic.
+    /// 3. Otherwise, attempt to install the iptables ACL. On
+    ///    `CAP_NET_ADMIN` failure: respect `strict` to decide whether
+    ///    to error or fall back with a warning.
+    async fn activate_network(&self) -> Result<(), SandboxError> {
+        platform::create_network_namespace()?;
+
+        let domains = self.config.effective_allowed_domains();
+        if domains.is_empty() {
+            // No allowlist configured: the netns alone blocks
+            // everything (no veth, no default route). The historical
+            // behavior is preserved exactly.
+            return Ok(());
+        }
+
+        // Capability gate: on Linux we can detect CAP_NET_ADMIN absence
+        // up front and respect the operator's `strict` toggle. On
+        // non-Linux platforms `has_cap_net_admin` returns `false`, but
+        // the platform `apply_network_acl` is itself a no-op, so the
+        // net effect of the strict / non-strict branches is the same.
+        if !platform::has_cap_net_admin() {
+            if self.config.network_strict() {
+                return Err(SandboxError::NetworkAcl {
+                    reason: "CAP_NET_ADMIN is required to install iptables rules but is not held \
+                             by this process; set `[sandbox.network] strict = false` to fall \
+                             back to no network restriction"
+                        .to_owned(),
+                });
+            }
+            emit_capability_warning();
+            return Ok(());
+        }
+
+        // Best-effort: bring loopback up so locally-bound services keep
+        // working. Failure here is not fatal in non-strict mode.
+        if let Err(e) = platform::bring_up_loopback() {
+            if self.config.network_strict() {
+                return Err(e);
+            }
+            emit_loopback_warning(&e);
+        }
+
+        // Install the ACL. In strict mode, propagate any error; in
+        // non-strict mode, downgrade to a warning so the agent keeps
+        // working with whatever rules made it in (the netns itself
+        // still blocks outbound by default).
+        match platform::apply_network_acl(&domains).await {
+            Ok(_acl) => Ok(()),
+            Err(e) => {
+                if self.config.network_strict() {
+                    Err(e)
+                } else {
+                    emit_acl_warning(&e);
+                    Ok(())
+                }
+            }
+        }
     }
 
     /// Check whether a given path is accessible under the current sandbox mode.
@@ -444,6 +518,45 @@ fn tsumugi_config_dir() -> Option<PathBuf> {
         path.push("tsumugi");
         path
     })
+}
+
+/// Emit a warning to stderr explaining that network ACL enforcement is
+/// being skipped because `CAP_NET_ADMIN` is missing.
+#[expect(
+    clippy::print_stderr,
+    reason = "intentional warning when falling back from network ACL enforcement"
+)]
+fn emit_capability_warning() {
+    eprintln!(
+        "[tmg-sandbox] WARNING: CAP_NET_ADMIN is missing; allowed_domains will not be enforced. \
+         Set `[sandbox.network] strict = true` to fail closed instead."
+    );
+}
+
+/// Emit a warning to stderr when bringing up loopback inside the netns
+/// fails but the operator opted out of strict enforcement.
+#[expect(
+    clippy::print_stderr,
+    reason = "intentional warning when loopback bring-up fails in non-strict mode"
+)]
+fn emit_loopback_warning(err: &SandboxError) {
+    eprintln!(
+        "[tmg-sandbox] WARNING: failed to bring loopback up inside netns ({err}); \
+         continuing with network ACL anyway"
+    );
+}
+
+/// Emit a warning to stderr when iptables installation fails but the
+/// operator opted out of strict enforcement.
+#[expect(
+    clippy::print_stderr,
+    reason = "intentional warning when iptables ACL fails in non-strict mode"
+)]
+fn emit_acl_warning(err: &SandboxError) {
+    eprintln!(
+        "[tmg-sandbox] WARNING: failed to install network ACL ({err}); \
+         the netns still blocks outbound traffic but no domain-specific allowlist is active"
+    );
 }
 
 #[cfg(test)]
