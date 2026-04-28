@@ -32,6 +32,81 @@ async fn activate_with_allowed_domains_non_strict_does_not_fail() {
     assert!(res.is_ok(), "activate failed in Full mode: {res:?}");
 }
 
+/// Non-strict mode must not propagate netns-creation failures from
+/// `activate`. `unshare(CLONE_NEWNET)` requires `CAP_SYS_ADMIN`, which
+/// rootless CI environments typically lack; without this guarantee the
+/// documented "warn and continue" contract for `strict = false` would
+/// silently regress to a hard activation failure.
+///
+/// On macOS / non-Linux platforms `create_network_namespace` is a
+/// warning-only no-op, so this test passes trivially. On Linux without
+/// `CAP_SYS_ADMIN` the new `try_create_netns` helper kicks in: the
+/// `unshare` failure is downgraded to a warning and `activate` returns
+/// `Ok(())`. On Linux *with* `CAP_SYS_ADMIN` the test still passes
+/// because the netns is created cleanly and the iptables ACL succeeds
+/// (or is skipped with a warning if `iptables` is missing).
+#[tokio::test]
+async fn activate_non_strict_tolerates_netns_failure() {
+    // Use a non-Full mode so `activate` actually runs the network
+    // phase. ReadOnly avoids any Landlock workspace mutation.
+    let tempdir = std::env::temp_dir();
+    let mut config = SandboxConfig::new(&tempdir).with_mode(SandboxMode::ReadOnly);
+    // Empty allowed_domains exercises the "no allowlist" branch which
+    // historically bare-`?`-propagated `create_network_namespace`.
+    // This is the regression path the round-2 review flagged.
+    config.network.strict = false;
+
+    let ctx = SandboxContext::new(config);
+    let res = ctx.activate().await;
+    // Accept the Landlock failure path (kernel support / unprivileged
+    // user-namespace policy may block it before the network phase) but
+    // reject any NetworkNamespace error in non-strict mode.
+    assert!(
+        non_strict_activate_outcome_is_acceptable(&res),
+        "non-strict mode must not propagate NetworkNamespace errors from activate; \
+         got: {res:?}",
+    );
+}
+
+/// Same regression guard as `activate_non_strict_tolerates_netns_failure`,
+/// but with a non-empty `allowed_domains`. This exercises the no-cap
+/// fallback branch (`!has_cap_net_admin`) which also goes through
+/// `try_create_netns`.
+#[tokio::test]
+async fn activate_non_strict_with_domains_tolerates_netns_failure() {
+    let tempdir = std::env::temp_dir();
+    let mut config = SandboxConfig::new(&tempdir)
+        .with_mode(SandboxMode::ReadOnly)
+        .with_allowed_domains(vec!["example.com".to_owned()]);
+    config.network.strict = false;
+
+    let ctx = SandboxContext::new(config);
+    let res = ctx.activate().await;
+    assert!(
+        non_strict_activate_outcome_is_acceptable(&res),
+        "non-strict mode must not propagate NetworkNamespace errors from activate; \
+         got: {res:?}",
+    );
+}
+
+/// Decide whether an `activate()` result is acceptable under the
+/// "non-strict netns may degrade" contract.
+///
+/// Returns `true` when:
+/// - activation succeeded, **or**
+/// - it failed with [`SandboxError::Landlock`] (a separate, pre-network
+///   concern that this regression test is not scoped to).
+///
+/// Returns `false` when activation failed with
+/// [`SandboxError::NetworkNamespace`] (the regression we are guarding
+/// against) or any other unexpected error.
+fn non_strict_activate_outcome_is_acceptable(res: &Result<(), tmg_sandbox::SandboxError>) -> bool {
+    match res {
+        Ok(()) | Err(tmg_sandbox::SandboxError::Landlock { .. }) => true,
+        Err(_) => false,
+    }
+}
+
 /// `effective_allowed_domains` correctly merges the legacy top-level
 /// field with `[sandbox.network]`.
 #[test]

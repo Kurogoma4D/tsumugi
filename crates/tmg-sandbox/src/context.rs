@@ -155,8 +155,11 @@ impl SandboxContext {
         if domains.is_empty() {
             // No allowlist configured: the netns alone blocks
             // everything (no veth, no default route). The historical
-            // behavior is preserved exactly.
-            platform::create_network_namespace()?;
+            // behavior is preserved exactly, with the exception that
+            // netns creation failures now respect `strict` -- in
+            // non-strict mode a warning is emitted and the agent
+            // proceeds without network restriction.
+            self.try_create_netns()?;
             return Ok(());
         }
 
@@ -178,8 +181,12 @@ impl SandboxContext {
             emit_capability_warning();
             // We still want the netns isolation even when we can't
             // install per-IP rules, because an empty netns blocks
-            // outbound by default. Fall through and create it.
-            platform::create_network_namespace()?;
+            // outbound by default. Try to create it -- but gracefully
+            // degrade if even the netns cannot be created (e.g.
+            // rootless CI lacking `CAP_SYS_ADMIN`). Whether the netns
+            // came up or not, there is nothing more to do for the ACL
+            // path here, so return either way.
+            self.try_create_netns()?;
             return Ok(());
         }
 
@@ -194,17 +201,23 @@ impl SandboxContext {
                 }
                 emit_resolve_warning(&e);
                 // Fall back to "empty netns + nothing else": still
-                // create the namespace so outbound is blocked, but
-                // skip the per-IP rules entirely.
-                platform::create_network_namespace()?;
+                // try to create the namespace so outbound is blocked,
+                // but skip the per-IP rules entirely. Honour `strict`
+                // for netns creation too.
+                self.try_create_netns()?;
                 return Ok(());
             }
         };
 
         // Step 2: enter the empty netns. After this point the process
         // has no external connectivity until the iptables ACCEPT rules
-        // are installed.
-        platform::create_network_namespace()?;
+        // are installed. If netns creation itself fails in non-strict
+        // mode, there is no point trying loopback or iptables -- the
+        // process is still in the host netns, so any "ACL" we try to
+        // install would silently affect the host. Bail out cleanly.
+        if !self.try_create_netns()? {
+            return Ok(());
+        }
 
         // Step 3: best-effort loopback bring-up. Failure here is not
         // fatal in non-strict mode -- it only affects services that
@@ -229,6 +242,35 @@ impl SandboxContext {
                     emit_acl_warning(&e);
                     Ok(())
                 }
+            }
+        }
+    }
+
+    /// Attempt to create a new empty network namespace, honouring the
+    /// `[sandbox.network] strict` toggle on failure.
+    ///
+    /// Returns:
+    ///
+    /// - `Ok(true)` when the namespace was created successfully and
+    ///   subsequent loopback / iptables steps may proceed.
+    /// - `Ok(false)` when creation failed and `strict = false`. A
+    ///   warning is emitted and the caller should treat the network
+    ///   restriction phase as a no-op (the process remains in the host
+    ///   netns).
+    /// - `Err(_)` when creation failed and `strict = true`.
+    ///
+    /// `unshare(CLONE_NEWNET)` requires `CAP_SYS_ADMIN` (not
+    /// `CAP_NET_ADMIN`). Rootless CI environments often hold neither,
+    /// so without this fallback the documented "warn and continue"
+    /// behaviour for `strict = false` would silently regress into a
+    /// hard activation failure.
+    fn try_create_netns(&self) -> Result<bool, SandboxError> {
+        match platform::create_network_namespace() {
+            Ok(()) => Ok(true),
+            Err(e) if self.config.network_strict() => Err(e),
+            Err(e) => {
+                emit_netns_warning(&e);
+                Ok(false)
             }
         }
     }
@@ -612,6 +654,26 @@ fn emit_resolve_warning(err: &SandboxError) {
     eprintln!(
         "[tmg-sandbox] WARNING: failed to resolve any allowed domain ({err}); \
          falling back to an empty netns -- outbound is blocked, no allowlist is active"
+    );
+}
+
+/// Emit a warning to stderr when `unshare(CLONE_NEWNET)` fails but the
+/// operator opted out of strict enforcement.
+///
+/// Network namespace creation requires `CAP_SYS_ADMIN`. Rootless CI
+/// environments and many containerised setups lack this capability.
+/// In strict mode the failure is propagated as an error; in non-strict
+/// mode the agent continues in the host network namespace with no
+/// netns-level restriction, so this warning is the only signal the
+/// operator gets that the sandbox is degraded.
+#[expect(
+    clippy::print_stderr,
+    reason = "intentional warning when network namespace creation fails in non-strict mode"
+)]
+fn emit_netns_warning(err: &SandboxError) {
+    eprintln!(
+        "[tmg-sandbox] WARNING: failed to create network namespace ({err}); \
+         continuing without network restriction (strict = false)"
     );
 }
 
