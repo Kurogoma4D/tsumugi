@@ -1469,6 +1469,7 @@ mod tests {
         // not own).
         let mut sink = HarnessStreamSink::new(NullSink, Arc::clone(&runner));
         sink.on_tool_result(
+            "call_1",
             "file_write",
             "Successfully wrote 5 bytes to '/tmp/hot.rs'",
             false,
@@ -1535,6 +1536,7 @@ mod tests {
 
         let mut sink = HarnessStreamSink::new(NullSink, Arc::clone(&runner));
         sink.on_tool_result(
+            "call_1",
             "file_write",
             "Successfully wrote 1 bytes to '/tmp/a.rs'",
             false,
@@ -1560,6 +1562,7 @@ mod tests {
 
         // Append a new file via the sink.
         sink.on_tool_result(
+            "call_2",
             "file_write",
             "Successfully wrote 2 bytes to '/tmp/b.rs'",
             false,

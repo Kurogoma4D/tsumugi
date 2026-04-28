@@ -23,6 +23,15 @@ use crate::diff::DiffPreview;
 /// [`crate::app::ToolActivityEntry`].
 #[derive(Debug, Clone)]
 pub struct ToolActivityEntry {
+    /// Unique LLM-issued tool-call identifier. Used to pair a `ToolCall`
+    /// activity entry with the matching `ToolResult` /
+    /// `ToolResultCompressed` entries even when concurrent calls of
+    /// the same `tool_name` interleave (issue #49 review #6).
+    ///
+    /// Empty when the entry was created from a path that did not carry
+    /// a call id (currently no such path exists; reserved for forward
+    /// compatibility).
+    pub call_id: String,
     /// Tool name.
     pub tool_name: String,
     /// Display summary (call params or truncated result).

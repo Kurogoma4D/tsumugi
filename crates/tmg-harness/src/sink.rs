@@ -75,15 +75,21 @@ impl<S: StreamSink> StreamSink for HarnessStreamSink<S> {
         self.inner.on_done()
     }
 
-    fn on_tool_call(&mut self, name: &str, arguments: &str) -> Result<(), CoreError> {
+    fn on_tool_call(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        arguments: &str,
+    ) -> Result<(), CoreError> {
         self.with_active_session(|s| {
             s.tool_calls_count = s.tool_calls_count.saturating_add(1);
         });
-        self.inner.on_tool_call(name, arguments)
+        self.inner.on_tool_call(call_id, name, arguments)
     }
 
     fn on_tool_result(
         &mut self,
+        call_id: &str,
         name: &str,
         output: &str,
         is_error: bool,
@@ -102,7 +108,17 @@ impl<S: StreamSink> StreamSink for HarnessStreamSink<S> {
                 }
             });
         }
-        self.inner.on_tool_result(name, output, is_error)
+        self.inner.on_tool_result(call_id, name, output, is_error)
+    }
+
+    fn on_tool_result_compressed(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        symbol_count: usize,
+    ) -> Result<(), CoreError> {
+        self.inner
+            .on_tool_result_compressed(call_id, name, symbol_count)
     }
 
     fn on_warning(&mut self, message: &str) -> Result<(), CoreError> {
@@ -189,9 +205,9 @@ mod tests {
     async fn on_tool_call_increments_count() {
         let (_tmp, runner) = make_runner();
         let mut sink = HarnessStreamSink::new(NullSink, Arc::clone(&runner));
-        sink.on_tool_call("file_read", "{}")
+        sink.on_tool_call("call_1", "file_read", "{}")
             .unwrap_or_else(|e| panic!("{e}"));
-        sink.on_tool_call("shell_exec", "{}")
+        sink.on_tool_call("call_2", "shell_exec", "{}")
             .unwrap_or_else(|e| panic!("{e}"));
         let guard = runner.lock().await;
         let session = guard
@@ -207,22 +223,29 @@ mod tests {
         // Free-form success strings emitted by today's tools. The sink
         // pulls the path out of the trailing single-quoted segment.
         sink.on_tool_result(
+            "call_1",
             "file_write",
             "Successfully wrote 11 bytes to '/tmp/foo.rs'",
             false,
         )
         .unwrap_or_else(|e| panic!("{e}"));
-        sink.on_tool_result("file_patch", "Successfully patched '/tmp/bar.rs'", false)
-            .unwrap_or_else(|e| panic!("{e}"));
+        sink.on_tool_result(
+            "call_2",
+            "file_patch",
+            "Successfully patched '/tmp/bar.rs'",
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         // Errored writes should not count.
         sink.on_tool_result(
+            "call_3",
             "file_write",
             "Successfully wrote 0 bytes to '/tmp/baz'",
             true,
         )
         .unwrap_or_else(|e| panic!("{e}"));
         // Non-write tools should not count.
-        sink.on_tool_result("file_read", "ok", false)
+        sink.on_tool_result("call_4", "file_read", "ok", false)
             .unwrap_or_else(|e| panic!("{e}"));
 
         let guard = runner.lock().await;
@@ -254,12 +277,14 @@ mod tests {
         let (_tmp, runner) = make_runner();
         let mut sink = HarnessStreamSink::new(NullSink, Arc::clone(&runner));
         sink.on_tool_result(
+            "call_1",
             "file_write",
             "Successfully wrote 5 bytes to '/tmp/dupe.rs'",
             false,
         )
         .unwrap_or_else(|e| panic!("{e}"));
         sink.on_tool_result(
+            "call_2",
             "file_write",
             "Successfully wrote 17 bytes to '/tmp/dupe.rs'",
             false,
@@ -280,12 +305,14 @@ mod tests {
         let (_tmp, runner) = make_runner();
         let mut sink = HarnessStreamSink::new(NullSink, Arc::clone(&runner));
         sink.on_tool_result(
+            "call_1",
             "file_write",
             r#"{"path": "/tmp/json_path.rs", "bytes": 42}"#,
             false,
         )
         .unwrap_or_else(|e| panic!("{e}"));
         sink.on_tool_result(
+            "call_2",
             "file_patch",
             r#"{"file_path": "/tmp/file_path_key.rs"}"#,
             false,
@@ -319,7 +346,7 @@ mod tests {
     async fn on_tool_result_falls_back_when_path_unrecoverable() {
         let (_tmp, runner) = make_runner();
         let mut sink = HarnessStreamSink::new(NullSink, Arc::clone(&runner));
-        sink.on_tool_result("file_write", "no path here, sorry", false)
+        sink.on_tool_result("call_1", "file_write", "no path here, sorry", false)
             .unwrap_or_else(|e| panic!("{e}"));
         let guard = runner.lock().await;
         let session = guard
@@ -380,7 +407,12 @@ mod tests {
                     .push(format!("token:{token}"));
                 Ok(())
             }
-            fn on_tool_call(&mut self, name: &str, _args: &str) -> Result<(), CoreError> {
+            fn on_tool_call(
+                &mut self,
+                _call_id: &str,
+                name: &str,
+                _args: &str,
+            ) -> Result<(), CoreError> {
                 self.events
                     .lock()
                     .unwrap_or_else(|e| panic!("{e}"))
@@ -389,6 +421,7 @@ mod tests {
             }
             fn on_tool_result(
                 &mut self,
+                _call_id: &str,
                 name: &str,
                 _output: &str,
                 _is_error: bool,
@@ -410,10 +443,11 @@ mod tests {
 
         wrapped.on_token("hello").unwrap_or_else(|e| panic!("{e}"));
         wrapped
-            .on_tool_call("file_write", "{}")
+            .on_tool_call("call_1", "file_write", "{}")
             .unwrap_or_else(|e| panic!("{e}"));
         wrapped
             .on_tool_result(
+                "call_1",
                 "file_write",
                 "Successfully wrote 5 bytes to '/tmp/wired.rs'",
                 false,

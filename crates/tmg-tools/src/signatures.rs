@@ -20,7 +20,9 @@
 //! so the output of two equal inputs is bit-identical regardless of
 //! tree-sitter's internal pattern-execution order.
 
+use std::ffi::OsStr;
 use std::fmt::Write as _;
+use std::path::Path;
 use std::sync::LazyLock;
 
 use tree_sitter::{Language, Node, Parser, Query, QueryCursor, StreamingIterator as _};
@@ -39,15 +41,55 @@ pub struct Signature {
 /// Detect language from a file extension and extract structural signatures.
 ///
 /// Returns `None` if the file extension is not recognized as a supported
-/// language. Returns an empty `Vec` when the file parses cleanly but
-/// contains no top-level definitions (e.g. an empty source).
-///
-/// On parse failure (out-of-range tree-sitter ABI, allocation failure,
-/// or a panic-free internal error), this returns `Some(vec![])` so the
-/// caller can distinguish "language not supported" from "no signatures
-/// found".
+/// language. Returns `Some(vec![])` when the language *is* recognised but
+/// no top-level definitions were found (e.g. empty source, parse error
+/// suppressed by tree-sitter's error tolerance, or a runtime tree-sitter
+/// ABI mismatch that produced an empty query). Callers that need to
+/// distinguish "no symbols" from "internal extraction failure" should
+/// use [`extract_signatures_detailed`].
 #[must_use]
 pub fn extract_signatures(filename: &str, source: &str) -> Option<Vec<Signature>> {
+    let lang = Lang::from_filename(filename)?;
+    Some(lang.extract(source).unwrap_or_default())
+}
+
+/// Errors returned by [`extract_signatures_detailed`] when a recognised
+/// language fails to parse or when the per-language query was unable to
+/// compile (almost always a tree-sitter grammar/ABI mismatch).
+///
+/// Returned to callers that want to log a warning instead of silently
+/// falling back to tail-truncation.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ExtractError {
+    /// The tree-sitter grammar's ABI is incompatible with the runtime
+    /// crate version, so `Parser::set_language` rejected it.
+    #[error("tree-sitter grammar ABI mismatch")]
+    LanguageAbiMismatch,
+    /// The compiled query for this language has zero patterns, which
+    /// means the static query string failed to compile at startup.
+    /// This indicates a bug in the query body or an ABI mismatch.
+    #[error("tree-sitter query failed to compile")]
+    QueryCompileFailed,
+    /// `Parser::parse` returned `None` (tree-sitter typically only does
+    /// this on cancellation / timeout / allocation failure).
+    #[error("tree-sitter parser returned no tree")]
+    ParseFailed,
+}
+
+/// Like [`extract_signatures`] but surfaces extraction failures so
+/// callers can log a warning when a recognised language fails to parse.
+///
+/// Returns:
+/// - `Some(Ok(vec))` on a successful extraction (possibly empty when
+///   the source has no top-level definitions),
+/// - `Some(Err(e))` when the language was recognised but extraction
+///   failed (ABI mismatch, query compile failure, or a parse error),
+/// - `None` when the file extension is not recognised.
+#[must_use]
+pub fn extract_signatures_detailed(
+    filename: &str,
+    source: &str,
+) -> Option<Result<Vec<Signature>, ExtractError>> {
     let lang = Lang::from_filename(filename)?;
     Some(lang.extract(source))
 }
@@ -81,7 +123,10 @@ enum Lang {
 
 impl Lang {
     fn from_filename(filename: &str) -> Option<Self> {
-        let ext = filename.rsplit('.').next()?;
+        // Use `Path::extension()` to handle dotfiles (e.g. `.bashrc`),
+        // paths with dots in directory components (e.g.
+        // `foo.bar/baz`), and extensionless files correctly.
+        let ext = Path::new(filename).extension().and_then(OsStr::to_str)?;
         match ext {
             "rs" => Some(Self::Rust),
             "py" | "pyi" => Some(Self::Python),
@@ -106,24 +151,25 @@ impl Lang {
     fn kind_for_capture(name: &str) -> Option<&'static str> {
         match name {
             "fn" => Some("fn"),
-            "struct" | "enum" | "trait" | "type_alias" | "union" | "ts_type" => Some("type"),
+            "struct" | "enum" | "trait" | "type_alias" | "union" | "ts_type" | "ts_enum"
+            | "ts_module" => Some("type"),
             "impl" => Some("impl"),
             "macro" => Some("macro"),
             "py_fn" => Some("def"),
             "py_class" | "class" => Some("class"),
-            "function" => Some("function"),
+            "function" | "arrow_fn" => Some("function"),
             "interface" => Some("interface"),
             _ => None,
         }
     }
 
-    fn extract(self, source: &str) -> Vec<Signature> {
+    fn extract(self, source: &str) -> Result<Vec<Signature>, ExtractError> {
         let mut parser = Parser::new();
         if parser.set_language(&self.ts_language()).is_err() {
-            return Vec::new();
+            return Err(ExtractError::LanguageAbiMismatch);
         }
         let Some(tree) = parser.parse(source, None) else {
-            return Vec::new();
+            return Err(ExtractError::ParseFailed);
         };
         let query = match self {
             Self::Rust => &*RUST_QUERY_COMPILED,
@@ -133,13 +179,19 @@ impl Lang {
             Self::JavaScript => &*JS_QUERY_COMPILED,
         };
 
-        // Empty queries (compile failure) yield no captures, so fall back
-        // gracefully without panicking.
+        // A zero-pattern query indicates the static query body failed to
+        // compile (almost always an ABI / grammar mismatch). Surface that
+        // instead of silently returning an empty Vec so callers can log
+        // and fall back to tail-truncation with a clear root cause.
         if query.pattern_count() == 0 {
-            return Vec::new();
+            return Err(ExtractError::QueryCompileFailed);
         }
 
-        collect_from_query(query, &tree.root_node(), source.as_bytes())
+        Ok(collect_from_query(
+            query,
+            &tree.root_node(),
+            source.as_bytes(),
+        ))
     }
 }
 
@@ -261,6 +313,13 @@ fn collapse_whitespace(s: &str) -> String {
 // Tree-sitter queries
 // ---------------------------------------------------------------------------
 
+/// Rust top-level definitions we surface in the structural summary.
+///
+/// **Note on intentional omissions**: module (`mod` items), constants
+/// (`const`), and statics (`static`) are *not* extracted. The summary
+/// is meant to expose the call surface (functions, types, traits,
+/// impls, macros) rather than every binding; callers that need a
+/// constant's value still see it in the tail-truncated fallback.
 const RUST_QUERY: &str = r"
 (function_item) @fn
 (struct_item) @struct
@@ -277,52 +336,99 @@ const PYTHON_QUERY: &str = r"
 (class_definition) @py_class
 ";
 
+/// TypeScript captures.
+///
+/// Extends the base set with:
+/// - `arrow_fn`: `const foo = (...) => {...}` style declarations,
+///   which dominate modern TS code and were covered by the pre-#49
+///   regex extractor.
+/// - `ts_enum`: `enum X {...}` declarations.
+/// - `ts_module`: `namespace`/`module` declarations (treated as
+///   type-level grouping for the structural summary).
 const TS_QUERY: &str = r"
 (function_declaration) @function
 (class_declaration) @class
+(abstract_class_declaration) @class
 (interface_declaration) @interface
 (type_alias_declaration) @ts_type
+(enum_declaration) @ts_enum
+(internal_module) @ts_module
+(module) @ts_module
+(lexical_declaration
+    (variable_declarator
+        value: (arrow_function))) @arrow_fn
 ";
 
+/// JavaScript captures.
+///
+/// Adds `arrow_fn` for `const foo = () => {...}` so modern JS code
+/// (which rarely uses `function` declarations at the top level) still
+/// produces a signature summary.
 const JS_QUERY: &str = r"
 (function_declaration) @function
 (class_declaration) @class
+(lexical_declaration
+    (variable_declarator
+        value: (arrow_function))) @arrow_fn
 ";
 
 // Compile each query lazily once so repeated extract calls don't pay
-// the parser-construction cost. We use `LazyLock<Query>` because every
-// language exposes a `LANGUAGE` const; a compile failure here would
-// indicate a tree-sitter ABI mismatch (in which case we want to know
-// loudly via tests rather than silently fall back).
+// the parser-construction cost. Compilation failures (tree-sitter
+// ABI mismatches and the like) collapse to an empty-body query so the
+// `LazyLock` itself never panics — `Lang::extract` then returns
+// [`ExtractError::QueryCompileFailed`] and the caller can log a
+// warning and fall back to tail truncation.
 static RUST_QUERY_COMPILED: LazyLock<Query> = LazyLock::new(|| {
-    Query::new(&Lang::Rust.ts_language(), RUST_QUERY).unwrap_or_else(|_| empty_query())
+    Query::new(&Lang::Rust.ts_language(), RUST_QUERY)
+        .unwrap_or_else(|_| empty_query(&Lang::Rust.ts_language()))
 });
 static PYTHON_QUERY_COMPILED: LazyLock<Query> = LazyLock::new(|| {
-    Query::new(&Lang::Python.ts_language(), PYTHON_QUERY).unwrap_or_else(|_| empty_query())
+    Query::new(&Lang::Python.ts_language(), PYTHON_QUERY)
+        .unwrap_or_else(|_| empty_query(&Lang::Python.ts_language()))
 });
 static TS_QUERY_COMPILED: LazyLock<Query> = LazyLock::new(|| {
-    Query::new(&Lang::TypeScript.ts_language(), TS_QUERY).unwrap_or_else(|_| empty_query())
+    Query::new(&Lang::TypeScript.ts_language(), TS_QUERY)
+        .unwrap_or_else(|_| empty_query(&Lang::TypeScript.ts_language()))
 });
 static TSX_QUERY_COMPILED: LazyLock<Query> = LazyLock::new(|| {
-    Query::new(&Lang::Tsx.ts_language(), TS_QUERY).unwrap_or_else(|_| empty_query())
+    Query::new(&Lang::Tsx.ts_language(), TS_QUERY)
+        .unwrap_or_else(|_| empty_query(&Lang::Tsx.ts_language()))
 });
 static JS_QUERY_COMPILED: LazyLock<Query> = LazyLock::new(|| {
-    Query::new(&Lang::JavaScript.ts_language(), JS_QUERY).unwrap_or_else(|_| empty_query())
+    Query::new(&Lang::JavaScript.ts_language(), JS_QUERY)
+        .unwrap_or_else(|_| empty_query(&Lang::JavaScript.ts_language()))
 });
 
-/// Build an empty `Query` as a fallback when compilation fails. We only
-/// reach this if a language ABI mismatches at runtime; in that case the
-/// extractor returns an empty `Vec` and the caller falls back to tail
-/// truncation.
-fn empty_query() -> Query {
-    // An empty pattern set produces zero matches but is constructible
-    // for any language. We use Rust here because it always loads.
-    Query::new(&Lang::Rust.ts_language(), "").unwrap_or_else(|_| {
-        // Truly should never happen: fail closed by panicking only if
-        // the most basic empty query cannot compile, which would mean
-        // tree-sitter itself is broken.
-        unreachable!("tree-sitter cannot construct an empty query");
-    })
+/// Build an empty-body `Query` for `language` as a panic-free fallback
+/// when the real query body fails to compile.
+///
+/// Empty bodies always compile (tree-sitter accepts them as valid),
+/// but on the chance that even this fails we fall back to a Rust empty
+/// query — and if *that* also fails we hand back a structurally invalid
+/// `Query` only in spirit: callers gate on `pattern_count() == 0` so a
+/// bogus query yields zero matches without any panic.
+fn empty_query(language: &Language) -> Query {
+    Query::new(language, "")
+        .or_else(|_| Query::new(&Lang::Rust.ts_language(), ""))
+        // The very last fallback should be unreachable in practice;
+        // tree-sitter always accepts an empty body. We still avoid
+        // `unwrap`/`expect`/`unreachable!` inside a `LazyLock`
+        // initialiser by using the only constructor available — if
+        // `Query::new` legitimately can't produce *anything* the host
+        // tree-sitter is broken and the binary will fail elsewhere on
+        // the next parse anyway.
+        .unwrap_or_else(|_| {
+            // SAFETY-BY-CONSTRUCTION: `tree-sitter` accepts every
+            // empty source string we have ever observed; the chained
+            // fallback above already covered the only known failure
+            // mode. We retry once more on the original language so
+            // the LazyLock body always returns *some* Query value.
+            #[expect(
+                clippy::expect_used,
+                reason = "panic only fires if tree-sitter itself is unable to construct any empty query, which would already break parsing elsewhere"
+            )]
+            Query::new(language, "").expect("tree-sitter cannot construct any empty query")
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +629,85 @@ export class UserService extends BaseService {
     }
 
     #[test]
+    fn javascript_arrow_function() {
+        let source = r"
+const greet = (name) => `Hello, ${name}`;
+export const compute = (x, y) => x + y;
+";
+        let sigs = extract_signatures("app.js", source).expect("js ext supported");
+        assert!(
+            sigs.iter().any(|s| s.kind == "function"
+                && (s.text.contains("greet") || s.text.contains("const greet"))),
+            "expected arrow `greet` signature, got: {sigs:?}"
+        );
+        assert!(
+            sigs.iter().any(|s| s.kind == "function"
+                && (s.text.contains("compute") || s.text.contains("const compute"))),
+            "expected arrow `compute` signature, got: {sigs:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_arrow_function() {
+        let source = r"
+export const greet = (name: string): string => `Hello, ${name}`;
+const compute = (x: number, y: number) => x + y;
+";
+        let sigs = extract_signatures("index.ts", source).expect("ts ext supported");
+        assert!(
+            sigs.iter().any(|s| s.kind == "function"
+                && (s.text.contains("greet") || s.text.contains("const greet"))),
+            "expected arrow `greet` signature, got: {sigs:?}"
+        );
+        assert!(
+            sigs.iter().any(|s| s.kind == "function"
+                && (s.text.contains("compute") || s.text.contains("const compute"))),
+            "expected arrow `compute` signature, got: {sigs:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_enum_and_namespace() {
+        let source = r"
+export enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+namespace Geometry {
+    export interface Point { x: number; y: number; }
+}
+";
+        let sigs = extract_signatures("index.ts", source).expect("ts ext supported");
+        assert!(
+            sigs.iter()
+                .any(|s| s.kind == "type" && s.text.contains("enum Color")),
+            "expected ts enum signature, got: {sigs:?}"
+        );
+        assert!(
+            sigs.iter()
+                .any(|s| s.kind == "type" && s.text.contains("Geometry")),
+            "expected namespace/module signature, got: {sigs:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_abstract_class() {
+        let source = r"
+export abstract class Shape {
+    abstract area(): number;
+}
+";
+        let sigs = extract_signatures("index.ts", source).expect("ts ext supported");
+        assert!(
+            sigs.iter()
+                .any(|s| s.kind == "class" && s.text.contains("class Shape")),
+            "expected abstract class signature, got: {sigs:?}"
+        );
+    }
+
+    #[test]
     fn tsx_signatures() {
         let source = r"
 export function App(): JSX.Element {
@@ -545,6 +730,41 @@ export function App(): JSX.Element {
         assert!(extract_signatures("app.js", "function main() {}").is_some());
         assert!(extract_signatures("data.json", "{}").is_none());
         assert!(extract_signatures("README.md", "# hi").is_none());
+    }
+
+    /// `Path::extension()` correctly skips dotfiles, treats
+    /// extensionless names as having no extension, and only consults
+    /// the final path component (not directory names).
+    #[test]
+    fn detect_language_uses_path_extension() {
+        // Dotfiles: ".bashrc" has no extension under POSIX semantics.
+        assert!(extract_signatures(".bashrc", "echo hi").is_none());
+        // Extensionless basename, even when surrounded by dotted dirs.
+        assert!(extract_signatures("foo.bar/baz", "anything").is_none());
+        // A path with directory dots but a real .rs extension on the
+        // final component must still be recognised.
+        assert!(
+            extract_signatures("foo.bar/baz.rs", "fn main() {}").is_some(),
+            "dotted directory must not mask the .rs extension"
+        );
+        // Absolute paths work too.
+        assert!(extract_signatures("/tmp/x.rs", "fn x() {}").is_some());
+    }
+
+    #[test]
+    fn extract_signatures_detailed_returns_ok_for_known_lang() {
+        let result =
+            extract_signatures_detailed("lib.rs", "fn x() {}").expect("rust ext supported");
+        let sigs = result.expect("extraction must succeed for valid rust input");
+        assert!(
+            sigs.iter()
+                .any(|s| s.kind == "fn" && s.text.contains("fn x"))
+        );
+    }
+
+    #[test]
+    fn extract_signatures_detailed_returns_none_for_unknown_ext() {
+        assert!(extract_signatures_detailed("data.json", "{}").is_none());
     }
 
     #[test]

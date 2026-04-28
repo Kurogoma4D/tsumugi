@@ -11,6 +11,8 @@ pub mod tools;
 pub mod types;
 
 pub use error::ToolError;
-pub use signatures::{Signature, extract_signatures, format_signatures};
+pub use signatures::{
+    ExtractError, Signature, extract_signatures, extract_signatures_detailed, format_signatures,
+};
 pub use tools::default_registry;
 pub use types::{Tool, ToolRegistry, ToolResult};

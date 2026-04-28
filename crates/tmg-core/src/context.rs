@@ -30,6 +30,12 @@ const DEFAULT_MAX_TOOL_RESULT_TOKENS: usize = 4096;
 /// rewritten via tree-sitter signature extraction (issue #49).
 const DEFAULT_SIGNATURE_THRESHOLD_TOKENS: usize = 1500;
 
+/// Maximum width of the `file_read` line-number prefix (`{:>6}\t...`)
+/// — see `crates/tmg-tools/src/tools/file_read.rs`. We tolerate any
+/// run of 0..=`MAX_LINE_NUM_PREFIX_DIGITS` leading whitespace digits
+/// followed by a tab when stripping the prefix.
+const MAX_LINE_NUM_PREFIX_DIGITS: usize = 6;
+
 // ---------------------------------------------------------------------------
 // ContextConfig
 // ---------------------------------------------------------------------------
@@ -53,6 +59,13 @@ pub struct ContextConfig {
     /// agent loop's history is rewritten as a structural summary. The
     /// tail-truncation path is used for unrecognised file types or when
     /// signature extraction yields no symbols.
+    ///
+    /// **Token estimation note**: comparison against this threshold uses
+    /// the `chars/4` heuristic from
+    /// [`TokenCounter::estimate_tokens`], not the LLM-server's
+    /// tokenizer. The heuristic is chosen so the decision can be made
+    /// synchronously in [`ContextCompressor::compress_tool_result`]
+    /// without an extra HTTP round-trip.
     pub signature_threshold_tokens: usize,
 }
 
@@ -305,24 +318,49 @@ impl ContextCompressor {
         output: &str,
     ) -> CompressedToolResult {
         let threshold = self.config.signature_threshold_tokens;
-        let estimated = TokenCounter::estimate_tokens(output);
+        // Estimating tokens up-front would do a length walk for every
+        // tool call; gate on the cheap conditions first so non-`file_read`
+        // tools (the common case) skip the heuristic entirely.
         if tool_name == "file_read"
             && threshold > 0
-            && estimated > threshold
+            && TokenCounter::estimate_tokens(output) > threshold
             && let Some(path) = params.get("path").and_then(|v| v.as_str())
-            && let Some(sigs) = tmg_tools::extract_signatures(path, output)
-            && !sigs.is_empty()
         {
-            let symbol_count = sigs.len();
-            let formatted = tmg_tools::format_signatures(&sigs);
-            let text = format!(
-                "[file content compressed via tree-sitter — {symbol_count} symbols extracted]\n\n{formatted}"
-            );
-            return CompressedToolResult {
-                text,
-                compressed_via_signatures: true,
-                symbol_count,
-            };
+            // The `file_read` tool wraps each line with a
+            // `{:>6}\t<content>` prefix and (for partial reads) prepends
+            // a `(showing lines N-M of T)` header. tree-sitter is
+            // error-tolerant so passing the formatted text would still
+            // produce captures, but the line numbers and node text would
+            // be contaminated by the prefix. Strip the prefix here so
+            // tree-sitter sees the raw source, then translate the
+            // resulting line numbers back into the original file's
+            // 1-based numbering.
+            let StrippedSource {
+                cleaned,
+                line_offset,
+            } = strip_file_read_prefix(output);
+            if let Some(sigs) = tmg_tools::extract_signatures(path, &cleaned)
+                && !sigs.is_empty()
+            {
+                let symbol_count = sigs.len();
+                let translated: Vec<tmg_tools::Signature> = sigs
+                    .into_iter()
+                    .map(|s| tmg_tools::Signature {
+                        line: s.line.saturating_add(line_offset),
+                        kind: s.kind,
+                        text: s.text,
+                    })
+                    .collect();
+                let formatted = tmg_tools::format_signatures(&translated);
+                let text = format!(
+                    "[file content compressed via tree-sitter — {symbol_count} symbols extracted]\n\n{formatted}"
+                );
+                return CompressedToolResult {
+                    text,
+                    compressed_via_signatures: true,
+                    symbol_count,
+                };
+            }
         }
 
         // Fallback: tail-truncate at the existing tool-result budget.
@@ -478,6 +516,107 @@ pub fn truncate_tool_result(output: &str, max_tokens: usize) -> String {
         &output[..start_end],
         &output[tail_start..],
     )
+}
+
+/// Result of stripping `file_read`'s formatting wrapper from a tool
+/// result body so tree-sitter sees raw source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StrippedSource {
+    /// The cleaned source text, with the `(showing lines …)` header
+    /// dropped and the per-line `{:>6}\t` prefix removed from every
+    /// line that bore it.
+    cleaned: String,
+    /// Number of original-file lines that precede the first visible
+    /// line in `cleaned`. Add `(line_offset)` to a tree-sitter-reported
+    /// 1-based line number from `cleaned` to recover the line number
+    /// in the original file. For full-file reads this is `0`; for a
+    /// partial read starting at line `N` it is `N - 1`.
+    line_offset: usize,
+}
+
+/// Strip the `file_read` tool's formatting wrapper from `output`.
+///
+/// The wrapper looks like:
+///
+/// ```text
+/// (showing lines 3-12 of 50)        <- only on partial reads
+///      3\t<original line 3>
+///      4\t<original line 4>
+///      …
+/// ```
+///
+/// We:
+/// 1. Detect the header line and capture the start line `N` to use as
+///    the line offset (`N - 1`).
+/// 2. Strip the `{:>6}\t` line-number prefix from every remaining
+///    line. The format string is `"{:>6}\t{line}"` so up to
+///    [`MAX_LINE_NUM_PREFIX_DIGITS`] leading whitespace digits followed
+///    by a tab is the canonical shape.
+///
+/// Lines that don't match the canonical prefix shape are passed
+/// through unchanged so that this helper is safe to call on
+/// already-clean source (e.g. test fixtures and unit tests that
+/// hand-feed raw file bodies).
+fn strip_file_read_prefix(output: &str) -> StrippedSource {
+    let mut lines = output.lines();
+    let Some(first) = lines.next() else {
+        return StrippedSource {
+            cleaned: String::new(),
+            line_offset: 0,
+        };
+    };
+
+    let (line_offset, body_lines): (usize, Vec<&str>) =
+        if let Some(start) = parse_showing_header(first) {
+            (start.saturating_sub(1), lines.collect())
+        } else {
+            // Full-file read: no header; the first line is body.
+            let mut all = vec![first];
+            all.extend(lines);
+            (0, all)
+        };
+
+    let mut cleaned = String::with_capacity(output.len());
+    for (idx, line) in body_lines.iter().enumerate() {
+        if idx > 0 {
+            cleaned.push('\n');
+        }
+        match strip_line_number_prefix(line) {
+            Some(stripped) => cleaned.push_str(stripped),
+            None => cleaned.push_str(line),
+        }
+    }
+
+    StrippedSource {
+        cleaned,
+        line_offset,
+    }
+}
+
+/// Parse a `(showing lines N-M of T)` header. Returns `Some(N)` on
+/// success, `None` if the line does not match.
+fn parse_showing_header(line: &str) -> Option<usize> {
+    let inner = line.strip_prefix("(showing lines ")?.strip_suffix(')')?;
+    // `inner` is now e.g. `3-12 of 50`.
+    let (range, _rest) = inner.split_once(" of ")?;
+    let (start, _end) = range.split_once('-')?;
+    start.parse::<usize>().ok()
+}
+
+/// Strip the canonical `{:>6}\t` prefix written by `file_read`.
+/// Returns `Some(rest)` if `line` starts with up to
+/// [`MAX_LINE_NUM_PREFIX_DIGITS`] (whitespace-padded) ASCII digits and
+/// a literal tab; otherwise `None`.
+fn strip_line_number_prefix(line: &str) -> Option<&str> {
+    let (head, rest) = line.split_once('\t')?;
+    if head.is_empty() || head.len() > MAX_LINE_NUM_PREFIX_DIGITS {
+        return None;
+    }
+    let trimmed = head.trim_start();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(rest)
 }
 
 /// Find the largest byte index <= `index` that is a char boundary.
@@ -685,6 +824,162 @@ mod tests {
         let out = comp.compress_tool_result("shell_exec", &params, &body);
         assert!(!out.compressed_via_signatures);
         assert!(out.text.contains("truncated"));
+    }
+
+    /// Regression test for the issue where `compress_tool_result` was
+    /// passing the *formatted* `file_read` output (with the
+    /// `(showing lines …)` header and the per-line `{:>6}\t` prefix)
+    /// straight to tree-sitter. Tree-sitter is error-tolerant so the
+    /// old code returned captures, but every multi-line node text was
+    /// contaminated with embedded line-number prefixes and the line
+    /// numbers were off by 1+ from the visible window's start.
+    ///
+    /// This test reproduces the exact format emitted by
+    /// `crates/tmg-tools/src/tools/file_read.rs` for a partial read and
+    /// asserts:
+    /// 1. Symbol *names* are clean (no `\t` or digit prefix bleed-through).
+    /// 2. Reported line numbers match the *original* file lines, not
+    ///    the partial-window's local line counter.
+    #[test]
+    fn compress_tool_result_strips_file_read_prefix() {
+        let cfg = ContextConfig {
+            max_context_tokens: 8192,
+            compression_threshold: 0.8,
+            max_tool_result_tokens: 1024,
+            // Threshold low so the synthetic body trips the signature
+            // path even after the wrapper is stripped.
+            signature_threshold_tokens: 4,
+        };
+        let comp = ContextCompressor::with_config(dummy_client(), cfg);
+
+        // Reproduce the exact `file_read` format for a partial read of
+        // a 100-line file showing lines 5-7. The original source body
+        // (without prefix) would be:
+        //   pub fn alpha() {}
+        //   pub struct Beta;
+        //   pub fn gamma() {}
+        // so `alpha` lives on original line 5, `Beta` on line 6,
+        // `gamma` on line 7.
+        let formatted = "(showing lines 5-7 of 100)\n\
+             5\tpub fn alpha() {}\n\
+             6\tpub struct Beta;\n\
+             7\tpub fn gamma() {}";
+
+        let params = serde_json::json!({"path": "lib.rs"});
+        let out = comp.compress_tool_result("file_read", &params, formatted);
+
+        assert!(
+            out.compressed_via_signatures,
+            "expected signature-based compression, got: {out:?}"
+        );
+
+        // Symbol names must not contain tabs or stray digits.
+        assert!(
+            out.text.contains("alpha"),
+            "missing alpha in output: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("Beta"),
+            "missing Beta in output: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("gamma"),
+            "missing gamma in output: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains('\t'),
+            "raw tab from line-number prefix leaked into the rewrite: {}",
+            out.text
+        );
+        // No line in the symbol output should start with a leading
+        // digit run + tab — that would indicate the prefix bled into a
+        // signature header.
+        for line in out.text.lines() {
+            assert!(
+                !line.trim_start().starts_with(|c: char| c.is_ascii_digit()) || line.contains('L'),
+                "suspect prefix bleed: {line}",
+            );
+        }
+
+        // Lines must be translated back into the original file's
+        // 1-based numbering. `alpha` is on original line 5.
+        assert!(
+            out.text.contains("L5: [fn]"),
+            "expected L5 marker for alpha, got: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("L6: [type]"),
+            "expected L6 marker for Beta, got: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("L7: [fn]"),
+            "expected L7 marker for gamma, got: {}",
+            out.text
+        );
+    }
+
+    /// Full-file reads (no `(showing lines …)` header) must also be
+    /// stripped of the per-line prefix and produce 1-based original
+    /// line numbers.
+    #[test]
+    fn compress_tool_result_strips_full_file_read_prefix() {
+        let cfg = ContextConfig {
+            max_context_tokens: 8192,
+            compression_threshold: 0.8,
+            max_tool_result_tokens: 1024,
+            signature_threshold_tokens: 4,
+        };
+        let comp = ContextCompressor::with_config(dummy_client(), cfg);
+
+        let formatted = "     1\tpub fn alpha() {}\n\
+                              2\tpub struct Beta;";
+        let params = serde_json::json!({"path": "lib.rs"});
+        let out = comp.compress_tool_result("file_read", &params, formatted);
+        assert!(out.compressed_via_signatures);
+        assert!(!out.text.contains('\t'));
+        assert!(out.text.contains("L1: [fn]"));
+        assert!(out.text.contains("L2: [type]"));
+    }
+
+    #[test]
+    fn strip_file_read_prefix_partial_read() {
+        let formatted = "(showing lines 3-5 of 50)\n\
+             3\tfoo\n\
+             4\tbar\n\
+             5\tbaz";
+        let stripped = strip_file_read_prefix(formatted);
+        assert_eq!(stripped.line_offset, 2);
+        assert_eq!(stripped.cleaned, "foo\nbar\nbaz");
+    }
+
+    #[test]
+    fn strip_file_read_prefix_full_read() {
+        let formatted = "     1\tfoo\n     2\tbar";
+        let stripped = strip_file_read_prefix(formatted);
+        assert_eq!(stripped.line_offset, 0);
+        assert_eq!(stripped.cleaned, "foo\nbar");
+    }
+
+    #[test]
+    fn strip_file_read_prefix_passthrough_when_no_prefix() {
+        // Hand-fed raw source (e.g. unit-test fixtures) must round-trip
+        // unchanged.
+        let raw = "pub fn x() {}\npub struct Y;";
+        let stripped = strip_file_read_prefix(raw);
+        assert_eq!(stripped.line_offset, 0);
+        assert_eq!(stripped.cleaned, raw);
+    }
+
+    #[test]
+    fn strip_file_read_prefix_empty() {
+        let stripped = strip_file_read_prefix("");
+        assert_eq!(stripped.line_offset, 0);
+        assert_eq!(stripped.cleaned, "");
     }
 
     #[test]
