@@ -98,8 +98,13 @@ fn draw_human_prompt(frame: &mut Frame, prompt: &crate::HumanPrompt, area: Rect)
         .as_ref()
         .map_or(0, |s| u16::try_from(s.lines().count()).unwrap_or(u16::MAX));
     let options_lines: u16 = u16::try_from(prompt.options.len().max(1)).unwrap_or(u16::MAX);
-    // Header (1) + message + show + spacer (1) + options + footer (1) + borders (2).
-    let modal_height = (3 + body_lines + show_lines + options_lines + 1).min(area.height);
+    // Layout: top border (1) + message (body_lines) + spacer-before-options (1)
+    //       + options (options_lines) + spacer-before-footer (1) + footer (1)
+    //       + bottom border (1) = 5 + body + show + options.
+    // The `show` block (when present) inserts an extra leading spacer
+    // and `show_lines` content rows; the spacer is folded into
+    // `show_lines` when show is empty (saves one row in that case).
+    let modal_height = (5 + body_lines + show_lines + options_lines).min(area.height);
 
     if area.width < modal_width || area.height < modal_height {
         return;

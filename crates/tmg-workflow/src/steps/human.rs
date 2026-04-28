@@ -76,6 +76,7 @@ pub(crate) async fn execute(
             message: rendered_message,
             options: options.clone(),
             show: rendered_show,
+            revise_target: revise_target.clone(),
             response_tx: Arc::clone(&responder),
         })
         .await;

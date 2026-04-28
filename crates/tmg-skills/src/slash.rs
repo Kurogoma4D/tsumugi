@@ -104,6 +104,15 @@ pub fn parse_slash_command(input: &str) -> SlashParseResult {
         None => (rest, None),
     };
 
+    // A leading-whitespace input like "/  foo" splits into
+    // (command = "", args = Some("foo")), which would otherwise be
+    // dispatched as `InvokeSkill { name: "" }`. An empty skill name is
+    // never valid, so fall through to chat (the same path taken by a
+    // bare `/`).
+    if command.is_empty() {
+        return Ok(None);
+    }
+
     // Built-in commands first; the broad-net "any other /foo is a
     // skill invocation" path lives at the bottom so it never shadows
     // a typed command.
@@ -258,6 +267,16 @@ mod tests {
     fn parse_empty_slash() {
         let cmd = parse_slash_command("/").expect("ok");
         assert_eq!(cmd, None);
+    }
+
+    #[test]
+    fn parse_slash_with_leading_whitespace_is_not_skill() {
+        // Inputs like "/  foo" and "/ " must not produce a skill
+        // invocation with an empty name; they should fall through to
+        // chat (Ok(None)).
+        assert_eq!(parse_slash_command("/  foo").expect("ok"), None);
+        assert_eq!(parse_slash_command("/ ").expect("ok"), None);
+        assert_eq!(parse_slash_command("/\t").expect("ok"), None);
     }
 
     #[test]

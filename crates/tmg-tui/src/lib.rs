@@ -32,6 +32,7 @@ use crossterm::execute;
 use tmg_agents::{CustomAgentDef, SubagentManager};
 use tmg_core::AgentLoop;
 use tmg_harness::{RunProgressReceiver, RunRunner, RunSummary};
+use tmg_skills::SkillMeta;
 use tmg_workflow::{WorkflowMeta, WorkflowProgress};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -67,6 +68,8 @@ use tokio_util::sync::CancellationToken;
 ///   progress events.
 /// * `workflows` - Discovered workflows for the `/workflows` slash
 ///   command listing. Empty vec disables that listing.
+/// * `skills` - Discovered skills for the `/skills` slash command
+///   listing. Empty vec disables that listing.
 ///
 /// # Errors
 ///
@@ -89,6 +92,7 @@ pub async fn run(
     run_progress_rx: Option<RunProgressReceiver>,
     workflow_progress_rx: Option<mpsc::Receiver<WorkflowProgress>>,
     workflows: Vec<WorkflowMeta>,
+    skills: Vec<SkillMeta>,
 ) -> Result<(), TuiError> {
     // Pre-warm the syntect bundle off the rendering thread. Loading
     // `SyntaxSet::load_defaults_newlines` + `ThemeSet::load_defaults`
@@ -159,6 +163,10 @@ pub async fn run(
 
     if !workflows.is_empty() {
         app.set_workflows(workflows);
+    }
+
+    if !skills.is_empty() {
+        app.set_skills(skills);
     }
 
     let result = event::run_event_loop(&mut terminal, &mut app, cancel).await;

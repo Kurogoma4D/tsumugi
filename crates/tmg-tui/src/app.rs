@@ -8,7 +8,7 @@ use tmg_agents::{AgentType, CustomAgentDef, SubagentManager, truncate_str};
 use tmg_core::{AgentLoop, CoreError, StreamSink, format_context_usage};
 use tmg_harness::{HarnessStreamSink, RunProgressEvent, RunRunner, RunSummary};
 use tmg_llm::Role;
-use tmg_skills::SlashCommand;
+use tmg_skills::{SkillMeta, SlashCommand};
 use tmg_workflow::{WorkflowMeta, WorkflowProgress};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -239,6 +239,11 @@ pub struct App {
     /// startup; the TUI does not refresh this list at runtime.
     workflows: Vec<WorkflowMeta>,
 
+    /// Discovered skills for `/skills` listing. Loaded once at startup
+    /// from the same discovery pass that registered `use_skill` tool
+    /// metadata; the TUI does not refresh this list at runtime.
+    skills: Vec<SkillMeta>,
+
     /// Pending slash command awaiting async dispatch. Populated by
     /// [`Self::dispatch_slash`] (`SlashDispatch::Async`) and
     /// drained by the event loop on the next tick.
@@ -285,6 +290,7 @@ impl App {
             transient_banner: None,
             human_prompt: None,
             workflows: Vec::new(),
+            skills: Vec::new(),
             pending_slash: None,
         }
     }
@@ -311,6 +317,17 @@ impl App {
     #[must_use]
     pub fn workflows(&self) -> &[WorkflowMeta] {
         &self.workflows
+    }
+
+    /// Replace the discovered skills list (used by `/skills`).
+    pub fn set_skills(&mut self, skills: Vec<SkillMeta>) {
+        self.skills = skills;
+    }
+
+    /// Borrow the discovered skills.
+    #[must_use]
+    pub fn skills(&self) -> &[SkillMeta] {
+        &self.skills
     }
 
     /// Borrow the active transient banner, if any.
@@ -1251,6 +1268,7 @@ impl App {
                         message,
                         options,
                         show,
+                        revise_target,
                         response_tx,
                     } = ev
                     {
@@ -1259,13 +1277,10 @@ impl App {
                         // observer might double-fire), the new prompt
                         // wins. The prior responder is dropped, which
                         // the engine treats as a missing reply.
-                        self.human_prompt = Some(HumanPrompt::new(
-                            step_id,
-                            message,
-                            show,
-                            options,
-                            response_tx,
-                        ));
+                        self.human_prompt = Some(
+                            HumanPrompt::new(step_id, message, show, options, response_tx)
+                                .with_revise_target(revise_target),
+                        );
                     }
                     changed = true;
                 }

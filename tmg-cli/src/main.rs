@@ -259,6 +259,7 @@ fn main() -> anyhow::Result<()> {
                     &config.harness,
                     &config.sandbox,
                     &config.workflow,
+                    &config.skills,
                     None,
                 )
             }
@@ -340,6 +341,7 @@ fn dispatch_run_command(op: RunCommand, config: &TsumugiConfig) -> anyhow::Resul
                 &config.harness,
                 &config.sandbox,
                 &config.workflow,
+                &config.skills,
                 resolved.as_ref(),
             )
         }
@@ -494,6 +496,7 @@ fn run_tui(
     harness_config: &HarnessConfig,
     sandbox_config: &SandboxConfigSection,
     workflow_config: &tmg_workflow::WorkflowConfig,
+    skills_config: &tmg_skills::SkillsConfig,
     explicit_run_id: Option<&tmg_harness::RunId>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -814,6 +817,21 @@ fn run_tui(
             Some(guard.progress_channel())
         };
 
+        // Skill discovery for the `/skills` slash command listing.
+        // Failure is non-fatal: the TUI starts with an empty list and
+        // `/skills` simply reports no skills installed.
+        let skill_metas =
+            match tmg_skills::discover_skills_with_config(&project_root, skills_config).await {
+                Ok(list) => list,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "skill discovery failed; /skills will report an empty list",
+                    );
+                    Vec::new()
+                }
+            };
+
         let tui_cancel = cancel.clone();
         let tui_result = tmg_tui::run(
             agent,
@@ -829,6 +847,7 @@ fn run_tui(
             run_progress_rx,
             workflow_progress_rx,
             workflow_metas.clone(),
+            skill_metas,
         )
         .await;
 

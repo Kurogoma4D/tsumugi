@@ -69,8 +69,21 @@ pub async fn run_event_loop(
         // compact gate so a `/compact` queued from a slash dispatch
         // (none currently, but the path is symmetric) wouldn't be
         // shadowed by an in-flight compact.
+        //
+        // The dispatcher contains `runner.lock().await` calls that can
+        // contend with a long-running tool turn; race it against the
+        // cancellation token so Ctrl+C still breaks the TUI out of a
+        // stuck dispatch (the partial side-effects are tolerable —
+        // we're shutting down anyway).
         if let Some(cmd) = app.take_pending_slash() {
-            dispatch_slash_async(app, cmd).await;
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    app.request_exit();
+                    return Ok(());
+                }
+                () = dispatch_slash_async(app, cmd) => {}
+            }
         }
 
         // Handle pending /compact command as a background task.
@@ -336,20 +349,30 @@ async fn handle_human_prompt_key(app: &mut App, key: KeyEvent) {
 async fn deliver_human_response(app: &mut App, prompt: HumanPrompt) {
     let focused = prompt.focused_option().to_owned();
     let kind = option_kind(&focused);
-    // For revise responses, prefer the workflow's declared
-    // `revise_target`. The TUI does not currently support a free-form
-    // step-id picker; if the workflow author left `revise_target`
-    // unset we fall back to the prompt's own step id (which the engine
-    // may reject — surfaced via the standard error overlay if it
-    // does).
-    let target = match kind {
-        HumanResponseKind::Revise => Some(
-            prompt
-                .revise_target
-                .clone()
-                .unwrap_or_else(|| prompt.step_id.clone()),
-        ),
-        _ => None,
+    // For revise responses we require a `revise_target` declared by the
+    // workflow; without one we cannot pick a meaningful target and
+    // silently falling back to the human-step id would mismatch the
+    // engine's `step_results` map (since the human step has not been
+    // recorded yet) and break the rewind. Surface an error overlay
+    // instead and keep the prompt alive so the user can pick a
+    // different option.
+    let target = if matches!(kind, HumanResponseKind::Revise) {
+        if let Some(t) = prompt.revise_target.clone() {
+            Some(t)
+        } else {
+            let step_id = prompt.step_id.clone();
+            // Drop the responder so the engine observes a missing
+            // reply if the user later cancels the prompt; we do not
+            // consume the prompt itself because the user may wish to
+            // choose Approve/Reject after seeing the error.
+            prompt.take_responder().await;
+            app.set_error(format!(
+                "[human:{step_id}] cannot revise: workflow did not declare `revise_target`",
+            ));
+            return;
+        }
+    } else {
+        None
     };
     let response = HumanResponse { kind, target };
     let label = focused.clone();
@@ -359,7 +382,12 @@ async fn deliver_human_response(app: &mut App, prompt: HumanPrompt) {
         Ok(()) => {
             app.push_slash_output(format!("[human:{step_id}] responded with `{label}`",));
         }
-        Err(()) => {
+        Err(crate::human_prompt::RespondError::AlreadyResponded) => {
+            app.set_error(format!(
+                "[human:{step_id}] failed to deliver `{label}` (already responded)",
+            ));
+        }
+        Err(crate::human_prompt::RespondError::ChannelClosed) => {
             app.set_error(format!(
                 "[human:{step_id}] failed to deliver `{label}` (channel closed)",
             ));
@@ -372,14 +400,20 @@ async fn deliver_human_response(app: &mut App, prompt: HumanPrompt) {
 /// chat entries or error overlays.
 async fn dispatch_slash_async(app: &mut App, cmd: SlashCommand) {
     match cmd {
-        SlashCommand::ListSkills | SlashCommand::InvokeSkill { .. } => {
-            // Skill invocation/listing is not yet wired into the TUI's
-            // async surface (skills run via `use_skill` tool calls
-            // inside an active turn). Surface a friendly message so
-            // the user knows the command was recognised but is a
-            // no-op here.
+        SlashCommand::ListSkills => {
+            // Render the discovered skills list. The same metadata is
+            // used by the agent's `use_skill` tool, so the listing
+            // mirrors the LLM's view of available skills.
+            let text = tmg_skills::format_skills_list(app.skills());
+            app.push_slash_output(text);
+        }
+        SlashCommand::InvokeSkill { .. } => {
+            // Direct skill invocation from the TUI is not wired up:
+            // skills run via the LLM's `use_skill` tool inside a turn.
+            // Surface a friendly hint so the user reaches the canonical
+            // path.
             app.set_error(
-                "Skill commands are dispatched via the agent's tool loop; \
+                "Skill invocation is dispatched via the agent's tool loop; \
                  type your request normally and the agent will pick the right skill"
                     .to_owned(),
             );
@@ -392,9 +426,10 @@ async fn dispatch_slash_async(app: &mut App, cmd: SlashCommand) {
         SlashCommand::RunPause => run_pause(app).await,
         SlashCommand::RunAbort => run_abort(app).await,
         SlashCommand::RunStart { workflow, args } => {
-            // The TUI cannot drive a workflow synchronously: workflows
-            // execute via the LLM's `run_workflow` tool call. Surface
-            // a hint that drives the user to the canonical path.
+            // In-TUI workflow start is tracked in #71. For now, the TUI
+            // cannot drive a workflow synchronously: workflows execute
+            // via the LLM's `run_workflow` tool call. Surface a hint
+            // that drives the user to the canonical path.
             let arg_hint = args.as_deref().unwrap_or("");
             let suffix = if arg_hint.is_empty() {
                 String::new()
@@ -402,17 +437,18 @@ async fn dispatch_slash_async(app: &mut App, cmd: SlashCommand) {
                 format!(" with arguments `{arg_hint}`")
             };
             app.push_slash_output(format!(
-                "Ask the agent: \"run the {workflow} workflow{suffix}\". \
+                "/run start is not yet wired into the TUI (see #71). \
+                 Ask the agent: \"run the {workflow} workflow{suffix}\". \
                  The agent dispatches workflows via the run_workflow tool.",
             ));
         }
         SlashCommand::RunResume { run_id } => {
-            // In-TUI run rotation is not currently supported (the TUI
-            // attaches to a single run for its whole lifetime). Show a
+            // In-TUI run rotation is tracked in #71. The TUI currently
+            // attaches to a single run for its whole lifetime; show a
             // hint pointing at the CLI command.
             let target = run_id.unwrap_or_else(|| "<id>".to_owned());
             app.push_slash_output(format!(
-                "Resuming a different run from inside the TUI is not yet supported. \
+                "/run resume is not yet wired into the TUI (see #71). \
                  Exit and run `tmg run resume {target}` to attach to that run.",
             ));
         }

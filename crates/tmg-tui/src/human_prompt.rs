@@ -21,15 +21,30 @@
 //! ## Response mapping
 //!
 //! The mapping from option-string to [`tmg_workflow::HumanResponseKind`]
-//! is intentionally lenient: any string starting with `app` becomes
-//! `Approve`, any string starting with `rej` becomes `Reject`, any
-//! string starting with `rev` becomes `Revise`. Workflow authors that
-//! deviate from the canonical names will still get a sensible default.
+//! is intentionally lenient (see [`option_kind`] for the full table):
+//! any string starting with `rej`, plus the literals `no` / `deny`,
+//! becomes `Reject`; any string starting with `rev` becomes `Revise`;
+//! everything else (including `app...`, `yes`, `ok`) falls through to
+//! `Approve`.
 
 use std::sync::Arc;
 
+use thiserror::Error;
 use tmg_workflow::{HumanResponder, HumanResponse, HumanResponseKind};
 use tokio::sync::Mutex;
+
+/// Errors returned by [`HumanPrompt::respond`].
+#[derive(Debug, Error)]
+pub enum RespondError {
+    /// The carried `oneshot::Sender` had already been taken (e.g. by a
+    /// prior `respond` call or by [`HumanPrompt::take_responder`]).
+    #[error("human prompt has already been responded to")]
+    AlreadyResponded,
+    /// The receiver was dropped before the response could be delivered.
+    /// The engine treats this the same as a missing reply.
+    #[error("human prompt channel was closed before delivery")]
+    ChannelClosed,
+}
 
 /// State for an in-flight `human` step prompt.
 #[derive(Debug)]
@@ -137,20 +152,23 @@ impl HumanPrompt {
 
     /// Send the carried response and consume the prompt.
     ///
-    /// Returns `Ok(())` on a successful send; `Err(())` when the
-    /// responder was already taken (double-take per the [`HumanResponder`]
-    /// contract). The TUI logs the error and clears the prompt either
-    /// way.
-    pub async fn respond(self, response: HumanResponse) -> Result<(), ()> {
+    /// # Errors
+    ///
+    /// Returns [`RespondError::AlreadyResponded`] when the carried
+    /// sender has already been taken (per the [`HumanResponder`] take-
+    /// once contract). Returns [`RespondError::ChannelClosed`] when the
+    /// engine-side receiver was dropped before delivery. The TUI logs
+    /// the error and clears the prompt either way.
+    pub async fn respond(self, response: HumanResponse) -> Result<(), RespondError> {
         let mut guard = self.responder.lock().await;
         let Some(tx) = guard.take() else {
-            return Err(());
+            return Err(RespondError::AlreadyResponded);
         };
         // Drop the guard before sending so the engine isn't blocked
         // waiting on the mutex in case it tries to read the responder
         // for diagnostics.
         drop(guard);
-        tx.send(response).map_err(|_| ())
+        tx.send(response).map_err(|_| RespondError::ChannelClosed)
     }
 
     /// Take the responder out so the prompt can be dismissed without
@@ -173,18 +191,20 @@ impl HumanPrompt {
 
 /// Map an option string to a response kind.
 ///
-/// Recognised prefixes:
-/// * `app...` → [`HumanResponseKind::Approve`]
-/// * `rej...` → [`HumanResponseKind::Reject`]
-/// * `rev...` → [`HumanResponseKind::Revise`]
+/// Recognised prefixes (ASCII case-insensitive):
+/// * `app...` / `yes` / `ok`        → [`HumanResponseKind::Approve`]
+/// * `rej...` / `no` / `deny`       → [`HumanResponseKind::Reject`]
+/// * `rev...`                        → [`HumanResponseKind::Revise`]
 ///
-/// Anything else falls back to `Approve` so workflow authors using
-/// ad-hoc affirmative options (`yes`, `ok`, ...) still see something
-/// sensible.
+/// Anything else falls back to `Approve` — workflow authors deviating
+/// from the canonical `approve / reject / revise` set are expected to
+/// use one of the affirmative aliases above; truly unrecognised strings
+/// are treated as approve so the modal cannot hard-error on a
+/// well-formed option list.
 #[must_use]
 pub fn option_kind(option: &str) -> HumanResponseKind {
     let lower = option.to_ascii_lowercase();
-    if lower.starts_with("rej") || lower.starts_with("no") {
+    if lower.starts_with("rej") || lower == "no" || lower == "deny" {
         HumanResponseKind::Reject
     } else if lower.starts_with("rev") {
         HumanResponseKind::Revise
@@ -279,7 +299,21 @@ mod tests {
         let mut guard = handle.lock().await;
         let _ = guard.take();
         drop(guard);
-        let err = prompt.respond(HumanResponse::approve()).await;
-        assert!(err.is_err());
+        let err = prompt
+            .respond(HumanResponse::approve())
+            .await
+            .expect_err("double-respond should fail");
+        assert!(matches!(err, RespondError::AlreadyResponded));
+    }
+
+    #[tokio::test]
+    async fn respond_after_receiver_dropped_returns_channel_closed() {
+        let (prompt, rx) = make_prompt(vec!["approve"]);
+        drop(rx);
+        let err = prompt
+            .respond(HumanResponse::approve())
+            .await
+            .expect_err("send to closed channel should fail");
+        assert!(matches!(err, RespondError::ChannelClosed));
     }
 }
