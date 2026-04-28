@@ -923,6 +923,14 @@ pub struct SandboxConfigSection {
     #[serde(default)]
     pub allowed_domains: Option<Vec<String>>,
 
+    /// Structured `[sandbox.network]` settings (SPEC §6.2).
+    ///
+    /// Mirrors [`tmg_sandbox::NetworkConfig`] but lets partial TOML
+    /// sections merge independently of the legacy top-level
+    /// `allowed_domains`.
+    #[serde(default)]
+    pub network: Option<NetworkConfigSection>,
+
     /// Maximum execution time in seconds for shell commands.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -930,6 +938,24 @@ pub struct SandboxConfigSection {
     /// OOM score adjustment for child processes (Linux only).
     #[serde(default)]
     pub oom_score_adj: Option<i32>,
+}
+
+/// `[sandbox.network]` settings as exposed in `tsumugi.toml`.
+///
+/// Mirrors [`tmg_sandbox::NetworkConfig`] but uses `Option` wrappers so
+/// that partial overlays (e.g. a user `tsumugi.toml` that only sets
+/// `strict = true`) can merge cleanly with the project default.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct NetworkConfigSection {
+    /// Domains allowed for outbound network access.
+    #[serde(default)]
+    pub allowed_domains: Option<Vec<String>>,
+
+    /// When `true`, missing `CAP_NET_ADMIN` causes activation to fail.
+    /// When unset or `false`, the agent emits a warning and continues
+    /// without network restriction.
+    #[serde(default)]
+    pub strict: Option<bool>,
 }
 
 /// TUI display settings from `[tui]` section.
@@ -1139,6 +1165,12 @@ impl SandboxConfigSection {
         if other.allowed_domains.is_some() {
             self.allowed_domains.clone_from(&other.allowed_domains);
         }
+        if let Some(other_net) = &other.network {
+            let net = self
+                .network
+                .get_or_insert_with(NetworkConfigSection::default);
+            net.merge_from(other_net);
+        }
         if other.timeout_secs.is_some() {
             self.timeout_secs = other.timeout_secs;
         }
@@ -1166,6 +1198,16 @@ impl SandboxConfigSection {
         if let Some(domains) = self.allowed_domains.clone() {
             cfg = cfg.with_allowed_domains(domains);
         }
+        if let Some(net) = &self.network {
+            let mut nc = tmg_sandbox::NetworkConfig::default();
+            if let Some(domains) = net.allowed_domains.clone() {
+                nc.allowed_domains = domains;
+            }
+            if let Some(strict) = net.strict {
+                nc.strict = strict;
+            }
+            cfg = cfg.with_network(nc);
+        }
         if let Some(timeout) = self.timeout_secs {
             cfg = cfg.with_timeout(timeout);
         }
@@ -1173,6 +1215,18 @@ impl SandboxConfigSection {
             cfg.oom_score_adj = oom;
         }
         cfg
+    }
+}
+
+impl NetworkConfigSection {
+    /// Merge `other` into `self`. `Some` fields in `other` take precedence.
+    fn merge_from(&mut self, other: &Self) {
+        if other.allowed_domains.is_some() {
+            self.allowed_domains.clone_from(&other.allowed_domains);
+        }
+        if other.strict.is_some() {
+            self.strict = other.strict;
+        }
     }
 }
 

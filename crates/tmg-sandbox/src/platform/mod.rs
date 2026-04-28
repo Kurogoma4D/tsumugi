@@ -11,7 +11,13 @@ mod linux;
 mod fallback;
 
 #[cfg(target_os = "linux")]
-pub use linux::{adjust_oom_score, apply_landlock, create_network_namespace};
+pub use linux::{
+    NetworkAcl, adjust_oom_score, apply_landlock, bring_up_loopback, create_network_namespace,
+    has_cap_net_admin, install_iptables_chain, resolve_domains,
+};
 
 #[cfg(not(target_os = "linux"))]
-pub use fallback::{adjust_oom_score, apply_landlock, create_network_namespace};
+pub use fallback::{
+    NetworkAcl, adjust_oom_score, apply_landlock, bring_up_loopback, create_network_namespace,
+    has_cap_net_admin, install_iptables_chain, resolve_domains,
+};

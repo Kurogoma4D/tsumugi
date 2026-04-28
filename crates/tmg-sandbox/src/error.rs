@@ -20,6 +20,18 @@ pub enum SandboxError {
         source: std::io::Error,
     },
 
+    /// Failed to install the network ACL (DNS resolution + iptables rules)
+    /// inside the netns.
+    ///
+    /// This error covers DNS resolution failures, missing `iptables`
+    /// binary, non-zero exit from any `iptables` invocation, and
+    /// `CAP_NET_ADMIN` enforcement under `strict` mode.
+    #[error("failed to apply network ACL: {reason}")]
+    NetworkAcl {
+        /// A human-readable description of what went wrong.
+        reason: String,
+    },
+
     /// A filesystem access was denied by the sandbox.
     #[error("access denied: {path} is outside the sandbox")]
     AccessDenied {
