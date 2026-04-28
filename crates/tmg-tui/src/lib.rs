@@ -5,17 +5,21 @@
 
 pub mod activity;
 pub mod app;
+pub mod banner;
 pub mod diff;
 pub mod error;
 pub mod event;
+pub mod human_prompt;
 pub mod ui;
 
 pub use activity::{
     ActivityPane, RunHeader, RunProgressSection, ToolActivityEntry, WorkflowProgressSection,
 };
 pub use app::App;
+pub use banner::TransientBanner;
 pub use diff::DiffPreview;
 pub use error::TuiError;
+pub use human_prompt::HumanPrompt;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,7 +32,7 @@ use crossterm::execute;
 use tmg_agents::{CustomAgentDef, SubagentManager};
 use tmg_core::AgentLoop;
 use tmg_harness::{RunProgressReceiver, RunRunner, RunSummary};
-use tmg_workflow::WorkflowProgress;
+use tmg_workflow::{WorkflowMeta, WorkflowProgress};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -61,6 +65,8 @@ use tokio_util::sync::CancellationToken;
 ///   [`tmg_workflow::register_workflow_tools_with_observer`]); the
 ///   activity pane drains it every tick to surface live workflow
 ///   progress events.
+/// * `workflows` - Discovered workflows for the `/workflows` slash
+///   command listing. Empty vec disables that listing.
 ///
 /// # Errors
 ///
@@ -82,6 +88,7 @@ pub async fn run(
     runner: Option<Arc<Mutex<RunRunner>>>,
     run_progress_rx: Option<RunProgressReceiver>,
     workflow_progress_rx: Option<mpsc::Receiver<WorkflowProgress>>,
+    workflows: Vec<WorkflowMeta>,
 ) -> Result<(), TuiError> {
     // Pre-warm the syntect bundle off the rendering thread. Loading
     // `SyntaxSet::load_defaults_newlines` + `ThemeSet::load_defaults`
@@ -148,6 +155,10 @@ pub async fn run(
 
     if let Some(rx) = workflow_progress_rx {
         app.set_workflow_progress_rx(rx);
+    }
+
+    if !workflows.is_empty() {
+        app.set_workflows(workflows);
     }
 
     let result = event::run_event_loop(&mut terminal, &mut app, cancel).await;

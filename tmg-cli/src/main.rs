@@ -828,6 +828,7 @@ fn run_tui(
             Some(Arc::clone(&runner)),
             run_progress_rx,
             workflow_progress_rx,
+            workflow_metas.clone(),
         )
         .await;
 

@@ -192,7 +192,14 @@ pub struct SkillContent {
 // ---------------------------------------------------------------------------
 
 /// A parsed slash command from user input.
+///
+/// The variants below cover both skill-related commands (the original
+/// scope of this enum) and TUI-level operations (clear, exit, run-
+/// management, workflow listing) consolidated here in issue #46 so a
+/// single `dispatch_slash` site in `tmg-tui` can route every slash
+/// command through one match.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum SlashCommand {
     /// `/skills` — list all installed skills.
     ListSkills,
@@ -204,4 +211,51 @@ pub enum SlashCommand {
         /// Optional arguments passed after the skill name.
         args: Option<String>,
     },
+
+    // ---- TUI-level commands (issue #46) ----------------------------------
+    /// `/clear` — wipe chat & tool log and reload the prompt files.
+    Clear,
+    /// `/compact` — trigger a context compression turn.
+    Compact,
+    /// `/exit` (or `/quit`) — request the application to exit.
+    Exit,
+    /// `/agents` — show the list of available subagent types and live
+    /// subagent statuses.
+    ListAgents,
+    /// `/workflows` — show the list of discovered workflows.
+    ListWorkflows,
+
+    // ---- /run subcommands (SPEC §9.8) ------------------------------------
+    /// `/run start <workflow> [args]` — start a workflow run.
+    RunStart {
+        /// Workflow id (matches `WorkflowDef::id`).
+        workflow: String,
+        /// Optional remaining arguments string (typically `key=value`
+        /// pairs). The TUI passes this through to the workflow tool.
+        args: Option<String>,
+    },
+    /// `/run resume [<id>]` — resume a paused or backgrounded run.
+    RunResume {
+        /// Optional explicit run id; when `None` the TUI defers to the
+        /// auto-resume policy (most-recent resumable run).
+        run_id: Option<String>,
+    },
+    /// `/run list` — list all runs in the run store.
+    RunList,
+    /// `/run status [<id>]` — show status of a run.
+    RunStatus {
+        /// Optional run id; when `None` the active run is used.
+        run_id: Option<String>,
+    },
+    /// `/run upgrade` — promote the active run to harnessed scope.
+    RunUpgrade,
+    /// `/run downgrade` — demote the active run back to ad-hoc.
+    RunDowngrade,
+    /// `/run new-session` — manually rotate to a fresh session.
+    RunNewSession,
+    /// `/run pause` — flip the active run to `Paused`.
+    RunPause,
+    /// `/run abort` — flip the active run to `Failed { reason: "user
+    /// aborted" }`.
+    RunAbort,
 }
