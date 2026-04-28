@@ -42,6 +42,27 @@ use crate::error::AgentError;
 use crate::runner::SubagentRunner;
 use crate::status::SubagentStatus;
 
+/// Borrowed payload handed to an [`EndpointResolvedHook`] each time the
+/// [`EndpointResolver`] picks a spawn target.
+///
+/// Bundling the four strings into a struct (rather than passing them as
+/// positional arguments) prevents argument-swap bugs at the hook
+/// boundary: the CLI's `--event-log` writer can name each field
+/// explicitly when forwarding the event, and adding a future field
+/// (e.g. resolved provenance metadata) is non-breaking. Issue #50.
+#[derive(Debug, Clone, Copy)]
+pub struct EndpointResolvedEvent<'a> {
+    /// The agent kind's display name (e.g. `"explore"`, `"reviewer"`).
+    pub agent_kind: &'a str,
+    /// The resolved base URL the spawn will route to.
+    pub endpoint: &'a str,
+    /// The resolved model name.
+    pub model: &'a str,
+    /// The precedence rule that produced the pair (e.g. `"main"`,
+    /// `"pool"`, `"escalator_override"`, `"custom"`).
+    pub source: &'a str,
+}
+
 /// Boxed observer the manager invokes whenever an
 /// [`EndpointResolver`] resolves a spawn target.
 ///
@@ -50,7 +71,7 @@ use crate::status::SubagentStatus;
 /// [`tmg_core::EventLogWriter`]; the CLI's TUI startup wires this up to
 /// `event_log.write_endpoint_resolved` when an `--event-log` path was
 /// supplied. Issue #50.
-pub type EndpointResolvedHook = Arc<dyn Fn(&str, &str, &str, &str) + Send + Sync + 'static>;
+pub type EndpointResolvedHook = Arc<dyn Fn(&EndpointResolvedEvent<'_>) + Send + Sync + 'static>;
 
 /// Optional overrides for the escalator subagent's `(endpoint, model)`
 /// pair plus an explicit disable switch (SPEC §9.10 / §10.1
@@ -305,9 +326,10 @@ impl SubagentManager {
     ///
     /// Useful when the manager already lives behind an `Arc<Mutex<_>>`
     /// and the escalator config changes after construction (e.g. a
-    /// future config-reload path).
+    /// future config-reload path). Mutates the resolver in place
+    /// without cloning the entire struct (issue #50 review feedback).
     pub fn set_escalator_overrides(&mut self, overrides: EscalatorOverrides) {
-        self.resolver = self.resolver.clone().with_escalator_overrides(overrides);
+        self.resolver.set_escalator_overrides(overrides);
     }
 
     /// Borrow the currently-installed escalator overrides.
@@ -431,12 +453,13 @@ impl SubagentManager {
         // `LlmClient`; otherwise we spin up a dedicated client.
         let resolved = self.resolver.resolve(&config.agent_kind).await;
         if let Some(hook) = &self.resolved_hook {
-            hook(
-                config.agent_kind.name(),
-                &resolved.endpoint,
-                &resolved.model,
-                resolved.source.as_str(),
-            );
+            let event = EndpointResolvedEvent {
+                agent_kind: config.agent_kind.name(),
+                endpoint: &resolved.endpoint,
+                model: &resolved.model,
+                source: resolved.source.as_str(),
+            };
+            hook(&event);
         }
         let client = if resolved.endpoint == self.resolver.main_endpoint()
             && resolved.model == self.resolver.main_model()
@@ -889,6 +912,85 @@ allow = ["file_read"]
             .spawn(cfg_explore)
             .await
             .unwrap_or_else(|e| panic!("non-escalator spawn must still succeed: {e}"));
+
+        cancel.cancel();
+        manager.shutdown().await;
+    }
+
+    /// One observed [`EndpointResolvedEvent`] flattened to owned
+    /// strings so the test thread can inspect it after the
+    /// `Fn(&EndpointResolvedEvent<'_>)` hook returns. The named
+    /// fields keep the assertion site readable and avoid the
+    /// `clippy::type_complexity` warning a four-tuple triggered.
+    #[derive(Clone)]
+    struct CapturedEvent {
+        agent_kind: String,
+        endpoint: String,
+        model: String,
+        source: String,
+    }
+
+    /// Issue #50 review: the
+    /// [`SubagentManager::set_endpoint_resolved_hook`] surface is the
+    /// only published seam between the resolver and the CLI's
+    /// `--event-log` writer; when `spawn` resolves an endpoint it
+    /// must fire the installed hook with the
+    /// [`EndpointResolvedEvent`] for the spawn target. Without this
+    /// test the wiring claim in the PR description was unverifiable
+    /// at unit-test scope.
+    #[tokio::test]
+    async fn endpoint_resolved_hook_fires_on_spawn() {
+        use std::sync::Mutex as StdMutex;
+
+        let config = tmg_llm::LlmClientConfig::new("http://main:8080", "main-model");
+        let Ok(client) = tmg_llm::LlmClient::new(config) else {
+            return;
+        };
+        let cancel = CancellationToken::new();
+        let mut manager = SubagentManager::new(
+            client,
+            cancel.clone(),
+            EndpointResolver::new("http://main:8080", "main-model"),
+            Arc::new(SandboxContext::test_default()),
+        );
+        // Capture every call into a thread-safe vec so the test can
+        // observe the precedence rule that fired.
+        let captured: Arc<StdMutex<Vec<CapturedEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+        let captured_for_hook = Arc::clone(&captured);
+        manager.set_endpoint_resolved_hook(Some(Arc::new(
+            move |ev: &EndpointResolvedEvent<'_>| {
+                if let Ok(mut g) = captured_for_hook.lock() {
+                    g.push(CapturedEvent {
+                        agent_kind: ev.agent_kind.to_owned(),
+                        endpoint: ev.endpoint.to_owned(),
+                        model: ev.model.to_owned(),
+                        source: ev.source.to_owned(),
+                    });
+                }
+            },
+        )));
+
+        let cfg = SubagentConfig {
+            agent_kind: AgentKind::Builtin(AgentType::Explore),
+            task: "exercise the hook".to_owned(),
+            background: true,
+        };
+        manager
+            .spawn(cfg)
+            .await
+            .unwrap_or_else(|e| panic!("spawn must succeed for explore: {e}"));
+
+        // Snapshot the captured events under a short-lived guard so
+        // the std mutex is released before any subsequent .await.
+        let snapshot: Vec<CapturedEvent> = {
+            let guard = captured.lock().unwrap_or_else(|e| panic!("{e}"));
+            guard.clone()
+        };
+        assert_eq!(snapshot.len(), 1, "hook must fire exactly once per spawn");
+        assert_eq!(snapshot[0].agent_kind, "explore");
+        assert_eq!(snapshot[0].endpoint, "http://main:8080");
+        assert_eq!(snapshot[0].model, "main-model");
+        assert_eq!(snapshot[0].source, "main");
 
         cancel.cancel();
         manager.shutdown().await;

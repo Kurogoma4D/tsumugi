@@ -29,8 +29,8 @@ pub use endpoint_resolver::{EndpointResolver, ResolutionSource, ResolvedEndpoint
 pub use error::AgentError;
 pub use escalator::{EscalatorVerdict, ParseError as EscalatorParseError, parse_verdict};
 pub use manager::{
-    EndpointResolvedHook, EscalatorOverrides, SubagentId, SubagentManager, SubagentSummary,
-    derive_sandbox,
+    EndpointResolvedEvent, EndpointResolvedHook, EscalatorOverrides, SubagentId, SubagentManager,
+    SubagentSummary, derive_sandbox,
 };
 pub use runner::SubagentRunner;
 pub use status::{SubagentStatus, truncate_str};

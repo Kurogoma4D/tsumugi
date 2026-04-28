@@ -16,7 +16,10 @@ pub use prompt_tool_calling::{
     ParseError, ToolCallingMode, build_tool_calling_prompt, format_compressed_tool_defs,
     parse_tool_calls,
 };
-pub use tokenize::{count_tokens_or_estimate, estimate_tokens_heuristic};
+pub use tokenize::{
+    TokenizeFailureHook, count_tokens_or_estimate, estimate_tokens_heuristic,
+    set_tokenize_failure_hook,
+};
 pub use types::{
     ChatMessage, ChatRequest, ChatResponse, FunctionCall, FunctionDefinition, Role, StreamEvent,
     TokenizeResponse, ToolCall, ToolCallAccumulator, ToolCallIndexError, ToolDefinition, ToolKind,

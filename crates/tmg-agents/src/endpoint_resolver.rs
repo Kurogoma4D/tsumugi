@@ -123,6 +123,15 @@ impl EndpointResolver {
         self
     }
 
+    /// Replace the [`EscalatorOverrides`] in-place.
+    ///
+    /// Useful for callers that already own a mutable reference to the
+    /// resolver (e.g. [`SubagentManager::set_escalator_overrides`])
+    /// and want to avoid cloning the resolver just to swap one field.
+    pub fn set_escalator_overrides(&mut self, overrides: EscalatorOverrides) {
+        self.escalator_override = overrides;
+    }
+
     /// Borrow the main endpoint URL so the manager can decide whether
     /// to reuse its shared `LlmClient` (when the resolved URL matches)
     /// or construct a per-spawn client.
@@ -151,6 +160,12 @@ impl EndpointResolver {
     ///
     /// See the module docs for the precedence rules. This is `async`
     /// because step 3 may need to acquire the pool's read lock.
+    ///
+    /// Allocates three `String`s on every call (one per resolved
+    /// field). The cost is dwarfed by the spawn / LLM-client
+    /// construction the caller does next, so the allocation is
+    /// intentionally not optimised away.
+    #[must_use = "the resolved endpoint is the only output; ignoring it would make the call pointless"]
     pub async fn resolve(&self, kind: &AgentKind) -> ResolvedEndpoint {
         // Step 1: custom agent overrides.
         if let AgentKind::Custom(def) = kind {
@@ -436,6 +451,86 @@ allow = ["file_read"]
         assert_eq!(resolved.endpoint, "http://custom:7777");
         assert_eq!(resolved.model, "main-model");
         assert_eq!(resolved.source, ResolutionSource::Custom);
+    }
+
+    /// Two sequential resolves on a 2-endpoint pool must yield two
+    /// different URLs, proving the round-robin counter advances on
+    /// every call. Regression for issue #50 review: previously only
+    /// single-call resolves were tested.
+    #[tokio::test]
+    async fn pool_round_robin_advances_across_two_resolves() {
+        let pool = Arc::new(
+            LlmPool::new(
+                &PoolConfig {
+                    endpoints: vec![
+                        "http://pool-a:8080".to_owned(),
+                        "http://pool-b:8080".to_owned(),
+                    ],
+                    strategy: LoadBalanceStrategy::RoundRobin,
+                },
+                "main-model",
+            )
+            .expect("pool"),
+        );
+        let resolver = main_resolver().with_pool(Some(pool));
+        let kind = AgentKind::Builtin(AgentType::Worker);
+        let first = resolver.resolve(&kind).await;
+        let second = resolver.resolve(&kind).await;
+        assert_eq!(first.source, ResolutionSource::Pool);
+        assert_eq!(second.source, ResolutionSource::Pool);
+        assert_ne!(
+            first.endpoint, second.endpoint,
+            "round-robin must advance: first={}, second={}",
+            first.endpoint, second.endpoint,
+        );
+    }
+
+    /// Concurrent resolves on a 3-endpoint pool must each pick a
+    /// distinct URL when the counter is incremented atomically. The
+    /// `tokio::join!` schedules both futures on the same runtime, so
+    /// any non-atomic increment would surface as a duplicate URL with
+    /// reasonable frequency under stress; the deterministic assertion
+    /// here is the strongest guarantee we can make without adding a
+    /// fuzz harness.
+    #[tokio::test]
+    async fn pool_round_robin_handles_concurrent_resolves() {
+        let pool = Arc::new(
+            LlmPool::new(
+                &PoolConfig {
+                    endpoints: vec![
+                        "http://pool-a:8080".to_owned(),
+                        "http://pool-b:8080".to_owned(),
+                        "http://pool-c:8080".to_owned(),
+                    ],
+                    strategy: LoadBalanceStrategy::RoundRobin,
+                },
+                "main-model",
+            )
+            .expect("pool"),
+        );
+        let resolver = main_resolver().with_pool(Some(pool));
+        let kind = AgentKind::Builtin(AgentType::Worker);
+
+        // Three concurrent resolves should produce a permutation of
+        // the three endpoint URLs (the round-robin counter starts at 0
+        // and increments atomically). We collect into a `HashSet` to
+        // assert uniqueness; any drop in the count proves the
+        // `AtomicUsize` did not behave under contention.
+        let (a, b, c) = tokio::join!(
+            resolver.resolve(&kind),
+            resolver.resolve(&kind),
+            resolver.resolve(&kind),
+        );
+        let urls: std::collections::HashSet<String> =
+            [a.endpoint, b.endpoint, c.endpoint].into_iter().collect();
+        assert_eq!(
+            urls.len(),
+            3,
+            "concurrent resolves must each pick a distinct URL; got {urls:?}",
+        );
+        assert!(urls.contains("http://pool-a:8080"));
+        assert!(urls.contains("http://pool-b:8080"));
+        assert!(urls.contains("http://pool-c:8080"));
     }
 
     #[tokio::test]

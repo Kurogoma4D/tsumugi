@@ -237,6 +237,21 @@ impl LlmPool {
         }
     }
 
+    /// Return the configured load-balancing strategy.
+    ///
+    /// Single-endpoint pools report
+    /// [`LoadBalanceStrategy::default`] because no balancing actually
+    /// runs. The strategy is part of the public surface so the
+    /// `--event-log` writer can stamp `pool_selected` events with the
+    /// rule that picked the endpoint (issue #50).
+    #[must_use = "the strategy is the only output"]
+    pub fn strategy(&self) -> LoadBalanceStrategy {
+        match &self.inner {
+            PoolInner::Single { .. } => LoadBalanceStrategy::default(),
+            PoolInner::Multi { strategy, .. } => *strategy,
+        }
+    }
+
     /// Return the number of endpoints in the pool.
     #[must_use = "this returns the count without side effects"]
     pub async fn endpoint_count(&self) -> usize {

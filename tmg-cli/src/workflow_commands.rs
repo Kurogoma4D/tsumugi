@@ -29,6 +29,10 @@ use tmg_workflow::{
 };
 
 use crate::config::{HarnessConfig, TsumugiConfig};
+use crate::pool_setup::{
+    install_event_log_hooks, install_tokenize_failure_hook, open_event_log,
+    subagent_pool_from_config,
+};
 
 /// Parse a single `--input k=v` pair into `(key, value)`.
 ///
@@ -193,6 +197,7 @@ pub(crate) fn cmd_run(
     workflow_id: &str,
     inputs_raw: &[String],
     config: &TsumugiConfig,
+    event_log: Option<&Path>,
 ) -> anyhow::Result<()> {
     // 1. Parse the inputs first so we fail fast on bad CLI input.
     let mut inputs: BTreeMap<String, Value> = BTreeMap::new();
@@ -231,9 +236,11 @@ pub(crate) fn cmd_run(
         let store = Arc::new(RunStore::new(runs_dir));
 
         match workflow.mode {
-            WorkflowMode::Normal => run_normal(&workflow, inputs, &canonical, config).await,
+            WorkflowMode::Normal => {
+                run_normal(&workflow, inputs, &canonical, config, event_log).await
+            }
             WorkflowMode::LongRunning => {
-                run_long_running(&workflow, inputs, &canonical, &store, config).await
+                run_long_running(&workflow, inputs, &canonical, &store, config, event_log).await
             }
             other => anyhow::bail!(
                 "unsupported workflow mode for this CLI: {other:?}. \
@@ -304,11 +311,16 @@ fn render_value(v: &Value) -> String {
     clippy::print_stderr,
     reason = "WorkflowProgress events stream to stderr per SPEC §9.13"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear setup (pool -> resolver -> manager -> engine -> stream); splitting obscures the ad-hoc startup sequence"
+)]
 async fn run_normal(
     workflow: &WorkflowDef,
     inputs: BTreeMap<String, Value>,
     canonical: &Path,
     config: &TsumugiConfig,
+    event_log: Option<&Path>,
 ) -> anyhow::Result<()> {
     let llm_pool = Arc::new(
         tmg_llm::LlmPool::new(
@@ -335,12 +347,38 @@ async fn run_normal(
         tmg_sandbox::SandboxConfig::new(canonical)
             .with_mode(tmg_sandbox::SandboxMode::WorkspaceWrite),
     ));
+    // Honour `[llm.subagent_pool]` so subagents spawned by the
+    // workflow engine fan across the configured endpoints. The TUI
+    // path used to be the only consumer of this config — issue #50
+    // review caught the silent drop here.
+    let subagent_pool =
+        subagent_pool_from_config(config.llm.subagent_pool.as_ref(), &config.llm.model);
+    let pool_strategy_label: Option<&'static str> =
+        subagent_pool.as_ref().map(|p| p.strategy().as_str());
+    let resolver = tmg_agents::EndpointResolver::new(&config.llm.endpoint, &config.llm.model)
+        .with_pool(subagent_pool);
     let subagent_manager = Arc::new(Mutex::new(tmg_agents::SubagentManager::new(
         llm_client,
         cancel.clone(),
-        tmg_agents::EndpointResolver::new(&config.llm.endpoint, &config.llm.model),
+        resolver,
         Arc::clone(&sandbox),
     )));
+    if let Some(path) = event_log {
+        match open_event_log(path) {
+            Ok(log_writer) => {
+                install_event_log_hooks(
+                    Arc::clone(&subagent_manager),
+                    Arc::clone(&log_writer),
+                    pool_strategy_label,
+                )
+                .await;
+                install_tokenize_failure_hook(log_writer);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open event log for workflow run; resolver/tokenize events will not be recorded");
+            }
+        }
+    }
     let registry = Arc::new(tmg_tools::ToolRegistry::new());
     let engine = WorkflowEngine::new(
         llm_pool,
@@ -411,6 +449,7 @@ async fn run_long_running(
     canonical: &Path,
     store: &Arc<RunStore>,
     config: &TsumugiConfig,
+    event_log: Option<&Path>,
 ) -> anyhow::Result<()> {
     let cancel = CancellationToken::new();
     {
@@ -452,12 +491,36 @@ async fn run_long_running(
         tmg_sandbox::SandboxConfig::new(canonical)
             .with_mode(tmg_sandbox::SandboxMode::WorkspaceWrite),
     ));
+    // Honour `[llm.subagent_pool]` for long-running workflow spawns
+    // (issue #50 review).
+    let subagent_pool =
+        subagent_pool_from_config(config.llm.subagent_pool.as_ref(), &config.llm.model);
+    let pool_strategy_label: Option<&'static str> =
+        subagent_pool.as_ref().map(|p| p.strategy().as_str());
+    let resolver = tmg_agents::EndpointResolver::new(&config.llm.endpoint, &config.llm.model)
+        .with_pool(subagent_pool);
     let subagent_manager = Arc::new(Mutex::new(tmg_agents::SubagentManager::new(
         llm_client,
         cancel.clone(),
-        tmg_agents::EndpointResolver::new(&config.llm.endpoint, &config.llm.model),
+        resolver,
         Arc::clone(&sandbox),
     )));
+    if let Some(path) = event_log {
+        match open_event_log(path) {
+            Ok(log_writer) => {
+                install_event_log_hooks(
+                    Arc::clone(&subagent_manager),
+                    Arc::clone(&log_writer),
+                    pool_strategy_label,
+                )
+                .await;
+                install_tokenize_failure_hook(log_writer);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open event log for long-running workflow; resolver/tokenize events will not be recorded");
+            }
+        }
+    }
     let registry = Arc::new(tmg_tools::ToolRegistry::new());
     let engine = Arc::new(WorkflowEngine::new(
         llm_pool,
