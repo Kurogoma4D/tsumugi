@@ -360,15 +360,20 @@ async fn deliver_human_response(app: &mut App, prompt: HumanPrompt) {
         if let Some(t) = prompt.revise_target.clone() {
             Some(t)
         } else {
+            // Without a `revise_target` declared by the workflow we
+            // cannot pick a meaningful rewind target — silently
+            // falling back to the human-step id would mismatch the
+            // engine's `step_results` map (the human step has not been
+            // recorded yet) and break the rewind. Surface an error
+            // overlay and re-stash the prompt so the user can pick
+            // `Approve` or `Reject` instead. The responder is left
+            // intact (we do not call `take_responder`) so the modal
+            // is still actionable.
             let step_id = prompt.step_id.clone();
-            // Drop the responder so the engine observes a missing
-            // reply if the user later cancels the prompt; we do not
-            // consume the prompt itself because the user may wish to
-            // choose Approve/Reject after seeing the error.
-            prompt.take_responder().await;
             app.set_error(format!(
                 "[human:{step_id}] cannot revise: workflow did not declare `revise_target`",
             ));
+            app.set_human_prompt(prompt);
             return;
         }
     } else {

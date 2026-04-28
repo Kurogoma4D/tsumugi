@@ -192,15 +192,17 @@ impl HumanPrompt {
 /// Map an option string to a response kind.
 ///
 /// Recognised prefixes (ASCII case-insensitive):
-/// * `app...` / `yes` / `ok`        → [`HumanResponseKind::Approve`]
+/// * `app...` (and `yes` / `ok` via the default arm) →
+///   [`HumanResponseKind::Approve`]
 /// * `rej...` / `no` / `deny`       → [`HumanResponseKind::Reject`]
 /// * `rev...`                        → [`HumanResponseKind::Revise`]
 ///
 /// Anything else falls back to `Approve` — workflow authors deviating
 /// from the canonical `approve / reject / revise` set are expected to
-/// use one of the affirmative aliases above; truly unrecognised strings
-/// are treated as approve so the modal cannot hard-error on a
-/// well-formed option list.
+/// use one of the affirmative aliases above (`yes` / `ok` reach
+/// `Approve` via this default arm rather than a special case); truly
+/// unrecognised strings are treated as approve so the modal cannot
+/// hard-error on a well-formed option list.
 #[must_use]
 pub fn option_kind(option: &str) -> HumanResponseKind {
     let lower = option.to_ascii_lowercase();

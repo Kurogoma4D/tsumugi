@@ -378,6 +378,18 @@ impl App {
         self.human_prompt.take()
     }
 
+    /// Re-stash a human prompt into [`Self`].
+    ///
+    /// Used by the event handler when it needs to surface a soft error
+    /// (e.g. a `Revise` selection without a `revise_target`) without
+    /// dismissing the modal — the user may still pick `Approve` or
+    /// `Reject`. Any existing prompt is overwritten; callers should
+    /// only invoke this immediately after [`Self::take_human_prompt`]
+    /// to avoid clobbering a fresh prompt that arrived in the meantime.
+    pub fn set_human_prompt(&mut self, prompt: HumanPrompt) {
+        self.human_prompt = Some(prompt);
+    }
+
     /// Attach a workflow progress receiver.
     ///
     /// Intended use: the CLI / `run_workflow` foreground path forks

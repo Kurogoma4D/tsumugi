@@ -97,14 +97,24 @@ fn draw_human_prompt(frame: &mut Frame, prompt: &crate::HumanPrompt, area: Rect)
         .show
         .as_ref()
         .map_or(0, |s| u16::try_from(s.lines().count()).unwrap_or(u16::MAX));
+    // `options_lines` is an upper bound — the renderer collapses every
+    // option into a single ratatui `Line` (see `lines.push(Line::from(opt_spans))`
+    // below), so the actual height contribution is 1 row regardless of
+    // option count. We keep the per-option count here as a generous
+    // upper bound for narrow terminals where wrap can cause overflow,
+    // and clamp the final value to `area.height` regardless.
     let options_lines: u16 = u16::try_from(prompt.options.len().max(1)).unwrap_or(u16::MAX);
-    // Layout: top border (1) + message (body_lines) + spacer-before-options (1)
-    //       + options (options_lines) + spacer-before-footer (1) + footer (1)
-    //       + bottom border (1) = 5 + body + show + options.
-    // The `show` block (when present) inserts an extra leading spacer
-    // and `show_lines` content rows; the spacer is folded into
-    // `show_lines` when show is empty (saves one row in that case).
-    let modal_height = (5 + body_lines + show_lines + options_lines).min(area.height);
+    // Rendered rows (upper bound, clamped to `area.height`):
+    //   borders (2) + body + spacer-before-options (1) + options (1)
+    //   + spacer-before-footer (1) + footer (1)                = body + 6
+    //   plus, when `show` is present:
+    //       spacer-before-show (1) + show_lines                = show + 1
+    // The formula below sums those plus `options_lines` (an upper
+    // bound — see comment above) so it can over-estimate by
+    // `options_lines - 1` rows; `min(area.height)` papers over both
+    // the over- and under-estimate in practice.
+    let show_block = if show_lines > 0 { show_lines + 1 } else { 0 };
+    let modal_height = (6 + body_lines + show_block + options_lines).min(area.height);
 
     if area.width < modal_width || area.height < modal_height {
         return;
