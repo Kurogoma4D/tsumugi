@@ -147,6 +147,11 @@ impl TokenCounter {
     ///
     /// Spawns a background task to count tokens via the LLM server.
     /// The result updates `cached_count` when complete. Does not block.
+    ///
+    /// Delegates to [`tmg_llm::count_tokens_or_estimate`] (issue #50)
+    /// so the chars/4 fallback and the rate-limited
+    /// `tracing::warn!` on failure are shared with every other caller
+    /// in the workspace.
     pub async fn request_update(&self, messages: &[Message]) {
         // Serialize all messages into a single string for counting.
         let content = serialize_messages_for_counting(messages);
@@ -158,13 +163,7 @@ impl TokenCounter {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
         tasks.spawn(async move {
-            let count = match client.tokenize(&content).await {
-                Ok(count) => count,
-                Err(_) => {
-                    // Fall back to heuristic estimation on API failure.
-                    content.len() / 4
-                }
-            };
+            let count = tmg_llm::count_tokens_or_estimate(&client, &content).await;
             // Token counts always fit in u64.
             cached.store(count as u64, Ordering::Relaxed);
         });
@@ -172,11 +171,12 @@ impl TokenCounter {
 
     /// Estimate token count using a simple heuristic (characters / 4).
     ///
-    /// Useful when the tokenize API is unavailable.
+    /// Useful when the tokenize API is unavailable. Forwarder for
+    /// [`tmg_llm::estimate_tokens_heuristic`] kept here for source
+    /// compatibility with existing callers (`session_bootstrap` etc.).
     #[must_use]
     pub fn estimate_tokens(text: &str) -> usize {
-        // Integer division: 4 chars per token heuristic.
-        (text.len() / 4).max(1)
+        tmg_llm::estimate_tokens_heuristic(text)
     }
 }
 

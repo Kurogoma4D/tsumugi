@@ -14,6 +14,7 @@ mod config;
 mod error;
 mod harness_init;
 mod init_command;
+mod pool_setup;
 mod run_commands;
 mod workflow_commands;
 
@@ -232,6 +233,20 @@ impl Cli {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Initialise the global tracing subscriber so workspace-wide
+    // `tracing::warn!` / `tracing::debug!` calls land in the user's
+    // terminal when `TMG_LOG` is set. The default filter is `warn` so
+    // production runs only see escalation-grade messages; setting
+    // `TMG_LOG=debug` (or finer-grained `TMG_LOG=tmg_llm=debug,warn`)
+    // surfaces endpoint-resolution and pool-selection diagnostics.
+    //
+    // The TUI captures stderr indirectly via crossterm; in TUI mode the
+    // tracing output stays out of the way until the TUI exits, at
+    // which point it is flushed normally. One-shot mode renders the
+    // logs interleaved with the streamed response (acceptable noise
+    // for a debug session).
+    init_tracing();
+
     // Load and merge configuration: global -> project-local -> env -> CLI.
     let mut config =
         config::load_config(cli.config.as_deref()).context("loading tsumugi configuration")?;
@@ -247,7 +262,9 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::Run { op }) => dispatch_run_command(op, &config),
-        Some(Command::Workflow { op }) => dispatch_workflow_command(op, &config),
+        Some(Command::Workflow { op }) => {
+            dispatch_workflow_command(op, &config, cli.event_log.as_deref())
+        }
         Some(Command::Init(args)) => {
             init_command::cmd_init(&args.workflows, &args.harness, args.all, args.force)
         }
@@ -270,11 +287,37 @@ fn main() -> anyhow::Result<()> {
                     &config.sandbox,
                     &config.workflow,
                     &config.skills,
+                    config.llm.subagent_pool.as_ref(),
                     None,
                 )
             }
         }
     }
+}
+
+// `subagent_pool_from_config` lives in `crate::pool_setup` so the
+// workflow command path (`tmg workflow run`) can reuse it.
+
+/// Initialise the global `tracing` subscriber.
+///
+/// The subscriber is built from the `TMG_LOG` environment variable
+/// (using the standard `EnvFilter` syntax: `TMG_LOG=debug` for global
+/// debug, `TMG_LOG=tmg_llm=debug,warn` for crate-scoped overrides).
+/// When `TMG_LOG` is unset the filter defaults to `warn`, which keeps
+/// the live TUI quiet. Issue #50.
+///
+/// Calling this twice is harmless: the second `try_init` is a no-op
+/// because the global default is already installed, so the function
+/// silently absorbs the error. This matters for tests that may build
+/// a `Cli` and reuse the runtime.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_env("TMG_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .try_init();
 }
 
 /// Resolve the runs-dir against the canonical cwd, mirroring the
@@ -294,12 +337,20 @@ fn resolve_runs_dir(harness_config: &HarnessConfig) -> anyhow::Result<(PathBuf, 
 /// Dispatch one `tmg workflow <op>` invocation. None of these
 /// operations attach to an active TUI; they all read or run workflows
 /// against the configured discovery scope.
-fn dispatch_workflow_command(op: WorkflowCommand, config: &TsumugiConfig) -> anyhow::Result<()> {
+///
+/// `event_log` is threaded only into `Run` because `List` and
+/// `Validate` do not spawn subagents; the resolver / pool / tokenize
+/// hooks are no-ops outside the live engine path.
+fn dispatch_workflow_command(
+    op: WorkflowCommand,
+    config: &TsumugiConfig,
+    event_log: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
     match op {
         WorkflowCommand::List => workflow_commands::cmd_list(config),
         WorkflowCommand::Validate => workflow_commands::cmd_validate(config),
         WorkflowCommand::Run { workflow, inputs } => {
-            workflow_commands::cmd_run(&workflow, &inputs, config)
+            workflow_commands::cmd_run(&workflow, &inputs, config, event_log)
         }
     }
 }
@@ -353,6 +404,7 @@ fn dispatch_run_command(op: RunCommand, config: &TsumugiConfig) -> anyhow::Resul
                 &config.sandbox,
                 &config.workflow,
                 &config.skills,
+                config.llm.subagent_pool.as_ref(),
                 resolved.as_ref(),
             )
         }
@@ -508,6 +560,7 @@ fn run_tui(
     sandbox_config: &SandboxConfigSection,
     workflow_config: &tmg_workflow::WorkflowConfig,
     skills_config: &tmg_skills::SkillsConfig,
+    subagent_pool: Option<&tmg_llm::PoolConfig>,
     explicit_run_id: Option<&tmg_harness::RunId>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -662,25 +715,60 @@ fn run_tui(
 
         // Create the subagent manager. The escalator's
         // endpoint/model/disable knobs flow through
-        // [`tmg_agents::EscalatorOverrides`] so the resolver in
-        // `SubagentManager` is the single source of truth for
-        // precedence (see `crates/tmg-agents/src/manager.rs` module
-        // docs).
+        // [`tmg_agents::EscalatorOverrides`] into the centralised
+        // [`tmg_agents::EndpointResolver`] (issue #50) so the manager
+        // delegates every spawn-time precedence decision to that
+        // module.
         let escalator_overrides = tmg_agents::EscalatorOverrides::from_strings(
             harness_config.escalator.endpoint.clone(),
             harness_config.escalator.model.clone(),
             harness_config.escalator.disable,
         );
-        let subagent_manager = Arc::new(Mutex::new(
-            tmg_agents::SubagentManager::new(
-                client.clone(),
-                cancel.clone(),
-                endpoint,
-                model,
-                Arc::clone(&sandbox_ctx),
-            )
-            .with_escalator_overrides(escalator_overrides),
-        ));
+        // `[llm.subagent_pool]` is wired into the resolver here so
+        // non-escalator builtin agents fan across the configured pool
+        // endpoints. The validator already deduped URLs and reported
+        // an empty list as "pool disabled" via the relaxed-validation
+        // path; we honour that by only constructing a pool when the
+        // post-validation list has at least one entry.
+        let subagent_pool: Option<Arc<tmg_llm::LlmPool>> =
+            pool_setup::subagent_pool_from_config(subagent_pool, model);
+        // Capture the strategy BEFORE moving `subagent_pool` into the
+        // resolver so the `--event-log` `pool_selected` records can
+        // stamp the active strategy on every emitted event.
+        let pool_strategy_label: Option<&'static str> =
+            subagent_pool.as_ref().map(|p| p.strategy().as_str());
+        let resolver = tmg_agents::EndpointResolver::new(endpoint, model)
+            .with_escalator_overrides(escalator_overrides)
+            .with_pool(subagent_pool);
+        let subagent_manager = Arc::new(Mutex::new(tmg_agents::SubagentManager::new(
+            client.clone(),
+            cancel.clone(),
+            resolver,
+            Arc::clone(&sandbox_ctx),
+        )));
+
+        // Wire the `--event-log` observers on the subagent manager
+        // and the global tokenize fallback path. Issue #50 review:
+        // the previous wiring claim in the PR description was not
+        // backed by code — the writer methods were defined but never
+        // called. The hooks open the log file in append mode so we
+        // share the same file the TUI itself writes into.
+        if let Some(path) = event_log.as_deref() {
+            match pool_setup::open_event_log(path) {
+                Ok(log_writer) => {
+                    pool_setup::install_event_log_hooks(
+                        Arc::clone(&subagent_manager),
+                        Arc::clone(&log_writer),
+                        pool_strategy_label,
+                    )
+                    .await;
+                    pool_setup::install_tokenize_failure_hook(log_writer);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to open event log for hooks; resolver/tokenize events will not be recorded");
+                }
+            }
+        }
 
         // Wire the active `RunRunner` into the subagent manager so
         // harnessed-run subagents (initializer / tester / qa) get

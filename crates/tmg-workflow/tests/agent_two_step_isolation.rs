@@ -21,7 +21,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use tmg_agents::SubagentManager;
+use tmg_agents::{EndpointResolver, SubagentManager};
 use tmg_llm::{LlmPool, PoolConfig};
 use tmg_sandbox::{SandboxConfig, SandboxContext, SandboxMode};
 use tmg_tools::ToolRegistry;
@@ -162,8 +162,7 @@ async fn two_sequential_agent_steps_have_isolated_histories() {
     let manager = SubagentManager::new(
         llm_client,
         cancel,
-        &endpoint,
-        "mock-model",
+        EndpointResolver::new(&endpoint, "mock-model"),
         Arc::clone(&sandbox),
     );
     let subagent_manager = Arc::new(Mutex::new(manager));

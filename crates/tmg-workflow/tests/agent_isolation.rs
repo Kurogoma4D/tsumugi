@@ -36,7 +36,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use tmg_agents::SubagentManager;
+use tmg_agents::{EndpointResolver, SubagentManager};
 use tmg_llm::{LlmPool, PoolConfig};
 use tmg_sandbox::{SandboxConfig, SandboxContext, SandboxMode};
 use tmg_tools::ToolRegistry;
@@ -63,8 +63,7 @@ async fn agent_step_routes_through_subagent_manager() {
     let manager = SubagentManager::new(
         llm_client,
         cancel,
-        endpoint,
-        "test-model",
+        EndpointResolver::new(endpoint, "test-model"),
         Arc::clone(&sandbox),
     );
     let subagent_manager = Arc::new(Mutex::new(manager));
@@ -134,8 +133,7 @@ async fn unknown_subagent_name_is_step_failure() {
     let manager = SubagentManager::new(
         llm_client,
         cancel,
-        endpoint,
-        "test-model",
+        EndpointResolver::new(endpoint, "test-model"),
         Arc::clone(&sandbox),
     );
     let subagent_manager = Arc::new(Mutex::new(manager));

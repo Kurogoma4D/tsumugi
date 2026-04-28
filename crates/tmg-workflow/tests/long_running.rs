@@ -29,7 +29,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use tmg_agents::SubagentManager;
+use tmg_agents::{EndpointResolver, SubagentManager};
 use tmg_harness::{Run, RunRunner, RunStore};
 use tmg_llm::{LlmPool, PoolConfig};
 use tmg_sandbox::{SandboxConfig, SandboxContext, SandboxMode};
@@ -59,8 +59,7 @@ fn build_harness(
     let manager = SubagentManager::new(
         llm_client,
         cancel,
-        "http://localhost:9999",
-        "test-model",
+        EndpointResolver::new("http://localhost:9999", "test-model"),
         Arc::clone(&sandbox),
     );
     let subagent_manager = Arc::new(Mutex::new(manager));

@@ -45,6 +45,30 @@ enum EventKind {
     },
     #[serde(rename = "warning")]
     Warning { message: String },
+    /// Records the `(endpoint, model)` pair an [`EndpointResolver`]
+    /// selected for a subagent spawn, plus the precedence rule that
+    /// fired (e.g. `"custom"`, `"escalator_override"`, `"pool"`,
+    /// `"main"`). Issue #50.
+    #[serde(rename = "endpoint_resolved")]
+    EndpointResolved {
+        agent_kind: String,
+        endpoint: String,
+        model: String,
+        source: String,
+    },
+    /// Records that a request was routed to a specific pool endpoint
+    /// (only emitted when the pool is in multi-endpoint mode). Issue #50.
+    #[serde(rename = "pool_selected")]
+    PoolSelected { endpoint: String, strategy: String },
+    /// Records a tokenize failure that fell back to the chars/4
+    /// heuristic. Issue #50.
+    #[serde(rename = "tokenize_failure")]
+    TokenizeFailure {
+        endpoint: String,
+        text_len: usize,
+        estimate: usize,
+        error: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +143,53 @@ impl EventLogWriter {
     /// Log a done event.
     pub fn write_done(&mut self) {
         self.write_event(&EventKind::Done);
+    }
+
+    /// Log an endpoint-resolution event for a subagent spawn (issue #50).
+    ///
+    /// `source` should be one of `"custom"`, `"escalator_override"`,
+    /// `"pool"`, or `"main"` so the log reader can recover the
+    /// precedence rule that fired without re-running the resolver.
+    pub fn write_endpoint_resolved(
+        &mut self,
+        agent_kind: &str,
+        endpoint: &str,
+        model: &str,
+        source: &str,
+    ) {
+        let event = EventKind::EndpointResolved {
+            agent_kind: agent_kind.to_owned(),
+            endpoint: endpoint.to_owned(),
+            model: model.to_owned(),
+            source: source.to_owned(),
+        };
+        self.write_event(&event);
+    }
+
+    /// Log a pool selection event (issue #50).
+    pub fn write_pool_selected(&mut self, endpoint: &str, strategy: &str) {
+        let event = EventKind::PoolSelected {
+            endpoint: endpoint.to_owned(),
+            strategy: strategy.to_owned(),
+        };
+        self.write_event(&event);
+    }
+
+    /// Log a tokenize fallback event (issue #50).
+    pub fn write_tokenize_failure(
+        &mut self,
+        endpoint: &str,
+        text_len: usize,
+        estimate: usize,
+        error: &str,
+    ) {
+        let event = EventKind::TokenizeFailure {
+            endpoint: endpoint.to_owned(),
+            text_len,
+            estimate,
+            error: error.to_owned(),
+        };
+        self.write_event(&event);
     }
 
     /// Write one event record as a JSON line. Flushes immediately for

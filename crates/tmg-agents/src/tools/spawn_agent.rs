@@ -285,8 +285,7 @@ mod tests {
         let manager = SubagentManager::new(
             client,
             CancellationToken::new(),
-            "http://127.0.0.1:1",
-            "test-model",
+            crate::endpoint_resolver::EndpointResolver::new("http://127.0.0.1:1", "test-model"),
             Arc::new(SandboxContext::test_default()),
         );
         Some(SpawnAgentTool::new(Arc::new(Mutex::new(manager))))

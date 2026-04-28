@@ -23,7 +23,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use tmg_agents::SubagentManager;
+use tmg_agents::{EndpointResolver, SubagentManager};
 use tmg_llm::{LlmPool, PoolConfig};
 use tmg_sandbox::{SandboxConfig, SandboxContext, SandboxMode};
 use tmg_tools::{Tool, ToolRegistry};
@@ -52,8 +52,7 @@ fn build_engine(
     let manager = SubagentManager::new(
         llm_client,
         cancel,
-        "http://localhost:9999",
-        "test-model",
+        EndpointResolver::new("http://localhost:9999", "test-model"),
         Arc::clone(&sandbox),
     );
     let subagent_manager = Arc::new(Mutex::new(manager));
