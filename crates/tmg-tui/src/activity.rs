@@ -23,12 +23,28 @@ use crate::diff::DiffPreview;
 /// [`crate::app::ToolActivityEntry`].
 #[derive(Debug, Clone)]
 pub struct ToolActivityEntry {
+    /// Unique LLM-issued tool-call identifier. Used to pair a `ToolCall`
+    /// activity entry with the matching `ToolResult` /
+    /// `ToolResultCompressed` entries even when concurrent calls of
+    /// the same `tool_name` interleave (issue #49 review #6).
+    ///
+    /// Empty when the entry was created from a path that did not carry
+    /// a call id (currently no such path exists; reserved for forward
+    /// compatibility).
+    pub call_id: String,
     /// Tool name.
     pub tool_name: String,
     /// Display summary (call params or truncated result).
     pub summary: String,
     /// Whether this entry is an error.
     pub is_error: bool,
+    /// Whether the recorded (history-bound) tool result was rewritten
+    /// via tree-sitter signature extraction (issue #49). Drives the
+    /// `[compressed via tree-sitter: N symbols]` hint in the renderer.
+    pub compressed: bool,
+    /// Number of symbols extracted by tree-sitter when `compressed`
+    /// is true. Zero otherwise.
+    pub compressed_symbol_count: usize,
 }
 
 /// Aggregated state for the Activity Pane.

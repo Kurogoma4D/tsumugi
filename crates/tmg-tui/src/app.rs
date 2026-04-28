@@ -62,6 +62,10 @@ pub enum TurnMessage {
     Token(String),
     /// A tool call is being dispatched.
     ToolCall {
+        /// The unique LLM-issued tool-call identifier. Pair with the
+        /// matching `ToolResult` / `ToolResultCompressed` to find the
+        /// right activity entry even with concurrent same-name calls.
+        call_id: String,
         /// The tool name.
         name: String,
         /// The tool call arguments (JSON string).
@@ -69,12 +73,32 @@ pub enum TurnMessage {
     },
     /// A tool call completed with a result.
     ToolResult {
+        /// The unique LLM-issued tool-call identifier (matches the
+        /// preceding `ToolCall`).
+        call_id: String,
         /// The tool name.
         name: String,
         /// The tool output (may be truncated for display).
         output: String,
         /// Whether the tool reported an error.
         is_error: bool,
+    },
+    /// A tool result was rewritten via tree-sitter signature extraction
+    /// before being recorded in the conversation history (issue #49).
+    ///
+    /// This message is sent **in addition to** [`Self::ToolResult`] —
+    /// the activity pane receives the raw output via `ToolResult` for
+    /// display, then this message stamps a "compressed" marker on the
+    /// most recent matching entry so the TUI can show the
+    /// `[compressed via tree-sitter: N symbols]` hint.
+    ToolResultCompressed {
+        /// The unique LLM-issued tool-call identifier (matches the
+        /// `ToolCall` / `ToolResult` for the same call).
+        call_id: String,
+        /// The tool name (matches the preceding `ToolResult`).
+        name: String,
+        /// Number of structural symbols tree-sitter extracted.
+        symbol_count: usize,
     },
     /// The turn completed successfully. Contains the `AgentLoop` back
     /// and context usage information.
@@ -1051,7 +1075,11 @@ impl App {
                     }
                     changed = true;
                 }
-                Ok(TurnMessage::ToolCall { name, arguments }) => {
+                Ok(TurnMessage::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                }) => {
                     // Capture diff preview source from `file_write` /
                     // `file_patch` arguments. We parse the JSON
                     // best-effort: a malformed tool call still gets a
@@ -1071,13 +1099,17 @@ impl App {
 
                     let summary = truncate_for_display(&arguments, 120);
                     self.activity.tool_log.push(ToolActivityEntry {
+                        call_id,
                         tool_name: name,
                         summary: format!("calling: {summary}"),
                         is_error: false,
+                        compressed: false,
+                        compressed_symbol_count: 0,
                     });
                     changed = true;
                 }
                 Ok(TurnMessage::ToolResult {
+                    call_id,
                     name,
                     output,
                     is_error,
@@ -1100,11 +1132,36 @@ impl App {
 
                     let summary = truncate_for_display(&output, 200);
                     self.activity.tool_log.push(ToolActivityEntry {
+                        call_id,
                         tool_name: name,
                         summary,
                         is_error,
+                        compressed: false,
+                        compressed_symbol_count: 0,
                     });
                     changed = true;
+                }
+                Ok(TurnMessage::ToolResultCompressed {
+                    call_id,
+                    name,
+                    symbol_count,
+                }) => {
+                    // Stamp the compression marker on the entry with
+                    // the matching `(call_id, name)` pair. Matching by
+                    // `call_id` (in addition to name) prevents
+                    // concurrent same-name calls from cross-stamping
+                    // each other's results (issue #49 review #6).
+                    if let Some(entry) = self
+                        .activity
+                        .tool_log
+                        .iter_mut()
+                        .rev()
+                        .find(|e| e.call_id == call_id && e.tool_name == name && !e.compressed)
+                    {
+                        entry.compressed = true;
+                        entry.compressed_symbol_count = symbol_count;
+                        changed = true;
+                    }
                 }
                 Ok(TurnMessage::Done {
                     agent,
@@ -1510,9 +1567,15 @@ impl StreamSink for ChannelStreamSink {
         Ok(())
     }
 
-    fn on_tool_call(&mut self, name: &str, arguments: &str) -> Result<(), CoreError> {
+    fn on_tool_call(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        arguments: &str,
+    ) -> Result<(), CoreError> {
         self.tx
             .try_send(TurnMessage::ToolCall {
+                call_id: call_id.to_owned(),
                 name: name.to_owned(),
                 arguments: arguments.to_owned(),
             })
@@ -1521,12 +1584,14 @@ impl StreamSink for ChannelStreamSink {
 
     fn on_tool_result(
         &mut self,
+        call_id: &str,
         name: &str,
         output: &str,
         is_error: bool,
     ) -> Result<(), CoreError> {
         self.tx
             .try_send(TurnMessage::ToolResult {
+                call_id: call_id.to_owned(),
                 name: name.to_owned(),
                 output: output.to_owned(),
                 is_error,
@@ -1534,9 +1599,29 @@ impl StreamSink for ChannelStreamSink {
             .map_err(|_| CoreError::Cancelled)
     }
 
+    fn on_tool_result_compressed(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        symbol_count: usize,
+    ) -> Result<(), CoreError> {
+        self.tx
+            .try_send(TurnMessage::ToolResultCompressed {
+                call_id: call_id.to_owned(),
+                name: name.to_owned(),
+                symbol_count,
+            })
+            .map_err(|_| CoreError::Cancelled)
+    }
+
     fn on_warning(&mut self, message: &str) -> Result<(), CoreError> {
         self.tx
             .try_send(TurnMessage::ToolResult {
+                // System warnings are synthetic — they don't have a real
+                // tool-call id. We use an empty string so the activity
+                // pane treats them as unmatched and never tries to pair
+                // them with a `compressed` marker.
+                call_id: String::new(),
                 name: "system".to_owned(),
                 output: format!("warning: {message}"),
                 is_error: true,

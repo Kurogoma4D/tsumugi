@@ -171,19 +171,35 @@ impl<S: StreamSink> StreamSink for TeeStreamSink<S> {
         self.inner.on_done()
     }
 
-    fn on_tool_call(&mut self, name: &str, arguments: &str) -> Result<(), CoreError> {
+    fn on_tool_call(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        arguments: &str,
+    ) -> Result<(), CoreError> {
         self.log.write_tool_call(name, arguments);
-        self.inner.on_tool_call(name, arguments)
+        self.inner.on_tool_call(call_id, name, arguments)
     }
 
     fn on_tool_result(
         &mut self,
+        call_id: &str,
         name: &str,
         output: &str,
         is_error: bool,
     ) -> Result<(), CoreError> {
         self.log.write_tool_result(name, output, is_error);
-        self.inner.on_tool_result(name, output, is_error)
+        self.inner.on_tool_result(call_id, name, output, is_error)
+    }
+
+    fn on_tool_result_compressed(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        symbol_count: usize,
+    ) -> Result<(), CoreError> {
+        self.inner
+            .on_tool_result_compressed(call_id, name, symbol_count)
     }
 
     fn on_warning(&mut self, message: &str) -> Result<(), CoreError> {
@@ -219,8 +235,8 @@ mod tests {
             let log = EventLogWriter::new(&path)?;
             let mut tee = TeeStreamSink::new(NullSink, log);
             tee.on_token("hello")?;
-            tee.on_tool_call("file_read", r#"{"path":"Cargo.toml"}"#)?;
-            tee.on_tool_result("file_read", "[workspace]", false)?;
+            tee.on_tool_call("call_1", "file_read", r#"{"path":"Cargo.toml"}"#)?;
+            tee.on_tool_result("call_1", "file_read", "[workspace]", false)?;
             tee.on_done()?;
         }
 

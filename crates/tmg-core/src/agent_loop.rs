@@ -16,7 +16,7 @@ use tmg_llm::{
 use tmg_sandbox::SandboxContext;
 use tmg_tools::ToolRegistry;
 
-use crate::context::{ContextCompressor, ContextConfig, TokenCounter, truncate_tool_result};
+use crate::context::{ContextCompressor, ContextConfig, TokenCounter};
 use crate::error::CoreError;
 use crate::message::Message;
 use crate::prompt;
@@ -59,16 +59,56 @@ pub trait StreamSink {
     }
 
     /// Called when a tool call is about to be dispatched.
-    fn on_tool_call(&mut self, _name: &str, _arguments: &str) -> Result<(), CoreError> {
+    ///
+    /// `call_id` is the unique tool-call identifier from the LLM; sinks
+    /// that need to correlate this call with its later
+    /// [`Self::on_tool_result`] / [`Self::on_tool_result_compressed`]
+    /// callback should stamp it on the entry they create here.
+    fn on_tool_call(
+        &mut self,
+        _call_id: &str,
+        _name: &str,
+        _arguments: &str,
+    ) -> Result<(), CoreError> {
         Ok(())
     }
 
     /// Called when a tool call has completed with a result.
+    ///
+    /// `call_id` is the same identifier passed to the matching
+    /// [`Self::on_tool_call`] so concurrent tool calls of the same
+    /// `name` can be paired without ambiguity.
     fn on_tool_result(
         &mut self,
+        _call_id: &str,
         _name: &str,
         _output: &str,
         _is_error: bool,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    /// Called after [`Self::on_tool_result`] when the recorded
+    /// (history-bound) version of the output was rewritten by
+    /// [`crate::context::ContextCompressor::compress_tool_result`].
+    ///
+    /// `call_id` matches the preceding [`Self::on_tool_result`] so a
+    /// "compressed" marker can be stamped on the right entry even
+    /// when concurrent `file_read` calls of the same `name` interleave.
+    ///
+    /// `symbol_count` is the number of structural symbols extracted by
+    /// tree-sitter. Sinks that do not care about compression metadata
+    /// can leave the default no-op implementation.
+    ///
+    /// Note: this hook is **only** fired when the result was rewritten
+    /// via signature extraction (i.e. issue #49's tree-sitter path).
+    /// Tail-truncated results — the pre-#49 behaviour, still the
+    /// fallback for non-`file_read` tools — do **not** fire it.
+    fn on_tool_result_compressed(
+        &mut self,
+        _call_id: &str,
+        _name: &str,
+        _symbol_count: usize,
     ) -> Result<(), CoreError> {
         Ok(())
     }
@@ -149,7 +189,13 @@ pub struct AgentLoop {
     token_counter: TokenCounter,
 
     /// Context compressor for automatic and manual compression.
-    compressor: ContextCompressor,
+    ///
+    /// Stored behind an [`Arc`] so each spawned tool dispatch task in
+    /// [`Self::dispatch_tool_calls`] can call into the compressor
+    /// without a deep clone (the synchronous `compress_tool_result`
+    /// path runs inside the worker task to avoid the per-call
+    /// `serde_json::Value::clone` overhead).
+    compressor: Arc<ContextCompressor>,
 
     /// Tool calling strategy (native, `prompt_based`, or auto).
     tool_calling_mode: ToolCallingMode,
@@ -241,7 +287,10 @@ impl AgentLoop {
 
         let registry = Arc::new(registry);
         let token_counter = TokenCounter::new(client.clone());
-        let compressor = ContextCompressor::new(client.clone());
+        let compressor = Arc::new(ContextCompressor::with_config(
+            client.clone(),
+            context_config.clone(),
+        ));
 
         Ok(Self {
             client,
@@ -624,25 +673,39 @@ impl AgentLoop {
         tool_calls: &[ToolCall],
         sink: &mut impl StreamSink,
     ) -> Result<(), CoreError> {
-        // Notify sink of each tool call before dispatching.
+        // Notify sink of each tool call before dispatching. `call_id`
+        // is threaded through so concurrent calls of the same `name`
+        // can be paired with their result/compression hooks downstream.
         for tc in tool_calls {
-            sink.on_tool_call(&tc.function.name, &tc.function.arguments)?;
+            sink.on_tool_call(&tc.id, &tc.function.name, &tc.function.arguments)?;
         }
 
         // Spawn each tool call in a JoinSet for parallel execution.
+        // The compressor is `Arc`-cloned (cheap pointer bump) so each
+        // task can run `compress_tool_result` on its own owned `params`,
+        // avoiding the per-call `serde_json::Value::clone` of issue #5.
         let mut join_set = JoinSet::new();
         for tc in tool_calls {
             let registry = Arc::clone(&self.registry);
             let sandbox = Arc::clone(&self.sandbox);
+            let compressor = Arc::clone(&self.compressor);
             let name = tc.function.name.clone();
             let arguments_str = tc.function.arguments.clone();
             let call_id = tc.id.clone();
             let cancel = self.cancel.clone();
 
             join_set.spawn(async move {
-                // Check cancellation before executing.
+                // Check cancellation before executing. We surface
+                // cancellation as a sentinel `cancelled` flag in the
+                // payload rather than as a `CoreError` so the result
+                // type stays `Clone`-free at the channel boundary.
                 if cancel.is_cancelled() {
-                    return (call_id, name, Err(CoreError::Cancelled));
+                    return DispatchOutcome {
+                        call_id,
+                        name,
+                        cancelled: true,
+                        payload: None,
+                    };
                 }
 
                 // Parse the arguments JSON.
@@ -651,61 +714,125 @@ impl AgentLoop {
                     Err(e) => {
                         let result =
                             tmg_tools::ToolResult::error(format!("invalid JSON arguments: {e}"));
-                        return (call_id, name, Ok(result));
+                        // Compress using a null-params view; non-
+                        // `file_read` tools never consult `params`.
+                        let compressed = compressor.compress_tool_result(
+                            &name,
+                            &serde_json::Value::Null,
+                            &result.output,
+                        );
+                        return DispatchOutcome {
+                            call_id,
+                            name,
+                            cancelled: false,
+                            payload: Some((result, compressed)),
+                        };
                     }
                 };
 
-                let result = registry.execute(&name, params, &sandbox).await;
-                match result {
-                    Ok(tool_result) => (call_id, name, Ok(tool_result)),
+                // Execute the tool. We need `params` again for the
+                // compressor call afterwards, but only the `file_read`
+                // path actually reads it. Keep `params` owned by the
+                // task so the registry call can take it by value
+                // without a redundant clone at the dispatcher level.
+                let exec_result = registry.execute(&name, params.clone(), &sandbox).await;
+                let tool_result = match exec_result {
+                    Ok(r) => r,
                     Err(e) => {
-                        // Tool errors are reported as error results to the
-                        // LLM rather than aborting the entire turn, so the
+                        // Tool errors are reported as error results to
+                        // the LLM rather than aborting the turn so the
                         // model can attempt recovery.
-                        let error_result = tmg_tools::ToolResult::error(e.to_string());
-                        (call_id, name, Ok(error_result))
+                        tmg_tools::ToolResult::error(e.to_string())
                     }
+                };
+
+                // Compress *inside* the spawned task. This moves the
+                // `serde_json::Value` we already own here into the
+                // synchronous compressor call without copying the JSON
+                // tree, fixing the per-call `params.clone()` overhead
+                // that the previous on-collect approach incurred.
+                let compressed =
+                    compressor.compress_tool_result(&name, &params, &tool_result.output);
+                DispatchOutcome {
+                    call_id,
+                    name,
+                    cancelled: false,
+                    payload: Some((tool_result, compressed)),
                 }
             });
         }
 
-        // Collect results in completion order.
-        // We store (call_id, tool_name, ToolResult) and sort by original
-        // order at the end to maintain deterministic history.
-        let mut results: Vec<(String, String, tmg_tools::ToolResult)> =
-            Vec::with_capacity(tool_calls.len());
+        // Collect results as they finish. We *do not* fire sink hooks
+        // here — sinks are invoked in the deterministic call order
+        // after the sort below so concurrent calls of the same `name`
+        // never cross-stamp activity entries (issue #6 / #7).
+        let mut results: Vec<DispatchOutcome> = Vec::with_capacity(tool_calls.len());
 
         while let Some(join_result) = join_set.join_next().await {
-            let (call_id, name, tool_result) = join_result.map_err(|e| {
+            let outcome = join_result.map_err(|e| {
                 CoreError::Io(std::io::Error::other(format!("task join error: {e}")))
             })?;
-
-            let tool_result = tool_result?;
-
-            sink.on_tool_result(&name, &tool_result.output, tool_result.is_error)?;
-
-            results.push((call_id, name, tool_result));
+            if outcome.cancelled {
+                return Err(CoreError::Cancelled);
+            }
+            results.push(outcome);
         }
 
-        // Sort results to match the original tool_calls order so history
-        // is deterministic regardless of execution order.
+        // Sort results to match the original tool_calls order so
+        // history (and the sink fire order) is deterministic
+        // regardless of task completion order.
         let call_order: Vec<&str> = tool_calls.iter().map(|tc| tc.id.as_str()).collect();
-        results.sort_by_key(|(id, _, _)| {
+        results.sort_by_key(|outcome| {
             call_order
                 .iter()
-                .position(|&cid| cid == id)
+                .position(|&cid| cid == outcome.call_id)
                 .unwrap_or(usize::MAX)
         });
 
-        // Append tool-result messages to history, truncating if needed.
-        let max_tool_tokens = self.context_config.max_tool_result_tokens;
-        for (call_id, _name, tool_result) in results {
-            let output = truncate_tool_result(&tool_result.output, max_tool_tokens);
-            self.history.push(Message::tool_result(call_id, output));
+        // Now fire sink hooks and append history in deterministic
+        // order, threading `call_id` so the TUI / harness sinks can
+        // stamp the right activity entry even with concurrent
+        // `file_read` calls in flight (issues #6 / #7).
+        for outcome in results {
+            let DispatchOutcome {
+                call_id,
+                name,
+                payload,
+                ..
+            } = outcome;
+            let Some((tool_result, compressed)) = payload else {
+                continue;
+            };
+            sink.on_tool_result(&call_id, &name, &tool_result.output, tool_result.is_error)?;
+            if compressed.compressed_via_signatures {
+                sink.on_tool_result_compressed(&call_id, &name, compressed.symbol_count)?;
+            }
+            self.history
+                .push(Message::tool_result(call_id, compressed.text));
         }
 
         Ok(())
     }
+}
+
+/// Outcome of one parallel tool dispatch task.
+///
+/// Returned to [`AgentLoop::dispatch_tool_calls`] from each spawned
+/// `JoinSet` task and then sorted into call-order before sink hooks
+/// fire so concurrent calls never cross-stamp activity entries.
+struct DispatchOutcome {
+    /// The unique LLM-issued call identifier; threaded through every
+    /// sink hook so concurrent calls of the same `name` can be paired.
+    call_id: String,
+    /// The tool name (e.g. `"file_read"`).
+    name: String,
+    /// `true` when the task observed cancellation before producing a
+    /// result. The dispatcher converts this to [`CoreError::Cancelled`]
+    /// at collection time.
+    cancelled: bool,
+    /// `(tool_result, compressed)` when the task produced one;
+    /// `None` only on the cancelled branch.
+    payload: Option<(tmg_tools::ToolResult, crate::context::CompressedToolResult)>,
 }
 
 #[cfg(test)]
