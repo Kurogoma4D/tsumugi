@@ -1,7 +1,9 @@
 //! `file_read` tool: read file contents with optional line range.
 
+use tmg_sandbox::SandboxContext;
+
 use crate::error::ToolError;
-use crate::path_util::validate_path;
+use crate::path_util::validate_and_resolve;
 use crate::types::{Tool, ToolResult};
 
 /// Read the contents of a file, optionally restricting to a line range.
@@ -38,25 +40,31 @@ impl Tool for FileReadTool {
         })
     }
 
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         params: serde_json::Value,
+        ctx: &'a SandboxContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
     > {
-        Box::pin(self.execute_inner(params))
+        Box::pin(self.execute_inner(params, ctx))
     }
 }
 
 impl FileReadTool {
-    async fn execute_inner(&self, params: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn execute_inner(
+        &self,
+        params: serde_json::Value,
+        ctx: &SandboxContext,
+    ) -> Result<ToolResult, ToolError> {
         let Some(path_str) = params.get("path").and_then(serde_json::Value::as_str) else {
             return Err(ToolError::invalid_params(
                 "missing required parameter: path",
             ));
         };
 
-        let path = validate_path(path_str)?;
+        let path = validate_and_resolve(path_str, ctx)?;
+        ctx.check_path_access(&path)?;
 
         let content = tokio::fs::read_to_string(&path)
             .await
@@ -111,9 +119,14 @@ impl FileReadTool {
 }
 
 #[expect(clippy::unwrap_used, reason = "test assertions")]
+#[expect(clippy::panic, reason = "test assertions use panic-based macros")]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ctx() -> SandboxContext {
+        SandboxContext::test_default()
+    }
 
     #[tokio::test]
     async fn read_entire_file() {
@@ -123,8 +136,12 @@ mod tests {
         std::fs::write(&file, "line1\nline2\nline3\n").ok();
 
         let tool = FileReadTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({ "path": file.to_str().unwrap() }))
+            .execute(
+                serde_json::json!({ "path": file.to_str().unwrap() }),
+                &sandbox,
+            )
             .await;
 
         let result = result.unwrap();
@@ -143,12 +160,16 @@ mod tests {
         std::fs::write(&file, "line1\nline2\nline3\nline4\nline5\n").ok();
 
         let tool = FileReadTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({
-                "path": file.to_str().unwrap(),
-                "start_line": 2,
-                "end_line": 4
-            }))
+            .execute(
+                serde_json::json!({
+                    "path": file.to_str().unwrap(),
+                    "start_line": 2,
+                    "end_line": 4
+                }),
+                &sandbox,
+            )
             .await
             .unwrap();
 
@@ -164,8 +185,12 @@ mod tests {
     #[tokio::test]
     async fn read_missing_file() {
         let tool = FileReadTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({ "path": "/tmp/tmg_nonexistent_file_xyz.txt" }))
+            .execute(
+                serde_json::json!({ "path": "/tmp/tmg_nonexistent_file_xyz.txt" }),
+                &sandbox,
+            )
             .await;
 
         assert!(result.is_err());
@@ -176,7 +201,8 @@ mod tests {
     #[tokio::test]
     async fn read_missing_path_param() {
         let tool = FileReadTool;
-        let result = tool.execute(serde_json::json!({})).await;
+        let sandbox = ctx();
+        let result = tool.execute(serde_json::json!({}), &sandbox).await;
         assert!(result.is_err());
     }
 
@@ -188,11 +214,15 @@ mod tests {
         std::fs::write(&file, "line1\nline2\n").ok();
 
         let tool = FileReadTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({
-                "path": file.to_str().unwrap(),
-                "start_line": 0
-            }))
+            .execute(
+                serde_json::json!({
+                    "path": file.to_str().unwrap(),
+                    "start_line": 0
+                }),
+                &sandbox,
+            )
             .await;
 
         assert!(result.is_err());
@@ -205,11 +235,69 @@ mod tests {
     #[tokio::test]
     async fn read_path_traversal() {
         let tool = FileReadTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({ "path": "/tmp/../etc/passwd" }))
+            .execute(
+                serde_json::json!({ "path": "/tmp/../etc/passwd" }),
+                &sandbox,
+            )
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("traversal"));
+    }
+
+    /// Reading outside the workspace under a `WorkspaceWrite` sandbox
+    /// must surface a [`ToolError::Sandbox`] rather than silently
+    /// returning the file contents. Mirrors the strict pattern used by
+    /// `registry_integration::workspace_write_blocks_external_file_writes`
+    /// so a future regression that drops the sandbox check would be
+    /// caught here as well.
+    #[tokio::test]
+    async fn read_outside_workspace_denied() {
+        use tmg_sandbox::{SandboxConfig, SandboxMode};
+
+        // Build two distinct directories under the system temp tree:
+        // - `workspace` is what the sandbox is configured for.
+        // - `outside_root` holds the target file. We canonicalize it
+        //   to absorb macOS's `/var` -> `/private/var` symlink so the
+        //   sandbox sees the real, non-workspace prefix.
+        let temp_root = std::env::temp_dir();
+        let workspace = temp_root.join("tmg_tools_test_file_read_outside_ws");
+        let _ = std::fs::create_dir_all(&workspace);
+        let outside_root = temp_root.join("tmg_tools_test_file_read_outside_target_dir");
+        let _ = std::fs::create_dir_all(&outside_root);
+        let outside_root =
+            std::fs::canonicalize(&outside_root).unwrap_or_else(|_| outside_root.clone());
+        let outside = outside_root.join("secret.txt");
+        std::fs::write(&outside, "secret").ok();
+
+        // Build a fresh, non-`Full` sandbox so the workspace check
+        // actually fires. The workspace deliberately excludes the
+        // target path.
+        let sandbox = SandboxContext::new(
+            SandboxConfig::new(&workspace).with_mode(SandboxMode::WorkspaceWrite),
+        );
+        let tool = FileReadTool;
+        let result = tool
+            .execute(
+                serde_json::json!({ "path": outside.to_str().unwrap() }),
+                &sandbox,
+            )
+            .await;
+
+        // The sandbox MUST fire — silently allowing the read would
+        // mean the workspace boundary failed to hold.
+        match result {
+            Ok(res) => panic!("workspace-external file_read must be denied; got Ok({res:?})",),
+            Err(err) => assert!(
+                matches!(err, ToolError::Sandbox { .. }),
+                "expected ToolError::Sandbox, got {err:?}"
+            ),
+        }
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&outside_root);
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 }

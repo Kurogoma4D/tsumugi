@@ -1,5 +1,6 @@
 //! Process restriction utilities: timeout enforcement and OOM score adjustment.
 
+use std::path::Path;
 use std::time::Duration;
 
 use crate::error::SandboxError;
@@ -8,9 +9,13 @@ use crate::platform;
 /// Execute a shell command within sandbox constraints.
 ///
 /// This function:
-/// 1. Spawns the command via `sh -c`
+/// 1. Spawns the command via `sh -c` with `current_dir` set to `workspace`
 /// 2. Adjusts the child process's OOM score (Linux only)
 /// 3. Enforces a timeout, sending `SIGKILL` if exceeded
+///
+/// Anchoring `cwd` to the sandbox workspace prevents `tmg` invocations
+/// from running shell commands against an unintended directory when
+/// the agent is launched from outside the workspace tree.
 ///
 /// Returns the command's stdout, stderr, and exit code on success.
 ///
@@ -24,10 +29,12 @@ pub async fn run_sandboxed_command(
     command: &str,
     timeout_secs: u64,
     oom_score_adj: i32,
+    workspace: &Path,
 ) -> Result<CommandOutput, SandboxError> {
     let child = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(command)
+        .current_dir(workspace)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -92,7 +99,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_simple_command() {
-        let output = run_sandboxed_command("echo hello", 10, 0)
+        let cwd = std::env::temp_dir();
+        let output = run_sandboxed_command("echo hello", 10, 0, &cwd)
             .await
             .unwrap_or_else(|e| CommandOutput {
                 stdout: String::new(),
@@ -106,7 +114,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_command_timeout_returns_error() {
-        let result = run_sandboxed_command("sleep 60", 1, 0).await;
+        let cwd = std::env::temp_dir();
+        let result = run_sandboxed_command("sleep 60", 1, 0, &cwd).await;
         let Err(SandboxError::Timeout { seconds }) = result else {
             // If it's not a Timeout error, the test should fail.
             assert!(result.is_err(), "expected Timeout error");
@@ -117,7 +126,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_failing_command() {
-        let output = run_sandboxed_command("exit 42", 10, 0)
+        let cwd = std::env::temp_dir();
+        let output = run_sandboxed_command("exit 42", 10, 0, &cwd)
             .await
             .unwrap_or_else(|e| CommandOutput {
                 stdout: String::new(),
@@ -127,6 +137,29 @@ mod tests {
 
         assert!(!output.success());
         assert_eq!(output.exit_code, 42);
+    }
+
+    #[tokio::test]
+    async fn run_command_uses_workspace_cwd() {
+        // The sandbox must anchor `pwd` to its configured workspace
+        // even when the parent process cwd lives elsewhere.
+        let workspace = std::env::temp_dir();
+        let output = run_sandboxed_command("pwd", 10, 0, &workspace)
+            .await
+            .unwrap_or_else(|e| CommandOutput {
+                stdout: String::new(),
+                stderr: e.to_string(),
+                exit_code: -1,
+            });
+
+        assert!(output.success());
+        // Use canonicalisation to compare paths through any symlink
+        // (e.g. `/tmp` -> `/private/tmp` on macOS) that the shell's
+        // `pwd -L` would otherwise mask.
+        let expected = std::fs::canonicalize(&workspace).unwrap_or(workspace.clone());
+        let actual_str = output.stdout.trim();
+        let actual = std::fs::canonicalize(actual_str).unwrap_or_else(|_| actual_str.into());
+        assert_eq!(actual, expected);
     }
 
     #[test]

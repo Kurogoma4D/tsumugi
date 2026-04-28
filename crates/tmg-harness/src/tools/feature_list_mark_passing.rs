@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use tmg_sandbox::SandboxContext;
 use tmg_tools::{Tool, ToolError, ToolResult};
 use tokio::sync::Mutex;
 
@@ -54,12 +55,16 @@ impl Tool for FeatureListMarkPassingTool {
         })
     }
 
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         params: serde_json::Value,
+        _ctx: &'a SandboxContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
     > {
+        // The sandbox parameter is currently advisory: this tool only
+        // mutates the run-internal `features.json` (workspace-internal
+        // by construction) via the runner.
         let runner = Arc::clone(&self.runner);
         Box::pin(async move {
             let Some(feature_id) = params.get("feature_id").and_then(serde_json::Value::as_str)
@@ -164,8 +169,9 @@ mod tests {
     async fn happy_path_flips_only_target_feature() {
         let (_tmp, runner) = make_runner_with_features(sample_json());
         let tool = FeatureListMarkPassingTool::new(Arc::clone(&runner));
+        let ctx = SandboxContext::test_default();
         let res = tool
-            .execute(serde_json::json!({ "feature_id": "feat-001" }))
+            .execute(serde_json::json!({ "feature_id": "feat-001" }), &ctx)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(!res.is_error);
@@ -182,7 +188,8 @@ mod tests {
     async fn updates_active_session_features_marked_passing() {
         let (_tmp, runner) = make_runner_with_features(sample_json());
         let tool = FeatureListMarkPassingTool::new(Arc::clone(&runner));
-        tool.execute(serde_json::json!({ "feature_id": "feat-001" }))
+        let ctx = SandboxContext::test_default();
+        tool.execute(serde_json::json!({ "feature_id": "feat-001" }), &ctx)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
 
@@ -197,8 +204,9 @@ mod tests {
     async fn duplicate_calls_do_not_double_record_in_session() {
         let (_tmp, runner) = make_runner_with_features(sample_json());
         let tool = FeatureListMarkPassingTool::new(Arc::clone(&runner));
+        let ctx = SandboxContext::test_default();
         for _ in 0..3 {
-            tool.execute(serde_json::json!({ "feature_id": "feat-001" }))
+            tool.execute(serde_json::json!({ "feature_id": "feat-001" }), &ctx)
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
         }
@@ -213,8 +221,9 @@ mod tests {
     async fn unknown_id_returns_tool_error_result() {
         let (_tmp, runner) = make_runner_with_features(sample_json());
         let tool = FeatureListMarkPassingTool::new(Arc::clone(&runner));
+        let ctx = SandboxContext::test_default();
         let res = tool
-            .execute(serde_json::json!({ "feature_id": "feat-999" }))
+            .execute(serde_json::json!({ "feature_id": "feat-999" }), &ctx)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(res.is_error, "expected is_error=true, got {res:?}");
@@ -240,7 +249,8 @@ mod tests {
     async fn missing_param_is_invalid_params() {
         let (_tmp, runner) = make_runner_with_features(sample_json());
         let tool = FeatureListMarkPassingTool::new(runner);
-        let res = tool.execute(serde_json::json!({})).await;
+        let ctx = SandboxContext::test_default();
+        let res = tool.execute(serde_json::json!({}), &ctx).await;
         assert!(matches!(res, Err(ToolError::InvalidParams { .. })));
     }
 
@@ -248,8 +258,9 @@ mod tests {
     async fn empty_param_is_invalid_params() {
         let (_tmp, runner) = make_runner_with_features(sample_json());
         let tool = FeatureListMarkPassingTool::new(runner);
+        let ctx = SandboxContext::test_default();
         let res = tool
-            .execute(serde_json::json!({ "feature_id": "  " }))
+            .execute(serde_json::json!({ "feature_id": "  " }), &ctx)
             .await;
         assert!(matches!(res, Err(ToolError::InvalidParams { .. })));
     }
@@ -261,6 +272,7 @@ mod tests {
     async fn schema_invariance_via_tool_api() {
         let (_tmp, runner) = make_runner_with_features(sample_json());
         let tool = FeatureListMarkPassingTool::new(Arc::clone(&runner));
+        let ctx = SandboxContext::test_default();
 
         let before = {
             let guard = runner.lock().await;
@@ -268,11 +280,14 @@ mod tests {
         };
 
         // Try smuggling extra fields in the params.
-        tool.execute(serde_json::json!({
-            "feature_id": "feat-001",
-            "evil": "smuggled",
-            "passes": false,
-        }))
+        tool.execute(
+            serde_json::json!({
+                "feature_id": "feat-001",
+                "evil": "smuggled",
+                "passes": false,
+            }),
+            &ctx,
+        )
         .await
         .unwrap_or_else(|e| panic!("{e}"));
 

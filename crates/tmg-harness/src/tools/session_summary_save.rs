@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use tmg_sandbox::SandboxContext;
 use tmg_tools::{Tool, ToolError, ToolResult};
 use tokio::sync::Mutex;
 
@@ -47,12 +48,17 @@ impl Tool for SessionSummarySaveTool {
         })
     }
 
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         params: serde_json::Value,
+        _ctx: &'a SandboxContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
     > {
+        // The sandbox parameter is currently advisory: this tool only
+        // mutates the run's session log via the runner, which lives
+        // under the workspace by construction. Accepting it keeps the
+        // [`Tool`] signature uniform.
         let runner = Arc::clone(&self.runner);
         Box::pin(async move {
             let Some(summary) = params.get("summary").and_then(serde_json::Value::as_str) else {
@@ -103,8 +109,9 @@ mod tests {
     async fn save_summary_persists_to_session_log() {
         let (_tmp, runner) = make_runner();
         let tool = SessionSummarySaveTool::new(Arc::clone(&runner));
+        let ctx = SandboxContext::test_default();
         let res = tool
-            .execute(serde_json::json!({ "summary": "wrote a thing" }))
+            .execute(serde_json::json!({ "summary": "wrote a thing" }), &ctx)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(!res.is_error);
@@ -137,9 +144,13 @@ mod tests {
         }
 
         let tool = SessionSummarySaveTool::new(Arc::clone(&runner));
-        tool.execute(serde_json::json!({ "summary": "Implemented foo and bar" }))
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
+        let ctx = SandboxContext::test_default();
+        tool.execute(
+            serde_json::json!({ "summary": "Implemented foo and bar" }),
+            &ctx,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
 
         // End the active session so `trigger` and `ended_at` are
         // populated, then re-save to flush them to disk before checking
@@ -194,7 +205,8 @@ mod tests {
     async fn missing_summary_param_is_error() {
         let (_tmp, runner) = make_runner();
         let tool = SessionSummarySaveTool::new(runner);
-        let res = tool.execute(serde_json::json!({})).await;
+        let ctx = SandboxContext::test_default();
+        let res = tool.execute(serde_json::json!({}), &ctx).await;
         assert!(matches!(res, Err(ToolError::InvalidParams { .. })));
     }
 }

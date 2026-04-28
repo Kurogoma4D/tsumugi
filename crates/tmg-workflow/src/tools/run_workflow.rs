@@ -34,6 +34,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, OnceCell, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use tmg_sandbox::SandboxContext;
 use tmg_tools::{Tool, ToolError, ToolResult};
 
 use super::types::{
@@ -142,10 +143,16 @@ impl Tool for RunWorkflowTool {
     // dyn-compatibility (see `tmg_tools::types::Tool::execute`); when
     // the trait migrates to a native `async fn`, this can collapse to
     // a plain `async fn execute`.
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         params: Value,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + '_>> {
+        _ctx: &'a SandboxContext,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>> {
+        // The workflow engine carries its own [`SandboxContext`]
+        // (`WorkflowEngine::sandbox`) for per-step enforcement; the
+        // top-level dispatch sandbox is therefore advisory at the
+        // tool boundary. Future work will reconcile the two so the
+        // engine inherits the dispatch sandbox by default.
         Box::pin(self.execute_inner(params))
     }
 }

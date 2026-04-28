@@ -60,7 +60,13 @@ async fn agent_step_routes_through_subagent_manager() {
     let llm_client_cfg = tmg_llm::LlmClientConfig::new(endpoint, "test-model");
     let llm_client = tmg_llm::LlmClient::new(llm_client_cfg).unwrap();
     let cancel = CancellationToken::new();
-    let manager = SubagentManager::new(llm_client, cancel, endpoint, "test-model");
+    let manager = SubagentManager::new(
+        llm_client,
+        cancel,
+        endpoint,
+        "test-model",
+        Arc::clone(&sandbox),
+    );
     let subagent_manager = Arc::new(Mutex::new(manager));
 
     let engine = WorkflowEngine::new(
@@ -125,7 +131,13 @@ async fn unknown_subagent_name_is_step_failure() {
     let llm_client_cfg = tmg_llm::LlmClientConfig::new(endpoint, "test-model");
     let llm_client = tmg_llm::LlmClient::new(llm_client_cfg).unwrap();
     let cancel = CancellationToken::new();
-    let manager = SubagentManager::new(llm_client, cancel, endpoint, "test-model");
+    let manager = SubagentManager::new(
+        llm_client,
+        cancel,
+        endpoint,
+        "test-model",
+        Arc::clone(&sandbox),
+    );
     let subagent_manager = Arc::new(Mutex::new(manager));
 
     let engine = WorkflowEngine::new(

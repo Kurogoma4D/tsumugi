@@ -3,8 +3,10 @@
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
+use tmg_sandbox::SandboxContext;
+
 use crate::error::ToolError;
-use crate::path_util::validate_path;
+use crate::path_util::validate_and_resolve;
 use crate::types::{Tool, ToolResult};
 
 /// Default maximum depth for directory traversal.
@@ -43,18 +45,23 @@ impl Tool for ListDirTool {
         })
     }
 
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         params: serde_json::Value,
+        ctx: &'a SandboxContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
     > {
-        Box::pin(self.execute_inner(params))
+        Box::pin(self.execute_inner(params, ctx))
     }
 }
 
 impl ListDirTool {
-    async fn execute_inner(&self, params: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn execute_inner(
+        &self,
+        params: serde_json::Value,
+        ctx: &SandboxContext,
+    ) -> Result<ToolResult, ToolError> {
         let Some(path_str) = params.get("path").and_then(serde_json::Value::as_str) else {
             return Err(ToolError::invalid_params(
                 "missing required parameter: path",
@@ -67,7 +74,8 @@ impl ListDirTool {
             .and_then(|d| usize::try_from(d).ok())
             .unwrap_or(DEFAULT_MAX_DEPTH);
 
-        let path = validate_path(path_str)?;
+        let path = validate_and_resolve(path_str, ctx)?;
+        ctx.check_path_access(&path)?;
 
         // Use blocking I/O for the directory walk since std::fs::read_dir is
         // synchronous and we may read many entries.
@@ -162,6 +170,10 @@ fn collect_entries(
 mod tests {
     use super::*;
 
+    fn ctx() -> SandboxContext {
+        SandboxContext::test_default()
+    }
+
     #[tokio::test]
     async fn list_dir_basic() {
         let dir = std::env::temp_dir().join("tmg_tools_test_list_dir");
@@ -171,8 +183,12 @@ mod tests {
         std::fs::write(dir.join("sub").join("nested.txt"), "nested").ok();
 
         let tool = ListDirTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({ "path": dir.to_str().unwrap() }))
+            .execute(
+                serde_json::json!({ "path": dir.to_str().unwrap() }),
+                &sandbox,
+            )
             .await
             .unwrap();
 
@@ -193,11 +209,15 @@ mod tests {
         std::fs::write(dir.join("sub").join("deep").join("deep.txt"), "deep").ok();
 
         let tool = ListDirTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({
-                "path": dir.to_str().unwrap(),
-                "depth": 1
-            }))
+            .execute(
+                serde_json::json!({
+                    "path": dir.to_str().unwrap(),
+                    "depth": 1
+                }),
+                &sandbox,
+            )
             .await
             .unwrap();
 
@@ -213,8 +233,12 @@ mod tests {
     #[tokio::test]
     async fn list_dir_nonexistent() {
         let tool = ListDirTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({ "path": "/tmp/tmg_nonexistent_dir_xyz" }))
+            .execute(
+                serde_json::json!({ "path": "/tmp/tmg_nonexistent_dir_xyz" }),
+                &sandbox,
+            )
             .await;
         assert!(result.is_err());
     }
@@ -228,8 +252,12 @@ mod tests {
         std::fs::write(dir.join("visible.txt"), "visible").ok();
 
         let tool = ListDirTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({ "path": dir.to_str().unwrap() }))
+            .execute(
+                serde_json::json!({ "path": dir.to_str().unwrap() }),
+                &sandbox,
+            )
             .await
             .unwrap();
 

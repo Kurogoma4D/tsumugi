@@ -13,6 +13,7 @@ use tmg_llm::{
     LlmClient, StreamEvent, ToolCall, ToolCallingMode, ToolDefinition, build_tool_calling_prompt,
     parse_tool_calls,
 };
+use tmg_sandbox::SandboxContext;
 use tmg_tools::ToolRegistry;
 
 use crate::context::{ContextCompressor, ContextConfig, TokenCounter, truncate_tool_result};
@@ -153,6 +154,16 @@ pub struct AgentLoop {
     /// Tool calling strategy (native, `prompt_based`, or auto).
     tool_calling_mode: ToolCallingMode,
 
+    /// Sandbox context every tool dispatch runs under.
+    ///
+    /// Constructed by the CLI from the operator's `[sandbox]` config
+    /// and threaded into [`Self::dispatch_tool_calls`]. The sandbox is
+    /// a required constructor argument (see [`Self::new`] /
+    /// [`Self::with_context_config`]) so production callers cannot
+    /// silently fall back to an unrestricted [`SandboxContext`] by
+    /// forgetting to install one.
+    sandbox: Arc<SandboxContext>,
+
     /// Optional callback invoked at the end of every [`Self::turn`].
     ///
     /// Installed by the harness wire-up to feed the auto-promotion
@@ -168,6 +179,12 @@ impl AgentLoop {
     /// directory and from `project_root` down to `cwd`, injecting them
     /// as initial user-role messages after the system prompt.
     ///
+    /// The `sandbox` argument is **required**: it is the
+    /// [`SandboxContext`] every dispatched tool runs under. Making it
+    /// a constructor argument prevents callers from accidentally
+    /// running tools under an unrestricted default
+    /// (issue #47 follow-up).
+    ///
     /// # Errors
     ///
     /// Returns [`CoreError::Io`] if a prompt file exists but cannot be read.
@@ -177,6 +194,7 @@ impl AgentLoop {
         cancel: CancellationToken,
         project_root: &Path,
         cwd: &Path,
+        sandbox: Arc<SandboxContext>,
     ) -> Result<Self, CoreError> {
         Self::with_context_config(
             client,
@@ -186,14 +204,21 @@ impl AgentLoop {
             cwd,
             ContextConfig::default(),
             ToolCallingMode::Auto,
+            sandbox,
         )
     }
 
     /// Create a new agent loop with tool support and custom context config.
     ///
+    /// The `sandbox` argument is **required**: see [`Self::new`].
+    ///
     /// # Errors
     ///
     /// Returns [`CoreError::Io`] if a prompt file exists but cannot be read.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor wires together independent capabilities (LLM, registry, paths, context budget, mode, sandbox); grouping them into a config struct adds boilerplate without clarifying intent"
+    )]
     pub fn with_context_config(
         client: LlmClient,
         registry: ToolRegistry,
@@ -202,6 +227,7 @@ impl AgentLoop {
         cwd: &Path,
         context_config: ContextConfig,
         tool_calling_mode: ToolCallingMode,
+        sandbox: Arc<SandboxContext>,
     ) -> Result<Self, CoreError> {
         let tool_defs = Arc::new(registry.tool_definitions());
 
@@ -227,8 +253,26 @@ impl AgentLoop {
             token_counter,
             compressor,
             tool_calling_mode,
+            sandbox,
             turn_observer: None,
         })
+    }
+
+    /// Replace the active [`SandboxContext`].
+    ///
+    /// Constructor-time installation via [`Self::new`] /
+    /// [`Self::with_context_config`] is the canonical path; this
+    /// setter exists only for explicit reconfiguration (e.g. a future
+    /// `tmg run upgrade` flow that re-derives the sandbox after
+    /// promotion).
+    pub fn set_sandbox(&mut self, sandbox: Arc<SandboxContext>) {
+        self.sandbox = sandbox;
+    }
+
+    /// Borrow the active [`SandboxContext`].
+    #[must_use]
+    pub fn sandbox(&self) -> &Arc<SandboxContext> {
+        &self.sandbox
     }
 
     /// Install (or replace) the per-turn observer callback.
@@ -589,6 +633,7 @@ impl AgentLoop {
         let mut join_set = JoinSet::new();
         for tc in tool_calls {
             let registry = Arc::clone(&self.registry);
+            let sandbox = Arc::clone(&self.sandbox);
             let name = tc.function.name.clone();
             let arguments_str = tc.function.arguments.clone();
             let call_id = tc.id.clone();
@@ -610,7 +655,7 @@ impl AgentLoop {
                     }
                 };
 
-                let result = registry.execute(&name, params).await;
+                let result = registry.execute(&name, params, &sandbox).await;
                 match result {
                     Ok(tool_result) => (call_id, name, Ok(tool_result)),
                     Err(e) => {

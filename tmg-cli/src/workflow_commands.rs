@@ -331,16 +331,17 @@ async fn run_normal(
         &config.llm.model,
     ))
     .context("constructing LlmClient")?;
+    let sandbox = Arc::new(tmg_sandbox::SandboxContext::new(
+        tmg_sandbox::SandboxConfig::new(canonical)
+            .with_mode(tmg_sandbox::SandboxMode::WorkspaceWrite),
+    ));
     let subagent_manager = Arc::new(Mutex::new(tmg_agents::SubagentManager::new(
         llm_client,
         cancel.clone(),
         &config.llm.endpoint,
         &config.llm.model,
+        Arc::clone(&sandbox),
     )));
-    let sandbox = Arc::new(tmg_sandbox::SandboxContext::new(
-        tmg_sandbox::SandboxConfig::new(canonical)
-            .with_mode(tmg_sandbox::SandboxMode::WorkspaceWrite),
-    ));
     let registry = Arc::new(tmg_tools::ToolRegistry::new());
     let engine = WorkflowEngine::new(
         llm_pool,
@@ -448,16 +449,17 @@ async fn run_long_running(
         &config.llm.model,
     ))
     .context("constructing LlmClient")?;
+    let sandbox = Arc::new(tmg_sandbox::SandboxContext::new(
+        tmg_sandbox::SandboxConfig::new(canonical)
+            .with_mode(tmg_sandbox::SandboxMode::WorkspaceWrite),
+    ));
     let subagent_manager = Arc::new(Mutex::new(tmg_agents::SubagentManager::new(
         llm_client,
         cancel.clone(),
         &config.llm.endpoint,
         &config.llm.model,
+        Arc::clone(&sandbox),
     )));
-    let sandbox = Arc::new(tmg_sandbox::SandboxContext::new(
-        tmg_sandbox::SandboxConfig::new(canonical)
-            .with_mode(tmg_sandbox::SandboxMode::WorkspaceWrite),
-    ));
     let registry = Arc::new(tmg_tools::ToolRegistry::new());
     let engine = Arc::new(WorkflowEngine::new(
         llm_pool,

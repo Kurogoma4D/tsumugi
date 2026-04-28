@@ -26,6 +26,16 @@ use tmg_workflow::{
     RunWorkflowTool, WorkflowConfig, WorkflowEngine, WorkflowStatusTool, parse_workflow_str, tools,
 };
 
+/// Tool dispatch sandbox shared across the tests in this file.
+///
+/// The `Tool::execute` signature added in issue #47 takes a
+/// [`SandboxContext`] reference; these tool-surface tests are not
+/// trying to assert sandbox enforcement themselves, so we hand them a
+/// permissive [`SandboxContext::test_default`].
+fn dispatch_ctx() -> SandboxContext {
+    SandboxContext::test_default()
+}
+
 /// Build an engine + index with the given workflows.
 fn build_engine(
     workspace: &Path,
@@ -44,7 +54,13 @@ fn build_engine(
     let llm_client_cfg = tmg_llm::LlmClientConfig::new("http://localhost:9999", "test-model");
     let llm_client = tmg_llm::LlmClient::new(llm_client_cfg).unwrap();
     let cancel = CancellationToken::new();
-    let manager = SubagentManager::new(llm_client, cancel, "http://localhost:9999", "test-model");
+    let manager = SubagentManager::new(
+        llm_client,
+        cancel,
+        "http://localhost:9999",
+        "test-model",
+        Arc::clone(&sandbox),
+    );
     let subagent_manager = Arc::new(Mutex::new(manager));
 
     let mut index_map: HashMap<String, tmg_workflow::WorkflowDef> = HashMap::new();
@@ -85,9 +101,10 @@ outputs:
     let (engine, index) = build_engine(tmp.path(), vec![("simple", yaml)]);
     let bg = tools::new_background_runs();
     let tool = RunWorkflowTool::new(engine, index, bg);
+    let ctx = dispatch_ctx();
 
     let result = tool
-        .execute(serde_json::json!({"workflow": "simple"}))
+        .execute(serde_json::json!({"workflow": "simple"}), &ctx)
         .await
         .unwrap();
     assert!(!result.is_error, "got error result: {}", result.output);
@@ -103,9 +120,10 @@ async fn unknown_workflow_returns_clear_error() {
     let (engine, index) = build_engine(tmp.path(), vec![]);
     let bg = tools::new_background_runs();
     let tool = RunWorkflowTool::new(engine, index, bg);
+    let ctx = dispatch_ctx();
 
     let result = tool
-        .execute(serde_json::json!({"workflow": "nope"}))
+        .execute(serde_json::json!({"workflow": "nope"}), &ctx)
         .await
         .unwrap();
     assert!(result.is_error);
@@ -129,10 +147,14 @@ outputs:
     let (engine, index) = build_engine(tmp.path(), vec![("bg", yaml)]);
     let bg = tools::new_background_runs();
     let run_tool = RunWorkflowTool::new(Arc::clone(&engine), index, Arc::clone(&bg));
+    let ctx = dispatch_ctx();
     let status_tool = WorkflowStatusTool::new(Arc::clone(&bg));
 
     let start = run_tool
-        .execute(serde_json::json!({"workflow": "bg", "background": true}))
+        .execute(
+            serde_json::json!({"workflow": "bg", "background": true}),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(!start.is_error);
@@ -152,7 +174,7 @@ outputs:
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let result = status_tool
-            .execute(serde_json::json!({"run_id": run_id.clone()}))
+            .execute(serde_json::json!({"run_id": run_id.clone()}), &ctx)
             .await
             .unwrap();
         let parsed: Value = serde_json::from_str(&result.output).unwrap();
@@ -192,12 +214,16 @@ outputs:
     let (engine, index) = build_engine(tmp.path(), vec![("bg", yaml)]);
     let bg = tools::new_background_runs();
     let run_tool = RunWorkflowTool::new(Arc::clone(&engine), index, Arc::clone(&bg));
+    let ctx = dispatch_ctx();
     let status_tool = WorkflowStatusTool::new(Arc::clone(&bg));
 
     let mut run_ids = Vec::new();
     for _ in 0..3 {
         let start = run_tool
-            .execute(serde_json::json!({"workflow": "bg", "background": true}))
+            .execute(
+                serde_json::json!({"workflow": "bg", "background": true}),
+                &ctx,
+            )
             .await
             .unwrap();
         let parsed: Value = serde_json::from_str(&start.output).unwrap();
@@ -218,7 +244,7 @@ outputs:
     // Each is queryable.
     for rid in &run_ids {
         let r = status_tool
-            .execute(serde_json::json!({"run_id": rid}))
+            .execute(serde_json::json!({"run_id": rid}), &ctx)
             .await
             .unwrap();
         assert!(!r.is_error, "{}", r.output);
@@ -230,7 +256,7 @@ outputs:
         let mut all_done = true;
         for rid in &run_ids {
             let r = status_tool
-                .execute(serde_json::json!({"run_id": rid}))
+                .execute(serde_json::json!({"run_id": rid}), &ctx)
                 .await
                 .unwrap();
             let parsed: Value = serde_json::from_str(&r.output).unwrap();
@@ -254,9 +280,10 @@ outputs:
 async fn unknown_run_id_returns_clear_error() {
     let bg = tools::new_background_runs();
     let status_tool = WorkflowStatusTool::new(bg);
+    let ctx = dispatch_ctx();
 
     let result = status_tool
-        .execute(serde_json::json!({"run_id": "0123456789abcdef"}))
+        .execute(serde_json::json!({"run_id": "0123456789abcdef"}), &ctx)
         .await
         .unwrap();
     assert!(result.is_error);
@@ -280,10 +307,14 @@ outputs:
     let (engine, index) = build_engine(tmp.path(), vec![("simple", yaml)]);
     let bg = tools::new_background_runs();
     let tool = RunWorkflowTool::new(engine, index, bg);
+    let ctx = dispatch_ctx();
 
     // Array instead of object.
     let r = tool
-        .execute(serde_json::json!({"workflow": "simple", "inputs": [1, 2, 3]}))
+        .execute(
+            serde_json::json!({"workflow": "simple", "inputs": [1, 2, 3]}),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(r.is_error, "expected error result for array inputs");
@@ -291,7 +322,10 @@ outputs:
 
     // String instead of object.
     let r = tool
-        .execute(serde_json::json!({"workflow": "simple", "inputs": "oops"}))
+        .execute(
+            serde_json::json!({"workflow": "simple", "inputs": "oops"}),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(r.is_error);
@@ -319,6 +353,7 @@ outputs:
     let (engine, index) = build_engine(tmp.path(), vec![("bg", yaml)]);
     let bg = tools::new_background_runs();
     let run_tool = RunWorkflowTool::new(Arc::clone(&engine), index, Arc::clone(&bg));
+    let ctx = dispatch_ctx();
     let status_tool = WorkflowStatusTool::new(Arc::clone(&bg));
 
     // Spawn the run repeatedly to give the select! race plenty of
@@ -327,7 +362,10 @@ outputs:
     // unexpectedly" path overwrote the success outcome.
     for _ in 0..5 {
         let start = run_tool
-            .execute(serde_json::json!({"workflow": "bg", "background": true}))
+            .execute(
+                serde_json::json!({"workflow": "bg", "background": true}),
+                &ctx,
+            )
             .await
             .unwrap();
         let parsed: Value = serde_json::from_str(&start.output).unwrap();
@@ -340,7 +378,7 @@ outputs:
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             let r = status_tool
-                .execute(serde_json::json!({"run_id": run_id.clone()}))
+                .execute(serde_json::json!({"run_id": run_id.clone()}), &ctx)
                 .await
                 .unwrap();
             let parsed: Value = serde_json::from_str(&r.output).unwrap();
@@ -392,10 +430,14 @@ outputs:
     let (engine, index) = build_engine(tmp.path(), vec![("long", yaml)]);
     let bg = tools::new_background_runs();
     let run_tool = RunWorkflowTool::new(Arc::clone(&engine), index, Arc::clone(&bg));
+    let ctx = dispatch_ctx();
     let status_tool = WorkflowStatusTool::new(Arc::clone(&bg));
 
     let start = run_tool
-        .execute(serde_json::json!({"workflow": "long", "background": true}))
+        .execute(
+            serde_json::json!({"workflow": "long", "background": true}),
+            &ctx,
+        )
         .await
         .unwrap();
     let parsed: Value = serde_json::from_str(&start.output).unwrap();
@@ -407,7 +449,7 @@ outputs:
 
     // Confirm the run is registered and running before we cancel.
     let r = status_tool
-        .execute(serde_json::json!({"run_id": run_id.clone()}))
+        .execute(serde_json::json!({"run_id": run_id.clone()}), &ctx)
         .await
         .unwrap();
     let parsed: Value = serde_json::from_str(&r.output).unwrap();
@@ -430,7 +472,7 @@ outputs:
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let r = status_tool
-            .execute(serde_json::json!({"run_id": run_id.clone()}))
+            .execute(serde_json::json!({"run_id": run_id.clone()}), &ctx)
             .await
             .unwrap();
         let parsed: Value = serde_json::from_str(&r.output).unwrap();

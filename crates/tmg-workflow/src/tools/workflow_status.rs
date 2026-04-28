@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use tmg_sandbox::SandboxContext;
 use tmg_tools::{Tool, ToolError, ToolResult};
 
 use super::types::{
@@ -91,10 +92,14 @@ impl Tool for WorkflowStatusTool {
     // dyn-compatibility (see `tmg_tools::types::Tool::execute`); when
     // the trait migrates to a native `async fn`, this can collapse to
     // a plain `async fn execute`.
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         params: Value,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + '_>> {
+        _ctx: &'a SandboxContext,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>> {
+        // Status lookup is in-memory only, so the dispatch sandbox is
+        // advisory here. Accepting it keeps the [`Tool`] signature
+        // uniform across in-memory and on-disk tools.
         Box::pin(self.execute_inner(params))
     }
 }

@@ -35,6 +35,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use tmg_llm::LlmClient;
+use tmg_sandbox::{SandboxContext, SandboxMode};
 
 use crate::builtins::{
     RunToolProvider, registry_for_agent_kind, registry_for_agent_kind_with_run_provider,
@@ -168,6 +169,37 @@ pub struct SubagentManager {
     /// disabled" so manager construction stays a single positional
     /// call until a `[harness.escalator]` section is present.
     escalator_overrides: EscalatorOverrides,
+
+    /// Parent [`SandboxContext`] from which each spawn derives its
+    /// per-subagent sandbox.
+    ///
+    /// The agent kind's [`AgentType::sandbox_mode`] picks the
+    /// [`SandboxMode`] for the derivation, while the workspace,
+    /// timeout, and OOM score are inherited from this parent. The
+    /// parent sandbox is a required constructor argument for
+    /// [`SubagentManager::new`], so production callers cannot
+    /// silently fall back to an unrestricted default.
+    parent_sandbox: Arc<SandboxContext>,
+}
+
+/// Derive a per-subagent [`SandboxContext`] from a parent context and
+/// a sandbox mode.
+///
+/// The returned context inherits the parent's workspace, allowed
+/// domains, timeout, and OOM-score adjustment, and applies the
+/// supplied [`SandboxMode`] override. The result is **not** activated
+/// at the OS level; subagents that need OS-level enforcement should
+/// call [`SandboxContext::activate`] themselves.
+///
+/// Used by [`SubagentManager::spawn_inner`] to give each spawned
+/// subagent a sandbox matching its
+/// [`AgentType::sandbox_mode`](crate::config::AgentType::sandbox_mode):
+/// `worker` / `initializer` / `tester` get [`SandboxMode::WorkspaceWrite`],
+/// `explore` / `plan` / `qa` / `escalator` get
+/// [`SandboxMode::ReadOnly`].
+#[must_use]
+pub fn derive_sandbox(parent: &SandboxContext, mode: SandboxMode) -> SandboxContext {
+    parent.derive(mode)
 }
 
 impl SubagentManager {
@@ -178,11 +210,18 @@ impl SubagentManager {
     /// The escalator overrides default to "no overrides, not disabled";
     /// install them with [`Self::with_escalator_overrides`] when a
     /// `[harness.escalator]` section is configured.
+    ///
+    /// The `parent_sandbox` argument is **required**: it is the
+    /// [`SandboxContext`] from which every spawned subagent derives
+    /// its own sandbox. Making it a constructor argument prevents
+    /// callers from accidentally spawning subagents under an
+    /// unrestricted default (issue #47 follow-up).
     pub fn new(
         client: LlmClient,
         parent_cancel: CancellationToken,
         default_endpoint: impl Into<String>,
         default_model: impl Into<String>,
+        parent_sandbox: Arc<SandboxContext>,
     ) -> Self {
         Self {
             client,
@@ -194,7 +233,25 @@ impl SubagentManager {
             next_id: 1,
             run_tool_provider: None,
             escalator_overrides: EscalatorOverrides::default(),
+            parent_sandbox,
         }
+    }
+
+    /// Replace the parent [`SandboxContext`] in-place.
+    ///
+    /// Constructor-time installation via [`Self::new`] is the
+    /// canonical path; this setter exists only for explicit
+    /// reconfiguration (e.g. a future config-reload path that swaps
+    /// the sandbox after the `[sandbox]` section has been re-merged
+    /// with run-scope overrides).
+    pub fn set_parent_sandbox(&mut self, sandbox: Arc<SandboxContext>) {
+        self.parent_sandbox = sandbox;
+    }
+
+    /// Borrow the currently-installed parent [`SandboxContext`].
+    #[must_use]
+    pub fn parent_sandbox(&self) -> &Arc<SandboxContext> {
+        &self.parent_sandbox
     }
 
     /// Install (or replace) the [`EscalatorOverrides`] used when
@@ -203,7 +260,7 @@ impl SubagentManager {
     /// Builder-style consuming method so the call site reads:
     ///
     /// ```ignore
-    /// let manager = SubagentManager::new(client, cancel, ep, model)
+    /// let manager = SubagentManager::new(client, cancel, ep, model, parent_sandbox)
     ///     .with_escalator_overrides(EscalatorOverrides::from_strings(
     ///         cfg.endpoint.clone(),
     ///         cfg.model.clone(),
@@ -385,6 +442,17 @@ impl SubagentManager {
         let cancel = self.parent_cancel.child_token();
         let instances = Arc::clone(&self.instances);
         let run_tool_provider = self.run_tool_provider.clone();
+        // Derive the per-subagent sandbox up-front so the spawn
+        // closure does not need to know the precedence rules.
+        // Built-in agents pick their mode from `AgentType::sandbox_mode`;
+        // custom agents may override via `CustomAgentDef::sandbox_mode`.
+        let subagent_mode = match &agent_kind {
+            AgentKind::Builtin(t) => t.sandbox_mode(),
+            AgentKind::Custom(def) => def
+                .sandbox_mode()
+                .unwrap_or_else(|| self.parent_sandbox.mode()),
+        };
+        let subagent_sandbox = Arc::new(derive_sandbox(&self.parent_sandbox, subagent_mode));
 
         self.join_set.spawn(async move {
             // Build the subagent's tool registry. With a
@@ -398,7 +466,8 @@ impl SubagentManager {
                 }
                 None => registry_for_agent_kind(&agent_kind),
             };
-            let mut runner = SubagentRunner::new(client, registry, &agent_kind, cancel);
+            let mut runner =
+                SubagentRunner::new(client, registry, &agent_kind, cancel, subagent_sandbox);
 
             let result = runner.run(&task).await;
 
@@ -548,8 +617,13 @@ mod tests {
         };
 
         let cancel = CancellationToken::new();
-        let mut manager =
-            SubagentManager::new(client, cancel.clone(), "http://localhost:9999", "test");
+        let mut manager = SubagentManager::new(
+            client,
+            cancel.clone(),
+            "http://localhost:9999",
+            "test",
+            Arc::new(SandboxContext::test_default()),
+        );
 
         let config1 = SubagentConfig {
             agent_kind: AgentKind::Builtin(AgentType::Explore),
@@ -587,8 +661,13 @@ mod tests {
         };
 
         let cancel = CancellationToken::new();
-        let mut manager =
-            SubagentManager::new(client, cancel.clone(), "http://localhost:9999", "test");
+        let mut manager = SubagentManager::new(
+            client,
+            cancel.clone(),
+            "http://localhost:9999",
+            "test",
+            Arc::new(SandboxContext::test_default()),
+        );
 
         let config1 = SubagentConfig {
             agent_kind: AgentKind::Builtin(AgentType::Explore),
@@ -620,6 +699,7 @@ mod tests {
             CancellationToken::new(),
             "http://main:8080",
             "main-model",
+            Arc::new(SandboxContext::test_default()),
         ))
     }
 
@@ -761,13 +841,18 @@ allow = ["file_read"]
             return;
         };
         let cancel = CancellationToken::new();
-        let mut manager =
-            SubagentManager::new(client, cancel.clone(), "http://main:8080", "main-model")
-                .with_escalator_overrides(EscalatorOverrides::from_strings(
-                    String::new(),
-                    String::new(),
-                    true,
-                ));
+        let mut manager = SubagentManager::new(
+            client,
+            cancel.clone(),
+            "http://main:8080",
+            "main-model",
+            Arc::new(SandboxContext::test_default()),
+        )
+        .with_escalator_overrides(EscalatorOverrides::from_strings(
+            String::new(),
+            String::new(),
+            true,
+        ));
 
         let cfg = SubagentConfig {
             agent_kind: AgentKind::Builtin(AgentType::Escalator),
@@ -806,8 +891,13 @@ allow = ["file_read"]
             return;
         };
         let cancel = CancellationToken::new();
-        let mut manager =
-            SubagentManager::new(client, cancel.clone(), "http://main:8080", "main-model");
+        let mut manager = SubagentManager::new(
+            client,
+            cancel.clone(),
+            "http://main:8080",
+            "main-model",
+            Arc::new(SandboxContext::test_default()),
+        );
 
         let cfg = SubagentConfig {
             agent_kind: AgentKind::Builtin(AgentType::Escalator),

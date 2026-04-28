@@ -42,7 +42,13 @@ fn build_engine(workspace: &Path, max_parallel_agents: u32) -> WorkflowEngine {
     let llm_client_cfg = tmg_llm::LlmClientConfig::new("http://localhost:9999", "test-model");
     let llm_client = tmg_llm::LlmClient::new(llm_client_cfg).unwrap();
     let cancel = CancellationToken::new();
-    let manager = SubagentManager::new(llm_client, cancel, "http://localhost:9999", "test-model");
+    let manager = SubagentManager::new(
+        llm_client,
+        cancel,
+        "http://localhost:9999",
+        "test-model",
+        Arc::clone(&sandbox),
+    );
     let subagent_manager = Arc::new(Mutex::new(manager));
 
     let config = WorkflowConfig {

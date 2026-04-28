@@ -33,7 +33,7 @@
 //!     .with_allowed_domains(vec!["api.example.com".to_owned()])
 //!     .with_timeout(60);
 //!
-//! let mut ctx = SandboxContext::new(config);
+//! let ctx = SandboxContext::new(config);
 //! ctx.activate().await?;
 //!
 //! // Validate path access before operations.

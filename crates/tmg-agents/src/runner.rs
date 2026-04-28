@@ -12,6 +12,7 @@ use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 
 use tmg_llm::{LlmClient, StreamEvent, ToolCall, ToolDefinition};
+use tmg_sandbox::SandboxContext;
 use tmg_tools::ToolRegistry;
 
 use crate::config::AgentKind;
@@ -109,6 +110,15 @@ pub struct SubagentRunner {
 
     /// Cancellation token for graceful shutdown.
     cancel: CancellationToken,
+
+    /// Sandbox context this subagent's tool dispatch operates under.
+    ///
+    /// Derived from the parent agent's sandbox via
+    /// [`SandboxContext::derive`] so the subagent inherits the
+    /// workspace root and process budgets but applies the
+    /// per-agent-kind [`tmg_sandbox::SandboxMode`] (e.g. `ReadOnly`
+    /// for `explore`, `WorkspaceWrite` for `worker`).
+    sandbox: Arc<SandboxContext>,
 }
 
 impl SubagentRunner {
@@ -116,11 +126,17 @@ impl SubagentRunner {
     ///
     /// The runner initializes with a system prompt appropriate for
     /// the agent kind (built-in or custom) and a filtered tool registry.
+    /// The supplied `sandbox` is the per-subagent context every tool
+    /// dispatch will receive; callers (typically
+    /// [`SubagentManager`](crate::manager::SubagentManager)) are
+    /// responsible for deriving it from the parent context with the
+    /// appropriate [`tmg_sandbox::SandboxMode`] for the agent kind.
     pub fn new(
         client: LlmClient,
         registry: ToolRegistry,
         agent_kind: &AgentKind,
         cancel: CancellationToken,
+        sandbox: Arc<SandboxContext>,
     ) -> Self {
         let tool_defs = registry.tool_definitions();
         let registry = Arc::new(registry);
@@ -133,6 +149,7 @@ impl SubagentRunner {
             tool_defs,
             history,
             cancel,
+            sandbox,
         }
     }
 
@@ -262,6 +279,7 @@ impl SubagentRunner {
 
         for tc in tool_calls {
             let registry = Arc::clone(&self.registry);
+            let sandbox = Arc::clone(&self.sandbox);
             let name = tc.function.name.clone();
             let arguments_str = tc.function.arguments.clone();
             let call_id = tc.id.clone();
@@ -281,7 +299,7 @@ impl SubagentRunner {
                     }
                 };
 
-                match registry.execute(&name, params).await {
+                match registry.execute(&name, params, &sandbox).await {
                     Ok(tool_result) => (call_id, Ok(tool_result)),
                     Err(e) => {
                         let error_result = tmg_tools::ToolResult::error(e.to_string());

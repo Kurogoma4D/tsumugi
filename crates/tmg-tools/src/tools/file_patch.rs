@@ -1,7 +1,9 @@
 //! `file_patch` tool: search/replace partial file editing.
 
+use tmg_sandbox::SandboxContext;
+
 use crate::error::ToolError;
-use crate::path_util::validate_path;
+use crate::path_util::validate_and_resolve;
 use crate::types::{Tool, ToolResult};
 
 /// Apply a search/replace patch to a file.
@@ -39,18 +41,23 @@ impl Tool for FilePatchTool {
         })
     }
 
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         params: serde_json::Value,
+        ctx: &'a SandboxContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
     > {
-        Box::pin(self.execute_inner(params))
+        Box::pin(self.execute_inner(params, ctx))
     }
 }
 
 impl FilePatchTool {
-    async fn execute_inner(&self, params: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn execute_inner(
+        &self,
+        params: serde_json::Value,
+        ctx: &SandboxContext,
+    ) -> Result<ToolResult, ToolError> {
         let Some(path_str) = params.get("path").and_then(serde_json::Value::as_str) else {
             return Err(ToolError::invalid_params(
                 "missing required parameter: path",
@@ -67,7 +74,16 @@ impl FilePatchTool {
             ));
         };
 
-        let path = validate_path(path_str)?;
+        let path = validate_and_resolve(path_str, ctx)?;
+        // Patching is a write: gate it on `check_write_access` so
+        // ReadOnly subagents cannot rewrite files. We deliberately
+        // skip the explicit `check_path_access` call here: the only
+        // paths it would additionally permit are the system-read
+        // allowlist (e.g. `/usr`, `/bin`), and writing into those
+        // would be denied by `check_write_access` anyway. So skipping
+        // the read check loses no enforcement and avoids a redundant
+        // round-trip through `normalize_path`.
+        ctx.check_write_access(&path)?;
 
         let content = tokio::fs::read_to_string(&path)
             .await
@@ -107,6 +123,10 @@ impl FilePatchTool {
 mod tests {
     use super::*;
 
+    fn ctx() -> SandboxContext {
+        SandboxContext::test_default()
+    }
+
     #[tokio::test]
     async fn patch_single_match() {
         let dir = std::env::temp_dir().join("tmg_tools_test_file_patch");
@@ -116,12 +136,16 @@ mod tests {
         std::fs::write(&file, "hello world\nfoo bar\n").ok();
 
         let tool = FilePatchTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({
-                "path": file.to_str().unwrap(),
-                "old_string": "foo bar",
-                "new_string": "baz qux"
-            }))
+            .execute(
+                serde_json::json!({
+                    "path": file.to_str().unwrap(),
+                    "old_string": "foo bar",
+                    "new_string": "baz qux"
+                }),
+                &sandbox,
+            )
             .await
             .unwrap();
 
@@ -141,12 +165,16 @@ mod tests {
         std::fs::write(&file, "hello world\n").ok();
 
         let tool = FilePatchTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({
-                "path": file.to_str().unwrap(),
-                "old_string": "nonexistent",
-                "new_string": "replacement"
-            }))
+            .execute(
+                serde_json::json!({
+                    "path": file.to_str().unwrap(),
+                    "old_string": "nonexistent",
+                    "new_string": "replacement"
+                }),
+                &sandbox,
+            )
             .await
             .unwrap();
 
@@ -165,12 +193,16 @@ mod tests {
         std::fs::write(&file, "aaa\naaa\naaa\n").ok();
 
         let tool = FilePatchTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({
-                "path": file.to_str().unwrap(),
-                "old_string": "aaa",
-                "new_string": "bbb"
-            }))
+            .execute(
+                serde_json::json!({
+                    "path": file.to_str().unwrap(),
+                    "old_string": "aaa",
+                    "new_string": "bbb"
+                }),
+                &sandbox,
+            )
             .await
             .unwrap();
 
@@ -183,12 +215,16 @@ mod tests {
     #[tokio::test]
     async fn patch_missing_file() {
         let tool = FilePatchTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({
-                "path": "/tmp/tmg_nonexistent_patch_xyz.txt",
-                "old_string": "a",
-                "new_string": "b"
-            }))
+            .execute(
+                serde_json::json!({
+                    "path": "/tmp/tmg_nonexistent_patch_xyz.txt",
+                    "old_string": "a",
+                    "new_string": "b"
+                }),
+                &sandbox,
+            )
             .await;
         assert!(result.is_err());
     }

@@ -8,6 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use tmg_sandbox::SandboxContext;
 use tmg_tools::error::ToolError;
 use tmg_tools::types::{Tool, ToolResult};
 
@@ -55,16 +56,21 @@ impl Tool for UseSkillTool {
         })
     }
 
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         params: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolResult, ToolError>> + Send + '_>> {
-        Box::pin(self.execute_inner(params))
+        ctx: &'a SandboxContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult, ToolError>> + Send + 'a>> {
+        Box::pin(self.execute_inner(params, ctx))
     }
 }
 
 impl UseSkillTool {
-    async fn execute_inner(&self, params: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn execute_inner(
+        &self,
+        params: serde_json::Value,
+        ctx: &SandboxContext,
+    ) -> Result<ToolResult, ToolError> {
         let Some(skill_name) = params.get("skill_name").and_then(serde_json::Value::as_str) else {
             return Err(ToolError::invalid_params(
                 "missing required parameter: skill_name",
@@ -80,6 +86,24 @@ impl UseSkillTool {
                 available.join(", ")
             )));
         };
+
+        // Loading the skill body is a filesystem read of the
+        // discovered SKILL.md path; surface a clear sandbox denial if
+        // the active mode forbids the read.
+        ctx.check_path_access(meta.path.as_path())?;
+        // Defense in depth: `load_skill` also enumerates the
+        // `scripts/` and `references/` siblings of SKILL.md. Those
+        // subdirectories live under the same parent we just approved,
+        // but a maliciously-crafted symlink there could redirect the
+        // walk outside the sandbox boundary. Approving the parent
+        // directly catches that case (`check_path_access`
+        // canonicalises the path, resolving any symlink), and
+        // [`load_skill`] itself guards against symlinked files inside
+        // the subdirectories by relying on `file_type()`, which does
+        // not traverse links.
+        if let Some(parent) = meta.path.as_path().parent() {
+            ctx.check_path_access(parent)?;
+        }
 
         match load_skill(meta).await {
             Ok(content) => {
@@ -127,9 +151,10 @@ mod tests {
     async fn use_skill_success() {
         let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let tool = make_tool_with_skill(tmp.path());
+        let ctx = SandboxContext::test_default();
 
         let result = tool
-            .execute_inner(serde_json::json!({ "skill_name": "my-skill" }))
+            .execute_inner(serde_json::json!({ "skill_name": "my-skill" }), &ctx)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
 
@@ -141,8 +166,9 @@ mod tests {
     #[tokio::test]
     async fn use_skill_not_found() {
         let tool = UseSkillTool::new(vec![]);
+        let ctx = SandboxContext::test_default();
         let result = tool
-            .execute_inner(serde_json::json!({ "skill_name": "nonexistent" }))
+            .execute_inner(serde_json::json!({ "skill_name": "nonexistent" }), &ctx)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
 
@@ -153,7 +179,8 @@ mod tests {
     #[tokio::test]
     async fn use_skill_missing_param() {
         let tool = UseSkillTool::new(vec![]);
-        let result = tool.execute_inner(serde_json::json!({})).await;
+        let ctx = SandboxContext::test_default();
+        let result = tool.execute_inner(serde_json::json!({}), &ctx).await;
         assert!(result.is_err());
     }
 }
