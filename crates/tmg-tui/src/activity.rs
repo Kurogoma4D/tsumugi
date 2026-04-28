@@ -29,6 +29,13 @@ pub struct ToolActivityEntry {
     pub summary: String,
     /// Whether this entry is an error.
     pub is_error: bool,
+    /// Whether the recorded (history-bound) tool result was rewritten
+    /// via tree-sitter signature extraction (issue #49). Drives the
+    /// `[compressed via tree-sitter: N symbols]` hint in the renderer.
+    pub compressed: bool,
+    /// Number of symbols extracted by tree-sitter when `compressed`
+    /// is true. Zero otherwise.
+    pub compressed_symbol_count: usize,
 }
 
 /// Aggregated state for the Activity Pane.

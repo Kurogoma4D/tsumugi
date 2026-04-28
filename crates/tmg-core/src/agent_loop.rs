@@ -16,7 +16,7 @@ use tmg_llm::{
 use tmg_sandbox::SandboxContext;
 use tmg_tools::ToolRegistry;
 
-use crate::context::{ContextCompressor, ContextConfig, TokenCounter, truncate_tool_result};
+use crate::context::{ContextCompressor, ContextConfig, TokenCounter};
 use crate::error::CoreError;
 use crate::message::Message;
 use crate::prompt;
@@ -69,6 +69,26 @@ pub trait StreamSink {
         _name: &str,
         _output: &str,
         _is_error: bool,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    /// Called after [`Self::on_tool_result`] when the recorded
+    /// (history-bound) version of the output was rewritten by
+    /// [`crate::context::ContextCompressor::compress_tool_result`].
+    ///
+    /// `symbol_count` is the number of structural symbols extracted by
+    /// tree-sitter. Sinks that do not care about compression metadata
+    /// can leave the default no-op implementation.
+    ///
+    /// Note: this hook is **only** fired when the result was rewritten
+    /// via signature extraction (i.e. issue #49's tree-sitter path).
+    /// Tail-truncated results — the pre-#49 behaviour, still the
+    /// fallback for non-`file_read` tools — do **not** fire it.
+    fn on_tool_result_compressed(
+        &mut self,
+        _name: &str,
+        _symbol_count: usize,
     ) -> Result<(), CoreError> {
         Ok(())
     }
@@ -241,7 +261,7 @@ impl AgentLoop {
 
         let registry = Arc::new(registry);
         let token_counter = TokenCounter::new(client.clone());
-        let compressor = ContextCompressor::new(client.clone());
+        let compressor = ContextCompressor::with_config(client.clone(), context_config.clone());
 
         Ok(Self {
             client,
@@ -642,7 +662,12 @@ impl AgentLoop {
             join_set.spawn(async move {
                 // Check cancellation before executing.
                 if cancel.is_cancelled() {
-                    return (call_id, name, Err(CoreError::Cancelled));
+                    return (
+                        call_id,
+                        name,
+                        serde_json::Value::Null,
+                        Err(CoreError::Cancelled),
+                    );
                 }
 
                 // Parse the arguments JSON.
@@ -651,32 +676,32 @@ impl AgentLoop {
                     Err(e) => {
                         let result =
                             tmg_tools::ToolResult::error(format!("invalid JSON arguments: {e}"));
-                        return (call_id, name, Ok(result));
+                        return (call_id, name, serde_json::Value::Null, Ok(result));
                     }
                 };
 
-                let result = registry.execute(&name, params, &sandbox).await;
+                let result = registry.execute(&name, params.clone(), &sandbox).await;
                 match result {
-                    Ok(tool_result) => (call_id, name, Ok(tool_result)),
+                    Ok(tool_result) => (call_id, name, params, Ok(tool_result)),
                     Err(e) => {
                         // Tool errors are reported as error results to the
                         // LLM rather than aborting the entire turn, so the
                         // model can attempt recovery.
                         let error_result = tmg_tools::ToolResult::error(e.to_string());
-                        (call_id, name, Ok(error_result))
+                        (call_id, name, params, Ok(error_result))
                     }
                 }
             });
         }
 
         // Collect results in completion order.
-        // We store (call_id, tool_name, ToolResult) and sort by original
-        // order at the end to maintain deterministic history.
-        let mut results: Vec<(String, String, tmg_tools::ToolResult)> =
+        // We store (call_id, tool_name, params, ToolResult) and sort by
+        // original order at the end to maintain deterministic history.
+        let mut results: Vec<(String, String, serde_json::Value, tmg_tools::ToolResult)> =
             Vec::with_capacity(tool_calls.len());
 
         while let Some(join_result) = join_set.join_next().await {
-            let (call_id, name, tool_result) = join_result.map_err(|e| {
+            let (call_id, name, params, tool_result) = join_result.map_err(|e| {
                 CoreError::Io(std::io::Error::other(format!("task join error: {e}")))
             })?;
 
@@ -684,24 +709,34 @@ impl AgentLoop {
 
             sink.on_tool_result(&name, &tool_result.output, tool_result.is_error)?;
 
-            results.push((call_id, name, tool_result));
+            results.push((call_id, name, params, tool_result));
         }
 
         // Sort results to match the original tool_calls order so history
         // is deterministic regardless of execution order.
         let call_order: Vec<&str> = tool_calls.iter().map(|tc| tc.id.as_str()).collect();
-        results.sort_by_key(|(id, _, _)| {
+        results.sort_by_key(|(id, _, _, _)| {
             call_order
                 .iter()
                 .position(|&cid| cid == id)
                 .unwrap_or(usize::MAX)
         });
 
-        // Append tool-result messages to history, truncating if needed.
-        let max_tool_tokens = self.context_config.max_tool_result_tokens;
-        for (call_id, _name, tool_result) in results {
-            let output = truncate_tool_result(&tool_result.output, max_tool_tokens);
-            self.history.push(Message::tool_result(call_id, output));
+        // Append tool-result messages to history. Each result is run
+        // through `ContextCompressor::compress_tool_result` so large
+        // `file_read` outputs collapse into tree-sitter signature
+        // summaries (issue #49) instead of being kept verbatim or just
+        // tail-truncated. Non-`file_read` tools and small results fall
+        // through to the existing tail-truncation path.
+        for (call_id, name, params, tool_result) in results {
+            let compressed =
+                self.compressor
+                    .compress_tool_result(&name, &params, &tool_result.output);
+            if compressed.compressed_via_signatures {
+                sink.on_tool_result_compressed(&name, compressed.symbol_count)?;
+            }
+            self.history
+                .push(Message::tool_result(call_id, compressed.text));
         }
 
         Ok(())

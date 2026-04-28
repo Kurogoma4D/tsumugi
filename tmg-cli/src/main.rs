@@ -55,6 +55,12 @@ struct Cli {
     #[arg(long, global = true)]
     max_tool_result_tokens: Option<usize>,
 
+    /// Token threshold above which `file_read` tool results are
+    /// rewritten via tree-sitter signature extraction (issue #49).
+    /// Set to 0 to disable signature-based compression.
+    #[arg(long, global = true)]
+    signature_threshold_tokens: Option<usize>,
+
     /// Tool calling mode: "native", "prompt_based", or "auto".
     ///
     /// - native: use OpenAI-compatible function calling API
@@ -214,6 +220,9 @@ impl Cli {
         if let Some(max_tool) = self.max_tool_result_tokens {
             config.llm.max_tool_result_tokens = max_tool;
         }
+        if let Some(sig_threshold) = self.signature_threshold_tokens {
+            config.llm.signature_threshold_tokens = sig_threshold;
+        }
         if let Some(tc) = self.tool_calling {
             config.llm.tool_calling = tc;
         }
@@ -233,6 +242,7 @@ fn main() -> anyhow::Result<()> {
         max_context_tokens: config.llm.max_context_tokens,
         compression_threshold: config.llm.compression_threshold,
         max_tool_result_tokens: config.llm.max_tool_result_tokens,
+        signature_threshold_tokens: config.llm.signature_threshold_tokens,
     };
 
     match cli.command {
@@ -307,6 +317,7 @@ fn dispatch_run_command(op: RunCommand, config: &TsumugiConfig) -> anyhow::Resul
                 max_context_tokens: config.llm.max_context_tokens,
                 compression_threshold: config.llm.compression_threshold,
                 max_tool_result_tokens: config.llm.max_tool_result_tokens,
+                signature_threshold_tokens: config.llm.signature_threshold_tokens,
             };
             // When the user supplied an explicit id, validate its
             // shape at the boundary. We thread the validated id

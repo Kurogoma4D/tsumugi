@@ -76,6 +76,20 @@ pub enum TurnMessage {
         /// Whether the tool reported an error.
         is_error: bool,
     },
+    /// A tool result was rewritten via tree-sitter signature extraction
+    /// before being recorded in the conversation history (issue #49).
+    ///
+    /// This message is sent **in addition to** [`Self::ToolResult`] —
+    /// the activity pane receives the raw output via `ToolResult` for
+    /// display, then this message stamps a "compressed" marker on the
+    /// most recent matching entry so the TUI can show the
+    /// `[compressed via tree-sitter: N symbols]` hint.
+    ToolResultCompressed {
+        /// The tool name (matches the preceding `ToolResult`).
+        name: String,
+        /// Number of structural symbols tree-sitter extracted.
+        symbol_count: usize,
+    },
     /// The turn completed successfully. Contains the `AgentLoop` back
     /// and context usage information.
     Done {
@@ -1074,6 +1088,8 @@ impl App {
                         tool_name: name,
                         summary: format!("calling: {summary}"),
                         is_error: false,
+                        compressed: false,
+                        compressed_symbol_count: 0,
                     });
                     changed = true;
                 }
@@ -1103,8 +1119,29 @@ impl App {
                         tool_name: name,
                         summary,
                         is_error,
+                        compressed: false,
+                        compressed_symbol_count: 0,
                     });
                     changed = true;
+                }
+                Ok(TurnMessage::ToolResultCompressed { name, symbol_count }) => {
+                    // Stamp the compression marker on the most recent
+                    // matching tool entry. We walk the log in reverse
+                    // so concurrent `file_read` calls don't fight over
+                    // the newest entry — the matching `ToolResult` has
+                    // just been pushed, so it sits at the back of the
+                    // log when this message arrives.
+                    if let Some(entry) = self
+                        .activity
+                        .tool_log
+                        .iter_mut()
+                        .rev()
+                        .find(|e| e.tool_name == name && !e.compressed)
+                    {
+                        entry.compressed = true;
+                        entry.compressed_symbol_count = symbol_count;
+                        changed = true;
+                    }
                 }
                 Ok(TurnMessage::Done {
                     agent,
@@ -1530,6 +1567,19 @@ impl StreamSink for ChannelStreamSink {
                 name: name.to_owned(),
                 output: output.to_owned(),
                 is_error,
+            })
+            .map_err(|_| CoreError::Cancelled)
+    }
+
+    fn on_tool_result_compressed(
+        &mut self,
+        name: &str,
+        symbol_count: usize,
+    ) -> Result<(), CoreError> {
+        self.tx
+            .try_send(TurnMessage::ToolResultCompressed {
+                name: name.to_owned(),
+                symbol_count,
             })
             .map_err(|_| CoreError::Cancelled)
     }

@@ -730,6 +730,23 @@ fn draw_tool_activity(frame: &mut Frame, app: &App, area: Rect) {
             ]));
         }
 
+        // Issue #49: signal that the recorded (history-bound) result
+        // was rewritten via tree-sitter. We render the hint dimly so
+        // it does not steal attention from the raw tool output above.
+        if entry.compressed {
+            let hint_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!(
+                        "[compressed via tree-sitter: {} symbols]",
+                        entry.compressed_symbol_count
+                    ),
+                    hint_style,
+                ),
+            ]));
+        }
+
         lines.push(Line::from(""));
     }
 

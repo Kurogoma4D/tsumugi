@@ -26,6 +26,10 @@ const DEFAULT_COMPRESSION_THRESHOLD: f64 = 0.8;
 /// Default maximum tokens for a single tool result.
 const DEFAULT_MAX_TOOL_RESULT_TOKENS: usize = 4096;
 
+/// Default token threshold above which `file_read` results are
+/// rewritten via tree-sitter signature extraction (issue #49).
+const DEFAULT_SIGNATURE_THRESHOLD_TOKENS: usize = 1500;
+
 // ---------------------------------------------------------------------------
 // ContextConfig
 // ---------------------------------------------------------------------------
@@ -39,6 +43,17 @@ pub struct ContextConfig {
     pub compression_threshold: f64,
     /// Maximum tokens allowed in a single tool result before truncation.
     pub max_tool_result_tokens: usize,
+    /// Token threshold above which a `file_read` tool result is replaced
+    /// with a tree-sitter signature summary instead of being kept verbatim
+    /// (or tail-truncated).
+    ///
+    /// When the estimated token count of the output exceeds this value
+    /// **and** the file extension is recognised by
+    /// [`tmg_tools::extract_signatures`], the tool result stored in the
+    /// agent loop's history is rewritten as a structural summary. The
+    /// tail-truncation path is used for unrecognised file types or when
+    /// signature extraction yields no symbols.
+    pub signature_threshold_tokens: usize,
 }
 
 impl Default for ContextConfig {
@@ -47,6 +62,7 @@ impl Default for ContextConfig {
             max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
             compression_threshold: DEFAULT_COMPRESSION_THRESHOLD,
             max_tool_result_tokens: DEFAULT_MAX_TOOL_RESULT_TOKENS,
+            signature_threshold_tokens: DEFAULT_SIGNATURE_THRESHOLD_TOKENS,
         }
     }
 }
@@ -186,6 +202,27 @@ fn serialize_messages_for_counting(messages: &[Message]) -> String {
 // ContextCompressor
 // ---------------------------------------------------------------------------
 
+/// Outcome of a single [`ContextCompressor::compress_tool_result`] call.
+///
+/// Returned alongside the compressed string so the caller (the agent
+/// loop wiring on the TUI side) can stamp a "compressed" marker on the
+/// matching activity entry without re-deriving the kind from the
+/// rewritten text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompressedToolResult {
+    /// The (possibly rewritten) tool result text suitable for storage
+    /// in the conversation history.
+    pub text: String,
+    /// Whether the result was rewritten via tree-sitter signature
+    /// extraction. `false` when the input was small enough to keep
+    /// verbatim, when the tool was not `file_read`, or when signature
+    /// extraction yielded no symbols and tail-truncation took over.
+    pub compressed_via_signatures: bool,
+    /// Number of symbols extracted when
+    /// [`Self::compressed_via_signatures`] is `true`.
+    pub symbol_count: usize,
+}
+
 /// Context compressor that summarizes old conversation turns to free
 /// context window space.
 ///
@@ -198,6 +235,11 @@ fn serialize_messages_for_counting(messages: &[Message]) -> String {
 pub struct ContextCompressor {
     /// The LLM client for generating summaries.
     client: LlmClient,
+    /// Context-window configuration. Used by
+    /// [`Self::compress_tool_result`] to decide when to rewrite a
+    /// `file_read` body via tree-sitter signature extraction and at
+    /// which token budget tail-truncation kicks in.
+    config: ContextConfig,
 }
 
 /// The prompt used to ask the LLM to summarize old context.
@@ -208,9 +250,87 @@ Remove verbose tool outputs but keep their essential findings. \
 Output only the summary, no preamble.";
 
 impl ContextCompressor {
-    /// Create a new compressor using the given LLM client.
+    /// Create a new compressor using the given LLM client and the
+    /// default [`ContextConfig`].
+    ///
+    /// Existing call sites that do not yet need to thread a custom
+    /// config through to the compressor keep working unchanged; new
+    /// call sites that want signature-based tool-result compression
+    /// (issue #49) should use [`Self::with_config`] instead.
     pub fn new(client: LlmClient) -> Self {
-        Self { client }
+        Self::with_config(client, ContextConfig::default())
+    }
+
+    /// Create a new compressor with a custom [`ContextConfig`].
+    ///
+    /// The config is used by [`Self::compress_tool_result`] only; the
+    /// LLM-driven [`Self::compress`] path does not consume it.
+    pub fn with_config(client: LlmClient, config: ContextConfig) -> Self {
+        Self { client, config }
+    }
+
+    /// Borrow the active [`ContextConfig`].
+    #[must_use]
+    pub fn config(&self) -> &ContextConfig {
+        &self.config
+    }
+
+    /// Compress a single tool result for inclusion in the conversation
+    /// history.
+    ///
+    /// Behaviour, by precedence:
+    ///
+    /// 1. If `tool_name == "file_read"`, the output's estimated token
+    ///    count exceeds [`ContextConfig::signature_threshold_tokens`],
+    ///    `params["path"]` is a string, and
+    ///    [`tmg_tools::extract_signatures`] returns at least one
+    ///    symbol — the output is replaced with a structural summary
+    ///    block headed by
+    ///    `[file content compressed via tree-sitter — N symbols extracted]`.
+    /// 2. Otherwise, the output is passed through
+    ///    [`truncate_tool_result`] using
+    ///    [`ContextConfig::max_tool_result_tokens`] as the budget. This
+    ///    matches the pre-#49 behaviour for non-`file_read` tools and
+    ///    `file_read` results below the signature threshold.
+    ///
+    /// The returned [`CompressedToolResult::compressed_via_signatures`]
+    /// flag tells the caller whether path 1 fired so a "compressed via
+    /// tree-sitter: N symbols" hint can be surfaced in the TUI activity
+    /// pane.
+    #[must_use]
+    pub fn compress_tool_result(
+        &self,
+        tool_name: &str,
+        params: &serde_json::Value,
+        output: &str,
+    ) -> CompressedToolResult {
+        let threshold = self.config.signature_threshold_tokens;
+        let estimated = TokenCounter::estimate_tokens(output);
+        if tool_name == "file_read"
+            && threshold > 0
+            && estimated > threshold
+            && let Some(path) = params.get("path").and_then(|v| v.as_str())
+            && let Some(sigs) = tmg_tools::extract_signatures(path, output)
+            && !sigs.is_empty()
+        {
+            let symbol_count = sigs.len();
+            let formatted = tmg_tools::format_signatures(&sigs);
+            let text = format!(
+                "[file content compressed via tree-sitter — {symbol_count} symbols extracted]\n\n{formatted}"
+            );
+            return CompressedToolResult {
+                text,
+                compressed_via_signatures: true,
+                symbol_count,
+            };
+        }
+
+        // Fallback: tail-truncate at the existing tool-result budget.
+        CompressedToolResult {
+            text: truncate_tool_result(output, self.config.max_tool_result_tokens),
+            compressed_via_signatures: false,
+            symbol_count: 0,
+        }
     }
 
     /// Compress the conversation history by summarizing old turns.
@@ -430,6 +550,10 @@ mod tests {
             config.max_tool_result_tokens,
             DEFAULT_MAX_TOOL_RESULT_TOKENS
         );
+        assert_eq!(
+            config.signature_threshold_tokens,
+            DEFAULT_SIGNATURE_THRESHOLD_TOKENS
+        );
     }
 
     #[test]
@@ -438,6 +562,7 @@ mod tests {
             max_context_tokens: 10_000,
             compression_threshold: 0.8,
             max_tool_result_tokens: 4096,
+            signature_threshold_tokens: 1500,
         };
         assert_eq!(config.compression_trigger(), 8000);
     }
@@ -448,6 +573,7 @@ mod tests {
             max_context_tokens: 10_000,
             compression_threshold: 0.0,
             max_tool_result_tokens: 4096,
+            signature_threshold_tokens: 1500,
         };
         assert_eq!(config.compression_trigger(), 0);
     }
@@ -494,6 +620,87 @@ mod tests {
     fn estimate_tokens_empty() {
         // Empty string should return at least 1.
         assert_eq!(TokenCounter::estimate_tokens(""), 1);
+    }
+
+    /// Build a no-network `LlmClient` suitable for unit tests of
+    /// `ContextCompressor` paths that do not actually contact the
+    /// server (e.g. the tool-result compression path).
+    #[expect(
+        clippy::expect_used,
+        reason = "test-only helper; failure to construct an offline LlmClient indicates a broken test runtime"
+    )]
+    fn dummy_client() -> tmg_llm::LlmClient {
+        let cfg = tmg_llm::LlmClientConfig::new("http://localhost:0", "test-model");
+        tmg_llm::LlmClient::new(cfg).expect("offline LlmClient construction must not fail")
+    }
+
+    #[test]
+    fn compress_tool_result_passthrough_when_short() {
+        let cfg = ContextConfig {
+            max_context_tokens: 8192,
+            compression_threshold: 0.8,
+            max_tool_result_tokens: 1024,
+            signature_threshold_tokens: 1500,
+        };
+        let comp = ContextCompressor::with_config(dummy_client(), cfg);
+        let params = serde_json::json!({"path": "lib.rs"});
+        let out = comp.compress_tool_result("file_read", &params, "fn small() {}");
+        assert!(!out.compressed_via_signatures);
+        assert_eq!(out.symbol_count, 0);
+        assert_eq!(out.text, "fn small() {}");
+    }
+
+    #[test]
+    fn compress_tool_result_rewrites_large_file_read() {
+        let cfg = ContextConfig {
+            max_context_tokens: 8192,
+            compression_threshold: 0.8,
+            max_tool_result_tokens: 1024,
+            // Set the threshold low so a tiny synthetic body trips it.
+            signature_threshold_tokens: 4,
+        };
+        let comp = ContextCompressor::with_config(dummy_client(), cfg);
+        let params = serde_json::json!({"path": "lib.rs"});
+        let body = "pub fn alpha(x: i32) -> i32 { x }\npub struct Beta;\n";
+        let out = comp.compress_tool_result("file_read", &params, body);
+        assert!(out.compressed_via_signatures);
+        assert!(out.symbol_count >= 2);
+        assert!(out.text.contains("compressed via tree-sitter"));
+        assert!(out.text.contains("alpha"));
+        assert!(out.text.contains("Beta"));
+    }
+
+    #[test]
+    fn compress_tool_result_falls_back_for_non_file_read() {
+        let cfg = ContextConfig {
+            max_context_tokens: 8192,
+            compression_threshold: 0.8,
+            // Force tail-truncation on the long output below.
+            max_tool_result_tokens: 8,
+            signature_threshold_tokens: 4,
+        };
+        let comp = ContextCompressor::with_config(dummy_client(), cfg);
+        let params = serde_json::json!({});
+        let body = "x".repeat(10_000);
+        let out = comp.compress_tool_result("shell_exec", &params, &body);
+        assert!(!out.compressed_via_signatures);
+        assert!(out.text.contains("truncated"));
+    }
+
+    #[test]
+    fn compress_tool_result_falls_back_for_unknown_extension() {
+        let cfg = ContextConfig {
+            max_context_tokens: 8192,
+            compression_threshold: 0.8,
+            max_tool_result_tokens: 8,
+            signature_threshold_tokens: 4,
+        };
+        let comp = ContextCompressor::with_config(dummy_client(), cfg);
+        let params = serde_json::json!({"path": "data.bin"});
+        let body = "x".repeat(10_000);
+        let out = comp.compress_tool_result("file_read", &params, &body);
+        assert!(!out.compressed_via_signatures);
+        assert!(out.text.contains("truncated"));
     }
 
     #[test]

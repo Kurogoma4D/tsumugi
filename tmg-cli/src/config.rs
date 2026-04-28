@@ -34,6 +34,9 @@ struct PartialLlmConfig {
     pub max_context_tokens: Option<usize>,
     pub compression_threshold: Option<f64>,
     pub max_tool_result_tokens: Option<usize>,
+    /// Token threshold above which `file_read` results are rewritten
+    /// via tree-sitter signature extraction. Issue #49.
+    pub signature_threshold_tokens: Option<usize>,
     pub tool_calling: Option<ToolCallingMode>,
 }
 
@@ -55,6 +58,9 @@ impl PartialLlmConfig {
         if other.max_tool_result_tokens.is_some() {
             self.max_tool_result_tokens = other.max_tool_result_tokens;
         }
+        if other.signature_threshold_tokens.is_some() {
+            self.signature_threshold_tokens = other.signature_threshold_tokens;
+        }
         if other.tool_calling.is_some() {
             self.tool_calling = other.tool_calling;
         }
@@ -74,6 +80,9 @@ impl PartialLlmConfig {
             max_tool_result_tokens: self
                 .max_tool_result_tokens
                 .unwrap_or(default_max_tool_result_tokens()),
+            signature_threshold_tokens: self
+                .signature_threshold_tokens
+                .unwrap_or(default_signature_threshold_tokens()),
             tool_calling: self.tool_calling.unwrap_or_default(),
         }
     }
@@ -605,6 +614,14 @@ impl PartialTsumugiConfig {
             })?;
             self.llm.max_tool_result_tokens = Some(n);
         }
+        if let Some(v) = env_fn("TMG_LLM_SIGNATURE_THRESHOLD_TOKENS") {
+            let n = v.parse::<usize>().map_err(|_| ConfigError::InvalidValue {
+                field: "TMG_LLM_SIGNATURE_THRESHOLD_TOKENS".to_owned(),
+                value: v,
+                reason: "must be a non-negative integer".to_owned(),
+            })?;
+            self.llm.signature_threshold_tokens = Some(n);
+        }
         if let Some(v) = env_fn("TMG_LLM_TOOL_CALLING") {
             let mode = v
                 .parse::<ToolCallingMode>()
@@ -871,6 +888,14 @@ pub struct LlmConfig {
     /// Maximum tokens allowed in a single tool result before truncation.
     pub max_tool_result_tokens: usize,
 
+    /// Token threshold above which `file_read` results are rewritten
+    /// via tree-sitter signature extraction (issue #49). When the
+    /// estimated token count of a `file_read` output exceeds this
+    /// value and the file extension is supported, the body stored in
+    /// the agent loop's history is replaced with a structural summary
+    /// instead of being kept verbatim or tail-truncated.
+    pub signature_threshold_tokens: usize,
+
     /// Tool calling mode.
     pub tool_calling: ToolCallingMode,
 }
@@ -895,6 +920,10 @@ const fn default_max_tool_result_tokens() -> usize {
     4096
 }
 
+const fn default_signature_threshold_tokens() -> usize {
+    1500
+}
+
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
@@ -903,6 +932,7 @@ impl Default for LlmConfig {
             max_context_tokens: default_max_context_tokens(),
             compression_threshold: default_compression_threshold(),
             max_tool_result_tokens: default_max_tool_result_tokens(),
+            signature_threshold_tokens: default_signature_threshold_tokens(),
             tool_calling: ToolCallingMode::default(),
         }
     }
