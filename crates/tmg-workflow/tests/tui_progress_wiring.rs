@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use tmg_agents::SubagentManager;
+use tmg_agents::{EndpointResolver, SubagentManager};
 use tmg_llm::{LlmPool, PoolConfig};
 use tmg_sandbox::{SandboxConfig, SandboxContext, SandboxMode};
 use tmg_tools::ToolRegistry;
@@ -40,8 +40,7 @@ fn build_engine(workspace: &Path) -> WorkflowEngine {
     let manager = SubagentManager::new(
         llm_client,
         cancel,
-        "http://localhost:9999",
-        "test-model",
+        EndpointResolver::new("http://localhost:9999", "test-model"),
         Arc::clone(&sandbox),
     );
     let subagent_manager = Arc::new(Mutex::new(manager));

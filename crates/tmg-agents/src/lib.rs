@@ -10,6 +10,7 @@ pub mod builtins;
 pub mod config;
 pub mod custom;
 pub mod discovery;
+pub mod endpoint_resolver;
 pub mod error;
 pub mod escalator;
 pub mod manager;
@@ -24,10 +25,12 @@ pub use builtins::{
 pub use config::{AgentKind, AgentType, SubagentConfig};
 pub use custom::{AgentSource, CustomAgentDef, CustomAgentMeta};
 pub use discovery::discover_custom_agents;
+pub use endpoint_resolver::{EndpointResolver, ResolutionSource, ResolvedEndpoint};
 pub use error::AgentError;
 pub use escalator::{EscalatorVerdict, ParseError as EscalatorParseError, parse_verdict};
 pub use manager::{
-    EscalatorOverrides, SubagentId, SubagentManager, SubagentSummary, derive_sandbox,
+    EndpointResolvedHook, EscalatorOverrides, SubagentId, SubagentManager, SubagentSummary,
+    derive_sandbox,
 };
 pub use runner::SubagentRunner;
 pub use status::{SubagentStatus, truncate_str};

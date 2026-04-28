@@ -30,7 +30,7 @@ pub enum LoadBalanceStrategy {
 /// endpoints = ["http://localhost:8081", "http://localhost:8082"]
 /// strategy = "round_robin"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolConfig {
     /// List of llama-server endpoint URLs for subagent requests.
     pub endpoints: Vec<String>,
@@ -62,6 +62,27 @@ pub enum PoolConfigError {
         /// The invalid URL string.
         url: String,
     },
+}
+
+/// Outcome of [`PoolConfig::validate_relaxed`].
+///
+/// Captures the operator-friendly invariants for `[llm.subagent_pool]`:
+/// an empty `endpoints` list is **not** an error (it is the explicit
+/// way to disable the pool), and duplicate URLs are deduped with a
+/// warning rather than rejected. Malformed URLs and empty / whitespace
+/// strings are still hard errors so a typo is reported at load time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationReport {
+    /// Endpoints after dedupe, preserving the original order of the
+    /// first occurrence.
+    pub deduped_endpoints: Vec<String>,
+    /// Duplicate URLs that were collapsed (each entry appears once
+    /// even if it was repeated more than twice).
+    pub duplicates: Vec<String>,
+    /// `true` when `endpoints` was empty after deserialization,
+    /// signalling the pool is disabled and the caller should fall back
+    /// to the main endpoint.
+    pub disabled: bool,
 }
 
 impl PoolConfig {
@@ -103,6 +124,69 @@ impl PoolConfig {
         }
 
         Ok(())
+    }
+
+    /// Operator-friendly validation that matches the SPEC §10.1
+    /// `[llm.subagent_pool]` policy:
+    ///
+    /// - An empty `endpoints` list is **not** an error: it means "pool
+    ///   disabled, route every subagent to the main endpoint".
+    /// - Duplicate URLs are deduped (first occurrence wins) and
+    ///   surfaced through [`ValidationReport::duplicates`] so the
+    ///   caller can warn / log without aborting the run.
+    /// - Empty / whitespace-only strings and malformed URLs remain
+    ///   hard errors — these almost always indicate a typo and should
+    ///   surface at config-load time rather than at first request.
+    ///
+    /// The strategy enum is already validated by `serde` at
+    /// deserialize time, so out-of-range values cannot reach this
+    /// path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PoolConfigError::EmptyEndpointString`] or
+    /// [`PoolConfigError::MalformedUrl`] for the first offending entry.
+    /// Empty endpoints lists never produce an error here.
+    pub fn validate_relaxed(&self) -> Result<ValidationReport, PoolConfigError> {
+        if self.endpoints.is_empty() {
+            return Ok(ValidationReport {
+                deduped_endpoints: Vec::new(),
+                duplicates: Vec::new(),
+                disabled: true,
+            });
+        }
+
+        for (index, url) in self.endpoints.iter().enumerate() {
+            let trimmed = url.trim();
+            if trimmed.is_empty() {
+                return Err(PoolConfigError::EmptyEndpointString { index });
+            }
+            if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+                return Err(PoolConfigError::MalformedUrl {
+                    index,
+                    url: url.clone(),
+                });
+            }
+        }
+
+        // Stable dedupe: preserve the first occurrence's position so
+        // the round-robin order matches the operator's intent.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut deduped: Vec<String> = Vec::with_capacity(self.endpoints.len());
+        let mut duplicates: Vec<String> = Vec::new();
+        for url in &self.endpoints {
+            if seen.insert(url.clone()) {
+                deduped.push(url.clone());
+            } else if !duplicates.contains(url) {
+                duplicates.push(url.clone());
+            }
+        }
+
+        Ok(ValidationReport {
+            deduped_endpoints: deduped,
+            duplicates,
+            disabled: false,
+        })
     }
 }
 
@@ -196,6 +280,70 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(PoolConfigError::MalformedUrl { index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn validate_relaxed_empty_endpoints_disables_pool() {
+        let config = PoolConfig {
+            endpoints: vec![],
+            strategy: LoadBalanceStrategy::RoundRobin,
+        };
+        let report = config.validate_relaxed().expect("relaxed validate ok");
+        assert!(report.disabled, "empty endpoints must disable the pool");
+        assert!(report.deduped_endpoints.is_empty());
+        assert!(report.duplicates.is_empty());
+    }
+
+    #[test]
+    fn validate_relaxed_dedupes_duplicates() {
+        let config = PoolConfig {
+            endpoints: vec![
+                "http://a:8080".to_owned(),
+                "http://b:8080".to_owned(),
+                "http://a:8080".to_owned(),
+                "http://c:8080".to_owned(),
+                "http://b:8080".to_owned(),
+            ],
+            strategy: LoadBalanceStrategy::RoundRobin,
+        };
+        let report = config.validate_relaxed().expect("relaxed validate ok");
+        assert!(!report.disabled);
+        assert_eq!(
+            report.deduped_endpoints,
+            vec![
+                "http://a:8080".to_owned(),
+                "http://b:8080".to_owned(),
+                "http://c:8080".to_owned(),
+            ],
+        );
+        assert_eq!(
+            report.duplicates,
+            vec!["http://a:8080".to_owned(), "http://b:8080".to_owned()],
+        );
+    }
+
+    #[test]
+    fn validate_relaxed_rejects_malformed_url() {
+        let config = PoolConfig {
+            endpoints: vec!["http://ok".to_owned(), "not-a-url".to_owned()],
+            strategy: LoadBalanceStrategy::RoundRobin,
+        };
+        assert!(matches!(
+            config.validate_relaxed(),
+            Err(PoolConfigError::MalformedUrl { index: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn validate_relaxed_rejects_empty_string() {
+        let config = PoolConfig {
+            endpoints: vec!["http://ok".to_owned(), "  ".to_owned()],
+            strategy: LoadBalanceStrategy::RoundRobin,
+        };
+        assert!(matches!(
+            config.validate_relaxed(),
+            Err(PoolConfigError::EmptyEndpointString { index: 1 })
         ));
     }
 }

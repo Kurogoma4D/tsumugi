@@ -338,8 +338,7 @@ async fn run_normal(
     let subagent_manager = Arc::new(Mutex::new(tmg_agents::SubagentManager::new(
         llm_client,
         cancel.clone(),
-        &config.llm.endpoint,
-        &config.llm.model,
+        tmg_agents::EndpointResolver::new(&config.llm.endpoint, &config.llm.model),
         Arc::clone(&sandbox),
     )));
     let registry = Arc::new(tmg_tools::ToolRegistry::new());
@@ -456,8 +455,7 @@ async fn run_long_running(
     let subagent_manager = Arc::new(Mutex::new(tmg_agents::SubagentManager::new(
         llm_client,
         cancel.clone(),
-        &config.llm.endpoint,
-        &config.llm.model,
+        tmg_agents::EndpointResolver::new(&config.llm.endpoint, &config.llm.model),
         Arc::clone(&sandbox),
     )));
     let registry = Arc::new(tmg_tools::ToolRegistry::new());

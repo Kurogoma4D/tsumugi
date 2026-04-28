@@ -232,6 +232,20 @@ impl Cli {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Initialise the global tracing subscriber so workspace-wide
+    // `tracing::warn!` / `tracing::debug!` calls land in the user's
+    // terminal when `TMG_LOG` is set. The default filter is `warn` so
+    // production runs only see escalation-grade messages; setting
+    // `TMG_LOG=debug` (or finer-grained `TMG_LOG=tmg_llm=debug,warn`)
+    // surfaces endpoint-resolution and pool-selection diagnostics.
+    //
+    // The TUI captures stderr indirectly via crossterm; in TUI mode the
+    // tracing output stays out of the way until the TUI exits, at
+    // which point it is flushed normally. One-shot mode renders the
+    // logs interleaved with the streamed response (acceptable noise
+    // for a debug session).
+    init_tracing();
+
     // Load and merge configuration: global -> project-local -> env -> CLI.
     let mut config =
         config::load_config(cli.config.as_deref()).context("loading tsumugi configuration")?;
@@ -270,11 +284,69 @@ fn main() -> anyhow::Result<()> {
                     &config.sandbox,
                     &config.workflow,
                     &config.skills,
+                    config.llm.subagent_pool.as_ref(),
                     None,
                 )
             }
         }
     }
+}
+
+/// Build the [`tmg_llm::LlmPool`] (if any) for the subagent resolver.
+///
+/// Returns `None` when no `[llm.subagent_pool]` section was supplied
+/// or when the operator left `endpoints = []` (the relaxed validator
+/// already logged the "pool disabled" notice). Construction errors are
+/// downgraded to a `tracing::warn!` so a malformed pool does not abort
+/// startup — the resolver still has a valid main fallback.
+fn subagent_pool_from_config(
+    pool_cfg: Option<&tmg_llm::PoolConfig>,
+    model: &str,
+) -> Option<Arc<tmg_llm::LlmPool>> {
+    let cfg = pool_cfg?;
+    let report = match cfg.validate_relaxed() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "subagent pool config invalid; not constructing pool");
+            return None;
+        }
+    };
+    if report.disabled {
+        return None;
+    }
+    let deduped = tmg_llm::PoolConfig {
+        endpoints: report.deduped_endpoints,
+        strategy: cfg.strategy,
+    };
+    match tmg_llm::LlmPool::new(&deduped, model) {
+        Ok(pool) => Some(Arc::new(pool)),
+        Err(e) => {
+            tracing::warn!(error = %e, "subagent pool construction failed; falling back to main endpoint");
+            None
+        }
+    }
+}
+
+/// Initialise the global `tracing` subscriber.
+///
+/// The subscriber is built from the `TMG_LOG` environment variable
+/// (using the standard `EnvFilter` syntax: `TMG_LOG=debug` for global
+/// debug, `TMG_LOG=tmg_llm=debug,warn` for crate-scoped overrides).
+/// When `TMG_LOG` is unset the filter defaults to `warn`, which keeps
+/// the live TUI quiet. Issue #50.
+///
+/// Calling this twice is harmless: the second `try_init` is a no-op
+/// because the global default is already installed, so the function
+/// silently absorbs the error. This matters for tests that may build
+/// a `Cli` and reuse the runtime.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_env("TMG_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .try_init();
 }
 
 /// Resolve the runs-dir against the canonical cwd, mirroring the
@@ -353,6 +425,7 @@ fn dispatch_run_command(op: RunCommand, config: &TsumugiConfig) -> anyhow::Resul
                 &config.sandbox,
                 &config.workflow,
                 &config.skills,
+                config.llm.subagent_pool.as_ref(),
                 resolved.as_ref(),
             )
         }
@@ -508,6 +581,7 @@ fn run_tui(
     sandbox_config: &SandboxConfigSection,
     workflow_config: &tmg_workflow::WorkflowConfig,
     skills_config: &tmg_skills::SkillsConfig,
+    subagent_pool: Option<&tmg_llm::PoolConfig>,
     explicit_run_id: Option<&tmg_harness::RunId>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -662,25 +736,32 @@ fn run_tui(
 
         // Create the subagent manager. The escalator's
         // endpoint/model/disable knobs flow through
-        // [`tmg_agents::EscalatorOverrides`] so the resolver in
-        // `SubagentManager` is the single source of truth for
-        // precedence (see `crates/tmg-agents/src/manager.rs` module
-        // docs).
+        // [`tmg_agents::EscalatorOverrides`] into the centralised
+        // [`tmg_agents::EndpointResolver`] (issue #50) so the manager
+        // delegates every spawn-time precedence decision to that
+        // module.
         let escalator_overrides = tmg_agents::EscalatorOverrides::from_strings(
             harness_config.escalator.endpoint.clone(),
             harness_config.escalator.model.clone(),
             harness_config.escalator.disable,
         );
-        let subagent_manager = Arc::new(Mutex::new(
-            tmg_agents::SubagentManager::new(
-                client.clone(),
-                cancel.clone(),
-                endpoint,
-                model,
-                Arc::clone(&sandbox_ctx),
-            )
-            .with_escalator_overrides(escalator_overrides),
-        ));
+        // `[llm.subagent_pool]` is wired into the resolver here so
+        // non-escalator builtin agents fan across the configured pool
+        // endpoints. The validator already deduped URLs and reported
+        // an empty list as "pool disabled" via the relaxed-validation
+        // path; we honour that by only constructing a pool when the
+        // post-validation list has at least one entry.
+        let subagent_pool: Option<Arc<tmg_llm::LlmPool>> =
+            subagent_pool_from_config(subagent_pool, model);
+        let resolver = tmg_agents::EndpointResolver::new(endpoint, model)
+            .with_escalator_overrides(escalator_overrides)
+            .with_pool(subagent_pool);
+        let subagent_manager = Arc::new(Mutex::new(tmg_agents::SubagentManager::new(
+            client.clone(),
+            cancel.clone(),
+            resolver,
+            Arc::clone(&sandbox_ctx),
+        )));
 
         // Wire the active `RunRunner` into the subagent manager so
         // harnessed-run subagents (initializer / tester / qa) get

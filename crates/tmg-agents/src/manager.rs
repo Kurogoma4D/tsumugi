@@ -6,25 +6,21 @@
 //!
 //! ## Endpoint / model resolution
 //!
-//! Each spawn picks an `(endpoint, model)` pair using the precedence
-//! rules in [`SubagentManager::resolve_endpoint`]:
+//! Each spawn picks an `(endpoint, model)` pair via an
+//! [`EndpointResolver`](crate::endpoint_resolver::EndpointResolver)
+//! installed at construction time. The resolver applies SPEC §10.1 /
+//! §9.10 / §9.3 precedence:
 //!
-//! - [`AgentKind::Custom`]: a non-empty `endpoint` / `model` on the
-//!   custom-agent definition wins; missing fields fall back to the
-//!   manager defaults.
-//! - [`AgentKind::Builtin`] of [`AgentType::Escalator`]: non-empty
-//!   values from [`EscalatorOverrides`] win; missing fields fall back
-//!   to the manager defaults so the escalator can transparently share
-//!   the main endpoint until a dedicated lightweight model is
-//!   configured.
-//! - All other built-in agents always run on the manager defaults.
+//! 1. `AgentKind::Custom`: the custom def's endpoint/model win.
+//! 2. `AgentKind::Builtin(AgentType::Escalator)`: the
+//!    [`EscalatorOverrides`] win; the escalator never routes through
+//!    the pool (cost-control).
+//! 3. Other `AgentKind::Builtin`: a multi-endpoint
+//!    [`tmg_llm::LlmPool`] picks an endpoint when configured.
+//! 4. Otherwise the main `(endpoint, model)` pair is used.
 //!
-//! TODO(SPEC §10.1 `[llm.subagent_pool]`): when load-balanced subagent
-//! endpoints land, the round-robin pool MUST NOT route the escalator;
-//! the escalator owns its dedicated endpoint so its cost stays
-//! predictable (SPEC §9.10). Keep that wiring out of
-//! `resolve_endpoint` for the escalator branch even after the pool
-//! exists.
+//! See [`crate::endpoint_resolver`] for the canonical implementation
+//! and tests of these rules.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -41,9 +37,20 @@ use crate::builtins::{
     RunToolProvider, registry_for_agent_kind, registry_for_agent_kind_with_run_provider,
 };
 use crate::config::{AgentKind, AgentType, SubagentConfig};
+use crate::endpoint_resolver::{EndpointResolver, ResolvedEndpoint};
 use crate::error::AgentError;
 use crate::runner::SubagentRunner;
 use crate::status::SubagentStatus;
+
+/// Boxed observer the manager invokes whenever an
+/// [`EndpointResolver`] resolves a spawn target.
+///
+/// The hook is intentionally string-shaped (and synchronous) so the
+/// manager does not need a direct dependency on
+/// [`tmg_core::EventLogWriter`]; the CLI's TUI startup wires this up to
+/// `event_log.write_endpoint_resolved` when an `--event-log` path was
+/// supplied. Issue #50.
+pub type EndpointResolvedHook = Arc<dyn Fn(&str, &str, &str, &str) + Send + Sync + 'static>;
 
 /// Optional overrides for the escalator subagent's `(endpoint, model)`
 /// pair plus an explicit disable switch (SPEC §9.10 / §10.1
@@ -129,14 +136,16 @@ struct SubagentInstance {
 /// tasks are tracked and can be shut down together via
 /// [`SubagentManager::shutdown`].
 pub struct SubagentManager {
-    /// The LLM client shared with all subagents.
+    /// The LLM client shared with all subagents whose resolved
+    /// endpoint matches the resolver's main `(endpoint, model)` pair.
     client: LlmClient,
 
-    /// Default endpoint URL (used when a custom agent does not override it).
-    default_endpoint: String,
-
-    /// Default model name (used when a custom agent does not override it).
-    default_model: String,
+    /// Centralised endpoint / model resolver. Owns the main fallback,
+    /// the escalator overrides, and (optionally) a multi-endpoint
+    /// pool. Issue #50 moved the precedence rules out of this struct
+    /// into [`EndpointResolver`] so the rules live in one well-tested
+    /// module.
+    resolver: EndpointResolver,
 
     /// The parent cancellation token.
     parent_cancel: CancellationToken,
@@ -164,12 +173,6 @@ pub struct SubagentManager {
     /// behaviour for Run-less code paths.
     run_tool_provider: Option<Arc<dyn RunToolProvider>>,
 
-    /// Optional overrides for the escalator's endpoint / model and
-    /// the operator's disable switch. Defaults to "no overrides, not
-    /// disabled" so manager construction stays a single positional
-    /// call until a `[harness.escalator]` section is present.
-    escalator_overrides: EscalatorOverrides,
-
     /// Parent [`SandboxContext`] from which each spawn derives its
     /// per-subagent sandbox.
     ///
@@ -180,6 +183,13 @@ pub struct SubagentManager {
     /// [`SubagentManager::new`], so production callers cannot
     /// silently fall back to an unrestricted default.
     parent_sandbox: Arc<SandboxContext>,
+
+    /// Optional observer fired on every successful endpoint
+    /// resolution. The CLI wires this up to
+    /// [`tmg_core::EventLogWriter::write_endpoint_resolved`] so the
+    /// `--event-log` debug stream records the precedence rule that
+    /// fired. Issue #50.
+    resolved_hook: Option<EndpointResolvedHook>,
 }
 
 /// Derive a per-subagent [`SandboxContext`] from a parent context and
@@ -205,36 +215,51 @@ pub fn derive_sandbox(parent: &SandboxContext, mode: SandboxMode) -> SandboxCont
 impl SubagentManager {
     /// Create a new subagent manager.
     ///
-    /// The `default_endpoint` and `default_model` are used when a custom
-    /// agent does not specify its own endpoint/model overrides.
-    /// The escalator overrides default to "no overrides, not disabled";
-    /// install them with [`Self::with_escalator_overrides`] when a
-    /// `[harness.escalator]` section is configured.
+    /// The `resolver` is the centralised
+    /// [`EndpointResolver`] that picks an `(endpoint, model)` pair
+    /// for every spawn following SPEC §10.1 / §9.10 / §9.3 precedence.
+    /// Existing callers that only have a `(endpoint, model)` pair to
+    /// hand can construct one with [`EndpointResolver::new`]; callers
+    /// that have a configured `[llm.subagent_pool]` should attach it
+    /// via [`EndpointResolver::with_pool`].
     ///
     /// The `parent_sandbox` argument is **required**: it is the
     /// [`SandboxContext`] from which every spawned subagent derives
     /// its own sandbox. Making it a constructor argument prevents
     /// callers from accidentally spawning subagents under an
     /// unrestricted default (issue #47 follow-up).
+    ///
+    /// Issue #50 made `resolver` a constructor argument (replacing the
+    /// `default_endpoint` / `default_model` strings). To install
+    /// escalator overrides, call
+    /// [`EndpointResolver::with_escalator_overrides`] before passing
+    /// the resolver in, or use the in-place setter
+    /// [`Self::set_escalator_overrides`].
     pub fn new(
         client: LlmClient,
         parent_cancel: CancellationToken,
-        default_endpoint: impl Into<String>,
-        default_model: impl Into<String>,
+        resolver: EndpointResolver,
         parent_sandbox: Arc<SandboxContext>,
     ) -> Self {
         Self {
             client,
-            default_endpoint: default_endpoint.into(),
-            default_model: default_model.into(),
+            resolver,
             parent_cancel,
             join_set: JoinSet::new(),
             instances: Arc::new(Mutex::new(BTreeMap::new())),
             next_id: 1,
             run_tool_provider: None,
-            escalator_overrides: EscalatorOverrides::default(),
             parent_sandbox,
+            resolved_hook: None,
         }
+    }
+
+    /// Install (or replace) the [`EndpointResolvedHook`] used to
+    /// surface resolved spawn targets to an external sink (typically
+    /// the CLI's `--event-log` writer). Pass `None` to clear a hook
+    /// that was previously installed.
+    pub fn set_endpoint_resolved_hook(&mut self, hook: Option<EndpointResolvedHook>) {
+        self.resolved_hook = hook;
     }
 
     /// Replace the parent [`SandboxContext`] in-place.
@@ -260,16 +285,19 @@ impl SubagentManager {
     /// Builder-style consuming method so the call site reads:
     ///
     /// ```ignore
-    /// let manager = SubagentManager::new(client, cancel, ep, model, parent_sandbox)
+    /// let manager = SubagentManager::new(client, cancel, resolver, parent_sandbox)
     ///     .with_escalator_overrides(EscalatorOverrides::from_strings(
     ///         cfg.endpoint.clone(),
     ///         cfg.model.clone(),
     ///         cfg.disable,
     ///     ));
     /// ```
+    ///
+    /// Internally re-installs the overrides on the
+    /// [`EndpointResolver`] so the precedence ladder picks them up.
     #[must_use]
     pub fn with_escalator_overrides(mut self, overrides: EscalatorOverrides) -> Self {
-        self.escalator_overrides = overrides;
+        self.resolver = self.resolver.with_escalator_overrides(overrides);
         self
     }
 
@@ -279,13 +307,19 @@ impl SubagentManager {
     /// and the escalator config changes after construction (e.g. a
     /// future config-reload path).
     pub fn set_escalator_overrides(&mut self, overrides: EscalatorOverrides) {
-        self.escalator_overrides = overrides;
+        self.resolver = self.resolver.clone().with_escalator_overrides(overrides);
     }
 
     /// Borrow the currently-installed escalator overrides.
     #[must_use]
     pub fn escalator_overrides(&self) -> &EscalatorOverrides {
-        &self.escalator_overrides
+        self.resolver.escalator_overrides()
+    }
+
+    /// Borrow the active [`EndpointResolver`].
+    #[must_use]
+    pub fn resolver(&self) -> &EndpointResolver {
+        &self.resolver
     }
 
     /// Install (or replace) the [`RunToolProvider`] used for spawning
@@ -304,54 +338,24 @@ impl SubagentManager {
         self.run_tool_provider.as_ref()
     }
 
-    /// Resolve the `(endpoint, model)` pair for a given [`AgentKind`].
-    ///
-    /// Precedence rules (see the module-level docs for context):
-    ///
-    /// - [`AgentKind::Custom`]: a non-empty `endpoint` / `model` on
-    ///   the custom-agent definition wins; missing fields fall back
-    ///   to the manager defaults.
-    /// - [`AgentKind::Builtin`] of [`AgentType::Escalator`]: non-empty
-    ///   values from [`EscalatorOverrides`] win; missing fields fall
-    ///   back to the manager defaults.
-    /// - All other built-in agents always run on the manager defaults.
-    ///
-    /// Exposed so the spawn path (and the dedicated test
-    /// [`Self::resolved_endpoint_for_kind`]) share a single source of
-    /// truth for the precedence rules.
-    fn resolve_endpoint(&self, kind: &AgentKind) -> (String, String) {
-        match kind {
-            AgentKind::Custom(def) => {
-                let endpoint = def.endpoint().unwrap_or(&self.default_endpoint).to_owned();
-                let model = def.model().unwrap_or(&self.default_model).to_owned();
-                (endpoint, model)
-            }
-            AgentKind::Builtin(AgentType::Escalator) => {
-                let endpoint = self
-                    .escalator_overrides
-                    .endpoint
-                    .clone()
-                    .unwrap_or_else(|| self.default_endpoint.clone());
-                let model = self
-                    .escalator_overrides
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| self.default_model.clone());
-                (endpoint, model)
-            }
-            AgentKind::Builtin(_) => (self.default_endpoint.clone(), self.default_model.clone()),
-        }
-    }
-
-    /// Test/inspection helper that returns the `(endpoint, model)`
-    /// pair a hypothetical spawn of `kind` would receive.
+    /// Test/inspection helper that returns the resolved
+    /// `(endpoint, model)` pair a hypothetical spawn of `kind` would
+    /// receive.
     ///
     /// Bypasses LLM-client construction so test code (and future
     /// diagnostics commands) can verify the precedence rules without
-    /// a live llama-server.
-    #[must_use]
-    pub fn resolved_endpoint_for_kind(&self, kind: &AgentKind) -> (String, String) {
-        self.resolve_endpoint(kind)
+    /// a live llama-server. Delegates to [`EndpointResolver::resolve`]
+    /// so the resolver is the single source of truth.
+    pub async fn resolved_endpoint_for_kind(&self, kind: &AgentKind) -> (String, String) {
+        let r = self.resolver.resolve(kind).await;
+        (r.endpoint, r.model)
+    }
+
+    /// Test/inspection helper that returns the full
+    /// [`ResolvedEndpoint`] including its [`ResolutionSource`]
+    /// label.
+    pub async fn resolve_for_kind(&self, kind: &AgentKind) -> ResolvedEndpoint {
+        self.resolver.resolve(kind).await
     }
 
     /// Spawn a subagent and return its ID immediately.
@@ -398,7 +402,7 @@ impl SubagentManager {
         // expects the auto-promotion path to treat this as "do not
         // escalate" rather than as a generic LLM/tool failure.
         if matches!(config.agent_kind, AgentKind::Builtin(AgentType::Escalator))
-            && self.escalator_overrides.disabled
+            && self.resolver.escalator_overrides().disabled
         {
             return Err(AgentError::EscalatorDisabled);
         }
@@ -421,21 +425,27 @@ impl SubagentManager {
             instances.insert(id, instance);
         }
 
-        // Resolve the endpoint / model with the centralised precedence
-        // rules (see `resolve_endpoint`). When the resolved pair
-        // matches the manager defaults we keep the shared `self.client`
-        // to avoid constructing a redundant `LlmClient`; otherwise we
-        // spin up a dedicated client. This reuse keeps the common
-        // built-in path allocation-free while still letting custom
-        // agents and the escalator land on a different endpoint.
-        let (resolved_endpoint, resolved_model) = self.resolve_endpoint(&config.agent_kind);
-        let client =
-            if resolved_endpoint == self.default_endpoint && resolved_model == self.default_model {
-                self.client.clone()
-            } else {
-                let llm_config = tmg_llm::LlmClientConfig::new(&resolved_endpoint, &resolved_model);
-                tmg_llm::LlmClient::new(llm_config).map_err(AgentError::Llm)?
-            };
+        // Resolve the endpoint / model via the centralised resolver.
+        // When the resolved pair matches the manager's main fallback
+        // we reuse `self.client` to avoid constructing a redundant
+        // `LlmClient`; otherwise we spin up a dedicated client.
+        let resolved = self.resolver.resolve(&config.agent_kind).await;
+        if let Some(hook) = &self.resolved_hook {
+            hook(
+                config.agent_kind.name(),
+                &resolved.endpoint,
+                &resolved.model,
+                resolved.source.as_str(),
+            );
+        }
+        let client = if resolved.endpoint == self.resolver.main_endpoint()
+            && resolved.model == self.resolver.main_model()
+        {
+            self.client.clone()
+        } else {
+            let llm_config = tmg_llm::LlmClientConfig::new(&resolved.endpoint, &resolved.model);
+            tmg_llm::LlmClient::new(llm_config).map_err(AgentError::Llm)?
+        };
 
         let agent_kind = config.agent_kind.clone();
         let task = config.task.clone();
@@ -620,8 +630,7 @@ mod tests {
         let mut manager = SubagentManager::new(
             client,
             cancel.clone(),
-            "http://localhost:9999",
-            "test",
+            EndpointResolver::new("http://localhost:9999", "test"),
             Arc::new(SandboxContext::test_default()),
         );
 
@@ -664,8 +673,7 @@ mod tests {
         let mut manager = SubagentManager::new(
             client,
             cancel.clone(),
-            "http://localhost:9999",
-            "test",
+            EndpointResolver::new("http://localhost:9999", "test"),
             Arc::new(SandboxContext::test_default()),
         );
 
@@ -697,8 +705,7 @@ mod tests {
         Some(SubagentManager::new(
             client,
             CancellationToken::new(),
-            "http://main:8080",
-            "main-model",
+            EndpointResolver::new("http://main:8080", "main-model"),
             Arc::new(SandboxContext::test_default()),
         ))
     }
@@ -723,8 +730,8 @@ mod tests {
         assert!(overrides.disabled);
     }
 
-    #[test]
-    fn resolved_endpoint_for_builtin_uses_main_defaults() {
+    #[tokio::test]
+    async fn resolved_endpoint_for_builtin_uses_main_defaults() {
         let Some(manager) = make_manager_for_resolution_tests() else {
             return;
         };
@@ -736,7 +743,7 @@ mod tests {
             AgentKind::Builtin(AgentType::Tester),
             AgentKind::Builtin(AgentType::Qa),
         ] {
-            let (ep, model) = manager.resolved_endpoint_for_kind(&kind);
+            let (ep, model) = manager.resolved_endpoint_for_kind(&kind).await;
             assert_eq!(ep, "http://main:8080", "wrong endpoint for {}", kind.name());
             assert_eq!(model, "main-model", "wrong model for {}", kind.name());
         }
@@ -747,8 +754,8 @@ mod tests {
     /// dropped. We verify this via the public
     /// [`SubagentManager::resolved_endpoint_for_kind`] helper rather
     /// than a mock `LlmClient` so the test stays unit-scoped.
-    #[test]
-    fn resolved_endpoint_for_escalator_uses_overrides() {
+    #[tokio::test]
+    async fn resolved_endpoint_for_escalator_uses_overrides() {
         let Some(manager) = make_manager_for_resolution_tests() else {
             return;
         };
@@ -758,15 +765,17 @@ mod tests {
             false,
         ));
 
-        let (ep, model) =
-            manager.resolved_endpoint_for_kind(&AgentKind::Builtin(AgentType::Escalator));
+        let (ep, model) = manager
+            .resolved_endpoint_for_kind(&AgentKind::Builtin(AgentType::Escalator))
+            .await;
         assert_eq!(ep, "http://escalator.invalid");
         assert_eq!(model, "lite");
 
         // Other built-ins must keep using the main endpoint even when
         // escalator overrides are installed.
-        let (ep, model) =
-            manager.resolved_endpoint_for_kind(&AgentKind::Builtin(AgentType::Explore));
+        let (ep, model) = manager
+            .resolved_endpoint_for_kind(&AgentKind::Builtin(AgentType::Explore))
+            .await;
         assert_eq!(ep, "http://main:8080");
         assert_eq!(model, "main-model");
     }
@@ -774,8 +783,8 @@ mod tests {
     /// Regression: an empty `[harness.escalator] endpoint = ""` must
     /// fall back to the main endpoint instead of trying to talk to a
     /// blank URL.
-    #[test]
-    fn resolved_endpoint_for_escalator_falls_back_to_main_when_empty() {
+    #[tokio::test]
+    async fn resolved_endpoint_for_escalator_falls_back_to_main_when_empty() {
         let Some(manager) = make_manager_for_resolution_tests() else {
             return;
         };
@@ -785,16 +794,17 @@ mod tests {
             false,
         ));
 
-        let (ep, model) =
-            manager.resolved_endpoint_for_kind(&AgentKind::Builtin(AgentType::Escalator));
+        let (ep, model) = manager
+            .resolved_endpoint_for_kind(&AgentKind::Builtin(AgentType::Escalator))
+            .await;
         assert_eq!(ep, "http://main:8080");
         assert_eq!(model, "main-model");
     }
 
     /// Partial overrides: only `endpoint` set, `model` empty -> the
     /// model inherits the main config while the endpoint is honoured.
-    #[test]
-    fn resolved_endpoint_for_escalator_mixes_override_and_default() {
+    #[tokio::test]
+    async fn resolved_endpoint_for_escalator_mixes_override_and_default() {
         let Some(manager) = make_manager_for_resolution_tests() else {
             return;
         };
@@ -804,14 +814,15 @@ mod tests {
             false,
         ));
 
-        let (ep, model) =
-            manager.resolved_endpoint_for_kind(&AgentKind::Builtin(AgentType::Escalator));
+        let (ep, model) = manager
+            .resolved_endpoint_for_kind(&AgentKind::Builtin(AgentType::Escalator))
+            .await;
         assert_eq!(ep, "http://escalator.invalid");
         assert_eq!(model, "main-model");
     }
 
-    #[test]
-    fn resolved_endpoint_for_custom_uses_def_overrides() {
+    #[tokio::test]
+    async fn resolved_endpoint_for_custom_uses_def_overrides() {
         let Some(manager) = make_manager_for_resolution_tests() else {
             return;
         };
@@ -829,7 +840,7 @@ allow = ["file_read"]
         let def = crate::custom::CustomAgentDef::from_toml(toml, "test.toml")
             .unwrap_or_else(|e| panic!("{e}"));
         let kind = AgentKind::Custom(Arc::new(def));
-        let (ep, model) = manager.resolved_endpoint_for_kind(&kind);
+        let (ep, model) = manager.resolved_endpoint_for_kind(&kind).await;
         assert_eq!(ep, "http://custom:7777");
         assert_eq!(model, "custom-model");
     }
@@ -844,8 +855,7 @@ allow = ["file_read"]
         let mut manager = SubagentManager::new(
             client,
             cancel.clone(),
-            "http://main:8080",
-            "main-model",
+            EndpointResolver::new("http://main:8080", "main-model"),
             Arc::new(SandboxContext::test_default()),
         )
         .with_escalator_overrides(EscalatorOverrides::from_strings(
@@ -894,8 +904,7 @@ allow = ["file_read"]
         let mut manager = SubagentManager::new(
             client,
             cancel.clone(),
-            "http://main:8080",
-            "main-model",
+            EndpointResolver::new("http://main:8080", "main-model"),
             Arc::new(SandboxContext::test_default()),
         );
 

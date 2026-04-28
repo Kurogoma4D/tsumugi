@@ -173,14 +173,24 @@ impl LlmPool {
     #[must_use = "the acquired client must be used to make requests"]
     pub async fn acquire(&self) -> Result<LlmClient, LlmError> {
         match &self.inner {
-            PoolInner::Single { client, .. } => Ok(client.clone()),
+            PoolInner::Single { url, client } => {
+                tracing::debug!(url, "pool acquired single endpoint");
+                Ok(client.clone())
+            }
             PoolInner::Multi {
                 state,
                 strategy,
                 round_robin_counter,
             } => {
                 let pool_state = state.read().await;
-                select_endpoint(&pool_state, *strategy, round_robin_counter)
+                let (client, picked_url) =
+                    select_endpoint_with_url(&pool_state, *strategy, round_robin_counter)?;
+                tracing::debug!(
+                    url = %picked_url,
+                    ?strategy,
+                    "pool selected multi endpoint",
+                );
+                Ok(client)
             }
         }
     }
@@ -239,6 +249,33 @@ impl LlmPool {
         }
     }
 
+    /// Pick the next endpoint URL using the configured strategy without
+    /// constructing or returning a full [`LlmClient`].
+    ///
+    /// Used by [`tmg_agents::EndpointResolver`] (and the broader
+    /// subagent endpoint-resolution path) when only the resolved URL
+    /// is needed — the caller will construct its own `LlmClient` (or
+    /// reuse the manager's). Returns `None` for empty / single-only
+    /// pools where there is no genuine selection to make.
+    ///
+    /// Note: this method holds the read lock for the duration of the
+    /// pick so the snapshot of endpoint health observed by selection
+    /// is internally consistent.
+    pub async fn pick_endpoint_url(&self) -> Result<Option<String>, LlmError> {
+        match &self.inner {
+            PoolInner::Single { .. } => Ok(None),
+            PoolInner::Multi {
+                state,
+                strategy,
+                round_robin_counter,
+            } => {
+                let pool_state = state.read().await;
+                let idx = pick_endpoint_index(&pool_state, *strategy, round_robin_counter)?;
+                Ok(Some(pool_state.endpoints[idx].url.clone()))
+            }
+        }
+    }
+
     /// Return health status of all endpoints.
     ///
     /// For single-endpoint pools, returns a single-element vec with
@@ -260,16 +297,47 @@ impl LlmPool {
     }
 }
 
-/// Select an endpoint from the pool based on the given strategy.
-///
-/// Prefers healthy endpoints. Falls back to unknown endpoints if no
-/// healthy ones are available. Returns [`LlmError::AllEndpointsDown`]
-/// when all endpoints are confirmed unhealthy.
+/// Same as [`select_endpoint`] but also returns the picked URL so the
+/// caller can emit a `tracing::debug!` line. Splitting the helpers
+/// keeps the existing tests (which only need the client) compiling
+/// without churn while letting [`LlmPool::acquire`] log the selection.
+fn select_endpoint_with_url(
+    state: &PoolState,
+    strategy: LoadBalanceStrategy,
+    round_robin_counter: &AtomicUsize,
+) -> Result<(LlmClient, String), LlmError> {
+    let idx = pick_endpoint_index(state, strategy, round_robin_counter)?;
+    let ep = &state.endpoints[idx];
+    Ok((ep.client.clone(), ep.url.clone()))
+}
+
+/// Select an endpoint client from the pool based on the given
+/// strategy. Used by the in-tree tests (the live `acquire` path now
+/// goes through [`select_endpoint_with_url`] so it can log the picked
+/// URL).
+#[cfg(test)]
 fn select_endpoint(
     state: &PoolState,
     strategy: LoadBalanceStrategy,
     round_robin_counter: &AtomicUsize,
 ) -> Result<LlmClient, LlmError> {
+    let idx = pick_endpoint_index(state, strategy, round_robin_counter)?;
+    Ok(state.endpoints[idx].client.clone())
+}
+
+/// Pure index-picking helper shared by [`select_endpoint_with_url`]
+/// and [`LlmPool::pick_endpoint_url`]. Centralising the logic ensures
+/// the healthy-vs-unknown precedence and round-robin-with-fallback
+/// behaviour stay in one place.
+///
+/// Prefers healthy endpoints. Falls back to unknown endpoints if no
+/// healthy ones are available. Returns [`LlmError::AllEndpointsDown`]
+/// when all endpoints are confirmed unhealthy.
+fn pick_endpoint_index(
+    state: &PoolState,
+    strategy: LoadBalanceStrategy,
+    round_robin_counter: &AtomicUsize,
+) -> Result<usize, LlmError> {
     let len = state.endpoints.len();
     if len == 0 {
         return Err(LlmError::PoolEmpty);
@@ -326,7 +394,7 @@ fn select_endpoint(
         }
     };
 
-    Ok(state.endpoints[selected].client.clone())
+    Ok(selected)
 }
 
 /// Background health check loop.

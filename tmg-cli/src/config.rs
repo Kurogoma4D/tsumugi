@@ -38,6 +38,12 @@ struct PartialLlmConfig {
     /// via tree-sitter signature extraction. Issue #49.
     pub signature_threshold_tokens: Option<usize>,
     pub tool_calling: Option<ToolCallingMode>,
+    /// `[llm.subagent_pool]` configuration. SPEC §10.1 / issue #50.
+    /// When present, the pool's endpoints are used to load-balance
+    /// non-escalator subagent spawns. An empty `endpoints` list is
+    /// **not** an error: it means "pool disabled".
+    #[serde(default)]
+    pub subagent_pool: Option<tmg_llm::PoolConfig>,
 }
 
 impl PartialLlmConfig {
@@ -64,6 +70,9 @@ impl PartialLlmConfig {
         if other.tool_calling.is_some() {
             self.tool_calling = other.tool_calling;
         }
+        if other.subagent_pool.is_some() {
+            self.subagent_pool.clone_from(&other.subagent_pool);
+        }
     }
 
     /// Convert to final `LlmConfig`, filling in defaults for unset fields.
@@ -84,6 +93,7 @@ impl PartialLlmConfig {
                 .signature_threshold_tokens
                 .unwrap_or(default_signature_threshold_tokens()),
             tool_calling: self.tool_calling.unwrap_or_default(),
+            subagent_pool: self.subagent_pool,
         }
     }
 }
@@ -898,6 +908,13 @@ pub struct LlmConfig {
 
     /// Tool calling mode.
     pub tool_calling: ToolCallingMode,
+
+    /// `[llm.subagent_pool]` configuration. SPEC §10.1 / issue #50.
+    /// `None` means "no pool section in the TOML"; `Some` with empty
+    /// endpoints means "pool disabled" (validated through
+    /// [`tmg_llm::PoolConfig::validate_relaxed`]).
+    #[serde(default)]
+    pub subagent_pool: Option<tmg_llm::PoolConfig>,
 }
 
 fn default_endpoint() -> String {
@@ -934,6 +951,7 @@ impl Default for LlmConfig {
             max_tool_result_tokens: default_max_tool_result_tokens(),
             signature_threshold_tokens: default_signature_threshold_tokens(),
             tool_calling: ToolCallingMode::default(),
+            subagent_pool: None,
         }
     }
 }
@@ -1302,6 +1320,36 @@ impl TsumugiConfig {
                 value: self.llm.compression_threshold.to_string(),
                 reason: "must be between 0.0 and 1.0".to_owned(),
             });
+        }
+
+        // Validate `[llm.subagent_pool]` (SPEC §10.1 / issue #50).
+        // Uses the relaxed validator so:
+        //   - empty `endpoints = []` is treated as "pool disabled",
+        //   - duplicate URLs are deduped with a `tracing::warn!`,
+        //   - malformed URLs / empty strings remain hard errors.
+        if let Some(pool) = self.llm.subagent_pool.as_ref() {
+            match pool.validate_relaxed() {
+                Ok(report) => {
+                    if !report.duplicates.is_empty() {
+                        tracing::warn!(
+                            duplicates = ?report.duplicates,
+                            "[llm.subagent_pool] endpoints contained duplicate URLs; deduping",
+                        );
+                    }
+                    if report.disabled {
+                        tracing::debug!(
+                            "[llm.subagent_pool] endpoints empty; subagent pool disabled",
+                        );
+                    }
+                }
+                Err(e) => {
+                    return Err(ConfigError::InvalidValue {
+                        field: "llm.subagent_pool".to_owned(),
+                        value: format!("{:?}", pool.endpoints),
+                        reason: e.to_string(),
+                    });
+                }
+            }
         }
 
         // No need to validate tool_calling or sandbox.mode -- they are
