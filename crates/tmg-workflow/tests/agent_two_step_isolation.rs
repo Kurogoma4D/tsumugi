@@ -159,7 +159,13 @@ async fn two_sequential_agent_steps_have_isolated_histories() {
     let llm_client_cfg = tmg_llm::LlmClientConfig::new(&endpoint, "mock-model");
     let llm_client = tmg_llm::LlmClient::new(llm_client_cfg).unwrap();
     let cancel = CancellationToken::new();
-    let manager = SubagentManager::new(llm_client, cancel, &endpoint, "mock-model");
+    let manager = SubagentManager::new(
+        llm_client,
+        cancel,
+        &endpoint,
+        "mock-model",
+        Arc::clone(&sandbox),
+    );
     let subagent_manager = Arc::new(Mutex::new(manager));
 
     let engine = WorkflowEngine::new(

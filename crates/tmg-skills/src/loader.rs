@@ -13,6 +13,22 @@ use crate::types::{InvocationPolicy, SkillContent, SkillMeta};
 /// Load the full content of a skill, including its instruction body
 /// and lists of associated scripts/ and references/ files.
 ///
+/// # Sandbox contract
+///
+/// This function performs filesystem reads **strictly inside the
+/// SKILL.md's parent directory** (the discovered skill directory):
+/// the `SKILL.md` file itself plus the immediate children of the
+/// `scripts/` and `references/` subdirectories. It does **not**
+/// resolve symlinks for the listed files (the entries are obtained
+/// via `file_type()`, which never follows links), so a symlinked
+/// file inside `scripts/` would simply be skipped.
+///
+/// Callers (currently only the `use_skill` tool) are expected to
+/// route the SKILL.md path *and* its parent directory through
+/// [`SandboxContext::check_path_access`](https://docs.rs/tmg-sandbox)
+/// before invoking `load_skill`, so a symlinked parent directory
+/// pointing outside the sandbox is caught at that boundary.
+///
 /// # Panics
 ///
 /// Panics if `meta.path` has no parent directory (should be unreachable

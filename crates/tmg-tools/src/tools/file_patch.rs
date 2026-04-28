@@ -76,10 +76,13 @@ impl FilePatchTool {
 
         let path = validate_and_resolve(path_str, ctx)?;
         // Patching is a write: gate it on `check_write_access` so
-        // ReadOnly subagents cannot rewrite files. The read of the
-        // existing content is implicit in the patch and is covered by
-        // the workspace-or-system allowance of `check_path_access`,
-        // which `check_write_access` strictly subsumes.
+        // ReadOnly subagents cannot rewrite files. We deliberately
+        // skip the explicit `check_path_access` call here: the only
+        // paths it would additionally permit are the system-read
+        // allowlist (e.g. `/usr`, `/bin`), and writing into those
+        // would be denied by `check_write_access` anyway. So skipping
+        // the read check loses no enforcement and avoids a redundant
+        // round-trip through `normalize_path`.
         ctx.check_write_access(&path)?;
 
         let content = tokio::fs::read_to_string(&path)

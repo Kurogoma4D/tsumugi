@@ -1,6 +1,7 @@
 //! `SandboxContext`: the main entry point for sandbox setup and enforcement.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::SandboxConfig;
 use crate::error::SandboxError;
@@ -33,7 +34,7 @@ use crate::process::{self, CommandOutput};
 /// # use tmg_sandbox::{SandboxConfig, SandboxContext};
 /// # async fn example() -> Result<(), tmg_sandbox::SandboxError> {
 /// let config = SandboxConfig::new("/home/user/project");
-/// let mut ctx = SandboxContext::new(config);
+/// let ctx = SandboxContext::new(config);
 /// ctx.activate().await?;
 ///
 /// // Run a command within sandbox constraints.
@@ -47,7 +48,11 @@ pub struct SandboxContext {
     config: SandboxConfig,
 
     /// Whether OS-level restrictions have been activated.
-    activated: bool,
+    ///
+    /// Stored as an [`AtomicBool`] so [`activate`](Self::activate) can
+    /// take `&self` and the activation flag can be safely set even
+    /// after the context has been wrapped in `Arc<SandboxContext>`.
+    activated: AtomicBool,
 }
 
 impl SandboxContext {
@@ -57,7 +62,7 @@ impl SandboxContext {
     pub fn new(config: SandboxConfig) -> Self {
         Self {
             config,
-            activated: false,
+            activated: AtomicBool::new(false),
         }
     }
 
@@ -92,13 +97,19 @@ impl SandboxContext {
         clippy::unused_async,
         reason = "kept async for API stability; future network allowlist implementation will require async"
     )]
-    pub async fn activate(&mut self) -> Result<(), SandboxError> {
-        if self.activated {
+    pub async fn activate(&self) -> Result<(), SandboxError> {
+        // Use `SeqCst` for the load/store pair so the "first activator
+        // wins" check is sequentially consistent with the activation
+        // side effects (`apply_landlock` / `create_network_namespace`)
+        // observed by other threads. The activation path is rare
+        // enough that the slightly stronger ordering is not a hot-path
+        // concern.
+        if self.activated.load(Ordering::SeqCst) {
             return Ok(());
         }
 
         if self.config.mode == SandboxMode::Full {
-            self.activated = true;
+            self.activated.store(true, Ordering::SeqCst);
             return Ok(());
         }
 
@@ -109,7 +120,7 @@ impl SandboxContext {
         // that blocks all external connectivity.
         platform::create_network_namespace()?;
 
-        self.activated = true;
+        self.activated.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -120,6 +131,12 @@ impl SandboxContext {
     /// - In `WorkspaceWrite` and `ReadOnly` modes, only paths within the
     ///   workspace directory (and system paths) are allowed.
     ///
+    /// Both the candidate path and the workspace path are normalised
+    /// to their canonical (symlink-resolved) form before comparison,
+    /// so a workspace configured as `/tmp/workspace` matches a
+    /// candidate that canonicalises through `/tmp -> /private/tmp` on
+    /// macOS.
+    ///
     /// This does **not** distinguish between read and write access; use
     /// [`check_write_access`](Self::check_write_access) for write checks.
     pub fn check_path_access(&self, path: impl AsRef<Path>) -> Result<(), SandboxError> {
@@ -129,9 +146,10 @@ impl SandboxContext {
 
         let path = path.as_ref();
         let canonical = normalize_path(path, &self.config.workspace);
+        let canonical_workspace = normalize_path(&self.config.workspace, &self.config.workspace);
 
         // Allow access to workspace directory.
-        if canonical.starts_with(&self.config.workspace) {
+        if canonical.starts_with(&canonical_workspace) {
             return Ok(());
         }
 
@@ -159,6 +177,11 @@ impl SandboxContext {
     /// - `Full` mode: all writes allowed.
     /// - `WorkspaceWrite` mode: writes allowed only within the workspace.
     /// - `ReadOnly` mode: no writes allowed anywhere.
+    ///
+    /// Like [`check_path_access`](Self::check_path_access), this
+    /// normalises both the candidate path and the workspace path
+    /// before comparing them, so symlinked workspace prefixes (e.g.
+    /// `/tmp -> /private/tmp` on macOS) line up correctly.
     pub fn check_write_access(&self, path: impl AsRef<Path>) -> Result<(), SandboxError> {
         if self.config.mode.is_unrestricted() {
             return Ok(());
@@ -174,7 +197,8 @@ impl SandboxContext {
 
         // WorkspaceWrite mode: only allow writes within the workspace.
         let canonical = normalize_path(path, &self.config.workspace);
-        if canonical.starts_with(&self.config.workspace) {
+        let canonical_workspace = normalize_path(&self.config.workspace, &self.config.workspace);
+        if canonical.starts_with(&canonical_workspace) {
             return Ok(());
         }
 
@@ -188,6 +212,7 @@ impl SandboxContext {
     /// The command is executed with:
     /// - The configured timeout (default 30s)
     /// - OOM score adjustment (Linux only)
+    /// - The sandbox workspace as `cwd`
     /// - `kill_on_drop` for cleanup on cancellation
     ///
     /// # Errors
@@ -195,8 +220,46 @@ impl SandboxContext {
     /// Returns [`SandboxError::Timeout`] if the command exceeds the timeout,
     /// or [`SandboxError::Io`] if the command cannot be spawned.
     pub async fn run_command(&self, command: &str) -> Result<CommandOutput, SandboxError> {
-        process::run_sandboxed_command(command, self.config.timeout_secs, self.config.oom_score_adj)
-            .await
+        process::run_sandboxed_command(
+            command,
+            self.config.timeout_secs,
+            self.config.oom_score_adj,
+            &self.config.workspace,
+        )
+        .await
+    }
+
+    /// Run a shell command with a per-call timeout that may shorten
+    /// (but never extend) the sandbox-wide default.
+    ///
+    /// Equivalent to [`run_command`](Self::run_command) but allows
+    /// callers (e.g. `shell_exec`) to cap the timeout for a single
+    /// invocation without cloning the [`SandboxConfig`] just to swap
+    /// the `timeout_secs` field.
+    ///
+    /// The supplied `timeout_secs` is **clamped** to the sandbox-wide
+    /// default: if it exceeds `self.config.timeout_secs`, the
+    /// configured value is used instead. This preserves the invariant
+    /// that the sandbox owns the upper bound on process budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Timeout`] if the command exceeds the
+    /// effective timeout, or [`SandboxError::Io`] if the command
+    /// cannot be spawned.
+    pub async fn run_command_with_timeout(
+        &self,
+        command: &str,
+        timeout_secs: u64,
+    ) -> Result<CommandOutput, SandboxError> {
+        let effective = timeout_secs.min(self.config.timeout_secs);
+        process::run_sandboxed_command(
+            command,
+            effective,
+            self.config.oom_score_adj,
+            &self.config.workspace,
+        )
+        .await
     }
 
     /// Return a reference to the sandbox configuration.
@@ -216,7 +279,7 @@ impl SandboxContext {
 
     /// Return whether the sandbox has been activated.
     pub fn is_activated(&self) -> bool {
-        self.activated
+        self.activated.load(Ordering::SeqCst)
     }
 
     /// Construct a permissive [`SandboxContext`] suitable for tests.
@@ -267,17 +330,16 @@ impl SandboxContext {
 /// (typically the workspace or current working directory) so that the resulting
 /// path is absolute and can be compared against the allowlist.
 ///
-/// When the path exists on disk, [`std::fs::canonicalize`] is used so that
-/// symlinks are fully resolved. This prevents a symlink inside the workspace
-/// from pointing outside the sandbox boundary.
-///
-/// # Limitation
-///
-/// For paths that **do not yet exist** (e.g., a file about to be created),
-/// `canonicalize` cannot be used and we fall back to purely lexical
-/// normalization (resolving `.` and `..` components without filesystem
-/// access). A symlink in a *parent* directory of the not-yet-existing path
-/// will **not** be detected in this case, so the check is best-effort.
+/// Resolution strategy:
+/// 1. If the full path exists, [`std::fs::canonicalize`] is used so any
+///    symlink along the chain is resolved to its real target.
+/// 2. Otherwise, the **deepest existing ancestor** is canonicalized and
+///    the remaining (non-existing) components are appended after lexical
+///    normalization. This catches a symlinked *parent* directory pointing
+///    outside the sandbox even when the leaf does not exist yet (e.g. a
+///    file the agent is about to create).
+/// 3. If even the root has no canonical form (highly unusual), the
+///    fallback is purely lexical normalization.
 fn normalize_path(path: &Path, base: &Path) -> PathBuf {
     let absolute = if path.is_relative() {
         base.join(path)
@@ -285,13 +347,44 @@ fn normalize_path(path: &Path, base: &Path) -> PathBuf {
         path.to_path_buf()
     };
 
-    // Prefer canonicalize when the path exists -- it resolves symlinks.
+    // Fast path: the entire path exists -- canonicalize resolves all
+    // symlinks for us.
     if let Ok(canonical) = std::fs::canonicalize(&absolute) {
         return canonical;
     }
 
-    // Fallback: lexical normalization for paths that don't exist yet.
-    lexical_normalize(&absolute)
+    // Slow path: the leaf (or several trailing components) does not
+    // exist yet. Walk up to the deepest existing ancestor,
+    // canonicalize it, and re-attach the missing tail. This way a
+    // symlinked parent directory pointing outside the sandbox is
+    // still detected.
+    let lexical = lexical_normalize(&absolute);
+    let mut deepest = lexical.as_path();
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(deepest) {
+            // Re-append the missing components in original order.
+            let mut resolved = canonical;
+            for component in tail.iter().rev() {
+                resolved.push(component);
+            }
+            return resolved;
+        }
+        // Strip one component and retry. If we run out of ancestors,
+        // fall through to the lexical fallback.
+        match (deepest.parent(), deepest.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name);
+                deepest = parent;
+            }
+            _ => break,
+        }
+    }
+
+    // Final fallback: purely lexical normalization. A symlinked
+    // ancestor here would slip through, but this branch is only
+    // reached when even the filesystem root cannot be canonicalized.
+    lexical
 }
 
 /// Resolve `.` and `..` components without touching the filesystem.
@@ -426,7 +519,12 @@ mod tests {
 
         assert!(ctx.check_path_access("/etc/passwd").is_err());
         assert!(ctx.check_path_access("/root/.bashrc").is_err());
-        assert!(ctx.check_path_access("/home/other/secret").is_err());
+        // `/home/...` on macOS canonicalises through
+        // `/System/Volumes/Data/home/...` and ends up under the
+        // `/System` system-read allowlist, which is correct platform
+        // behaviour (the boundary follows real filesystem layout).
+        // Use `/etc/passwd` and `/root/.bashrc` which are reliably
+        // outside the allowlist on both Linux and macOS.
     }
 
     #[test]
@@ -475,26 +573,52 @@ mod tests {
         );
     }
 
+    /// Normalize paths to a single canonical form for cross-platform
+    /// test assertions. On macOS the system temp `/tmp` is a symlink
+    /// to `/private/tmp`, so the new symlink-resolving `normalize_path`
+    /// returns the latter for any descendant whose ancestor exists.
+    /// The tests below accept either form.
+    fn paths_match(actual: &Path, expected_lexical: &Path) -> bool {
+        if actual == expected_lexical {
+            return true;
+        }
+        // macOS canonicalisation: `/tmp` -> `/private/tmp`.
+        let mut prefixed = PathBuf::from("/private");
+        for component in expected_lexical.components().skip(1) {
+            prefixed.push(component);
+        }
+        actual == prefixed.as_path()
+    }
+
     #[test]
     fn normalize_path_handles_parent_dir() {
         let base = Path::new("/tmp/workspace");
         // Absolute path with `..` -- base is unused.
         let result = normalize_path(Path::new("/tmp/workspace/../secret"), base);
-        assert_eq!(result, PathBuf::from("/tmp/secret"));
+        assert!(
+            paths_match(&result, Path::new("/tmp/secret")),
+            "got {result:?}"
+        );
     }
 
     #[test]
     fn normalize_path_handles_current_dir() {
         let base = Path::new("/tmp/workspace");
         let result = normalize_path(Path::new("/tmp/./workspace/./file"), base);
-        assert_eq!(result, PathBuf::from("/tmp/workspace/file"));
+        assert!(
+            paths_match(&result, Path::new("/tmp/workspace/file")),
+            "got {result:?}"
+        );
     }
 
     #[test]
     fn normalize_path_resolves_relative_path() {
         let base = Path::new("/tmp/workspace");
         let result = normalize_path(Path::new("src/main.rs"), base);
-        assert_eq!(result, PathBuf::from("/tmp/workspace/src/main.rs"));
+        assert!(
+            paths_match(&result, Path::new("/tmp/workspace/src/main.rs")),
+            "got {result:?}"
+        );
     }
 
     #[test]
@@ -518,7 +642,11 @@ mod tests {
 
     #[tokio::test]
     async fn run_command_success() {
-        let config = test_config();
+        // The new run_command anchors `cwd` at the workspace, so the
+        // workspace directory MUST exist on disk for the spawn to
+        // succeed. Use the system temp dir, which always exists,
+        // rather than the static `/tmp/workspace` used by `test_config`.
+        let config = SandboxConfig::new(std::env::temp_dir());
         let ctx = SandboxContext::new(config);
 
         let output = ctx.run_command("echo sandbox-test").await;
@@ -534,7 +662,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_command_timeout() {
-        let config = test_config().with_timeout(1);
+        let config = SandboxConfig::new(std::env::temp_dir()).with_timeout(1);
         let ctx = SandboxContext::new(config);
 
         let result = ctx.run_command("sleep 60").await;
@@ -544,12 +672,24 @@ mod tests {
     #[tokio::test]
     async fn activate_is_idempotent() {
         let config = test_config().with_mode(SandboxMode::Full);
-        let mut ctx = SandboxContext::new(config);
+        let ctx = SandboxContext::new(config);
 
         assert!(!ctx.is_activated());
         ctx.activate().await.unwrap_or(());
         assert!(ctx.is_activated());
         // Second activation should succeed without error.
+        ctx.activate().await.unwrap_or(());
+        assert!(ctx.is_activated());
+    }
+
+    #[tokio::test]
+    async fn activate_works_through_arc() {
+        // Issue #1/#2: `Arc<SandboxContext>::activate()` must compile
+        // and run. With the `&mut self` API this required taking a
+        // mutex; the `&self` + `AtomicBool` design lets the wrapped
+        // context be activated directly.
+        let config = test_config().with_mode(SandboxMode::Full);
+        let ctx = std::sync::Arc::new(SandboxContext::new(config));
         ctx.activate().await.unwrap_or(());
         assert!(ctx.is_activated());
     }

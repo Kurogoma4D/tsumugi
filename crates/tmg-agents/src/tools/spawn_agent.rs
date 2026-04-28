@@ -161,6 +161,18 @@ impl Tool for SpawnAgentTool {
         })
     }
 
+    /// `_ctx` is currently ignored on purpose: this tool only
+    /// mutates the in-memory [`SubagentManager`] state and never
+    /// touches the filesystem or spawns processes itself. The actual
+    /// sandbox decision is made *inside*
+    /// [`SubagentManager::spawn`](crate::manager::SubagentManager::spawn),
+    /// which derives a per-subagent [`SandboxContext`] from the agent
+    /// kind's [`AgentType::sandbox_mode`].
+    ///
+    /// **If you add filesystem work here, you MUST consult `ctx`** —
+    /// rename the parameter from `_ctx` to `ctx` and route every read
+    /// / write / shell call through it (analogous to the contract
+    /// documented on [`Tool::execute`]).
     fn execute<'a>(
         &'a self,
         params: serde_json::Value,
@@ -275,6 +287,7 @@ mod tests {
             CancellationToken::new(),
             "http://127.0.0.1:1",
             "test-model",
+            Arc::new(SandboxContext::test_default()),
         );
         Some(SpawnAgentTool::new(Arc::new(Mutex::new(manager))))
     }

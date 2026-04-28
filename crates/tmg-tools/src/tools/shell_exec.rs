@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use tmg_sandbox::{SandboxConfig, SandboxContext, SandboxError};
+use tmg_sandbox::{SandboxContext, SandboxError};
 
 use crate::error::ToolError;
 use crate::types::{Tool, ToolResult};
@@ -36,7 +36,7 @@ impl Tool for ShellExecTool {
                 },
                 "timeout_secs": {
                     "type": "integer",
-                    "description": "Maximum execution time in seconds (default: inherited from the sandbox)."
+                    "description": "Maximum execution time in seconds. Default and upper bound are inherited from the sandbox configuration; values larger than the sandbox-configured maximum are clamped down to that maximum (the sandbox owns the process-budget ceiling)."
                 }
             },
             "required": ["command"],
@@ -69,23 +69,18 @@ impl ShellExecTool {
 
         // Allow the LLM to shorten the sandbox-wide default timeout
         // for a single call, but never extend it (the sandbox owns
-        // the process-budget contract). When `timeout_secs` is set
-        // and is below the sandbox default, derive a one-shot
-        // [`SandboxContext`] with the tighter timeout; otherwise
-        // delegate to the live context unchanged.
+        // the process-budget contract).
+        // [`SandboxContext::run_command_with_timeout`] clamps the
+        // requested value down to the sandbox-configured maximum, so
+        // the per-call path stays allocation-free (no
+        // [`SandboxConfig`] clone) while preserving the upper bound.
         let per_call_timeout = params
             .get("timeout_secs")
             .and_then(serde_json::Value::as_u64);
 
         let result = match per_call_timeout {
-            Some(t) if t < ctx.config().timeout_secs => {
-                // Build a derived sandbox with the shorter timeout.
-                let mut cfg: SandboxConfig = ctx.config().clone();
-                cfg.timeout_secs = t;
-                let derived = SandboxContext::new(cfg);
-                derived.run_command(command).await
-            }
-            _ => ctx.run_command(command).await,
+            Some(t) => ctx.run_command_with_timeout(command, t).await,
+            None => ctx.run_command(command).await,
         };
 
         match result {

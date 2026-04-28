@@ -119,6 +119,7 @@ impl FileReadTool {
 }
 
 #[expect(clippy::unwrap_used, reason = "test assertions")]
+#[expect(clippy::panic, reason = "test assertions use panic-based macros")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,28 +249,32 @@ mod tests {
 
     /// Reading outside the workspace under a `WorkspaceWrite` sandbox
     /// must surface a [`ToolError::Sandbox`] rather than silently
-    /// returning the file contents.
+    /// returning the file contents. Mirrors the strict pattern used by
+    /// `registry_integration::workspace_write_blocks_external_file_writes`
+    /// so a future regression that drops the sandbox check would be
+    /// caught here as well.
     #[tokio::test]
     async fn read_outside_workspace_denied() {
         use tmg_sandbox::{SandboxConfig, SandboxMode};
 
-        // Workspace points at a fresh tmpdir; `/etc/passwd` (or any
-        // file outside it that isn't on the system-read allowlist) is
-        // refused.
-        let workspace = std::env::temp_dir().join("tmg_tools_test_file_read_outside_ws");
+        // Build two distinct directories under the system temp tree:
+        // - `workspace` is what the sandbox is configured for.
+        // - `outside_root` holds the target file. We canonicalize it
+        //   to absorb macOS's `/var` -> `/private/var` symlink so the
+        //   sandbox sees the real, non-workspace prefix.
+        let temp_root = std::env::temp_dir();
+        let workspace = temp_root.join("tmg_tools_test_file_read_outside_ws");
         let _ = std::fs::create_dir_all(&workspace);
-        // The workspace check is on the resolved path; pick a target
-        // that is not under the workspace AND not on the system-read
-        // allowlist (`/usr`, `/bin`, …) — `/private/var/...` works on
-        // macOS and `/var/tmp/...` on Linux. Use `$HOME/.tmg-test-outside`
-        // which is always outside the workspace.
-        let outside = std::env::temp_dir().join("tmg_tools_test_file_read_target");
-        let _ = std::fs::create_dir_all(outside.parent().unwrap());
+        let outside_root = temp_root.join("tmg_tools_test_file_read_outside_target_dir");
+        let _ = std::fs::create_dir_all(&outside_root);
+        let outside_root =
+            std::fs::canonicalize(&outside_root).unwrap_or_else(|_| outside_root.clone());
+        let outside = outside_root.join("secret.txt");
         std::fs::write(&outside, "secret").ok();
 
         // Build a fresh, non-`Full` sandbox so the workspace check
-        // actually fires. Note we deliberately pick a workspace that
-        // does NOT contain the target path.
+        // actually fires. The workspace deliberately excludes the
+        // target path.
         let sandbox = SandboxContext::new(
             SandboxConfig::new(&workspace).with_mode(SandboxMode::WorkspaceWrite),
         );
@@ -281,26 +286,18 @@ mod tests {
             )
             .await;
 
-        // The check might pass on platforms where the canonical form
-        // of `outside` happens to live under a system-read path; that
-        // is a property of `system_read_paths`, not a bug. But for the
-        // common temp-dir layout the access must be denied.
-        if let Ok(res) = &result {
-            // If the platform allow-listed the path, at least confirm
-            // we did not read the wrong file.
-            assert!(
-                !res.output.contains("secret") || res.is_error,
-                "unexpectedly read outside-workspace file under WorkspaceWrite"
-            );
-        } else {
-            let err = result.unwrap_err();
-            assert!(
+        // The sandbox MUST fire — silently allowing the read would
+        // mean the workspace boundary failed to hold.
+        match result {
+            Ok(res) => panic!("workspace-external file_read must be denied; got Ok({res:?})",),
+            Err(err) => assert!(
                 matches!(err, ToolError::Sandbox { .. }),
                 "expected ToolError::Sandbox, got {err:?}"
-            );
+            ),
         }
 
         let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&outside_root);
         let _ = std::fs::remove_dir_all(&workspace);
     }
 }

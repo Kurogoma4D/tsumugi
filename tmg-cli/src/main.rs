@@ -635,13 +635,19 @@ fn run_tui(
         // each agent kind's `sandbox_mode`).
         //
         // The workspace is the canonicalised cwd so workspace-write
-        // checks line up with where the user invoked `tmg`. We do not
-        // call `activate()` here (Linux-only Landlock + network
-        // namespace setup); software-level path checks already block
-        // workspace-external writes regardless of OS.
+        // checks line up with where the user invoked `tmg`. The OS
+        // restrictions (`activate()`) are best-effort: on Linux,
+        // Landlock + network-namespace setup is applied; on other
+        // platforms it's a no-op and the software-level path checks
+        // remain the enforcement boundary.
         let sandbox_ctx = Arc::new(tmg_sandbox::SandboxContext::new(
             sandbox_config.to_sandbox_config(&canonical_cwd),
         ));
+        if let Err(e) = sandbox_ctx.activate().await {
+            // Activation failure is fatal: the operator-configured
+            // sandbox MUST be in force before any tool is dispatched.
+            return Err(e).context("activating sandbox");
+        }
 
         // Create the subagent manager. The escalator's
         // endpoint/model/disable knobs flow through
@@ -655,9 +661,14 @@ fn run_tui(
             harness_config.escalator.disable,
         );
         let subagent_manager = Arc::new(Mutex::new(
-            tmg_agents::SubagentManager::new(client.clone(), cancel.clone(), endpoint, model)
-                .with_escalator_overrides(escalator_overrides)
-                .with_parent_sandbox(Arc::clone(&sandbox_ctx)),
+            tmg_agents::SubagentManager::new(
+                client.clone(),
+                cancel.clone(),
+                endpoint,
+                model,
+                Arc::clone(&sandbox_ctx),
+            )
+            .with_escalator_overrides(escalator_overrides),
         ));
 
         // Wire the active `RunRunner` into the subagent manager so
@@ -793,6 +804,12 @@ fn run_tui(
         }
 
         let max_context_tokens = context_config.max_context_tokens;
+        // Install the operator-configured sandbox so file / shell
+        // tools dispatched at the top level run under the same policy
+        // the subagent manager hands its children. The sandbox is a
+        // required constructor argument (issue #47 follow-up) so a
+        // future code path cannot silently fall back to an
+        // unrestricted default by forgetting to install one.
         let mut agent = tmg_core::AgentLoop::with_context_config(
             client,
             registry,
@@ -801,11 +818,8 @@ fn run_tui(
             &canonical_cwd,
             context_config,
             tool_calling_mode,
+            Arc::clone(&sandbox_ctx),
         )?;
-        // Install the operator-configured sandbox so file / shell
-        // tools dispatched at the top level run under the same policy
-        // the subagent manager hands its children.
-        agent.set_sandbox(Arc::clone(&sandbox_ctx));
 
         // Wire the auto-promotion gate (issue #37): after every turn,
         // the harness observer records the turn metrics into
@@ -825,8 +839,11 @@ fn run_tui(
         // Run session_bootstrap once and inject its output as a system
         // message so the LLM has the SPEC §9.7 context bundle for its
         // first turn. Failure is non-fatal: the agent simply starts
-        // without the auto-injected bundle.
-        inject_bootstrap(&mut agent, Arc::clone(&runner)).await;
+        // without the auto-injected bundle. The sandbox context is
+        // threaded in so the bootstrap's `git log` shell-out runs
+        // under the same policy as `shell_exec` (issue #47 follow-up
+        // #3).
+        inject_bootstrap(&mut agent, Arc::clone(&runner), Arc::clone(&sandbox_ctx)).await;
 
         // Subscribe to the runner's progress channel before handing
         // ownership of the runner mutex to the TUI. The channel is
@@ -1229,9 +1246,13 @@ fn parse_shortstat(s: &str) -> u32 {
 /// Failures (e.g. a missing `git` binary or a serialization error) are
 /// surfaced as a stderr warning but never abort startup; the TUI is
 /// usable without the bootstrap bundle.
-async fn inject_bootstrap(agent: &mut tmg_core::AgentLoop, runner: Arc<Mutex<RunRunner>>) {
+async fn inject_bootstrap(
+    agent: &mut tmg_core::AgentLoop,
+    runner: Arc<Mutex<RunRunner>>,
+    sandbox: Arc<tmg_sandbox::SandboxContext>,
+) {
     let bootstrap_tool = SessionBootstrapTool::new(runner);
-    match bootstrap_tool.run_once().await {
+    match bootstrap_tool.run_once(&sandbox).await {
         Ok(payload) => match serde_json::to_string_pretty(&payload) {
             Ok(json) => {
                 let injected = format!("[session_bootstrap]\n{json}\n[/session_bootstrap]");

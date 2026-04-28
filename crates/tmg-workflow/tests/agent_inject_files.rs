@@ -34,7 +34,13 @@ fn build_engine(workspace: &Path) -> WorkflowEngine {
     let llm_client_cfg = tmg_llm::LlmClientConfig::new(endpoint, "test-model");
     let llm_client = tmg_llm::LlmClient::new(llm_client_cfg).unwrap();
     let cancel = CancellationToken::new();
-    let manager = SubagentManager::new(llm_client, cancel, endpoint, "test-model");
+    let manager = SubagentManager::new(
+        llm_client,
+        cancel,
+        endpoint,
+        "test-model",
+        Arc::clone(&sandbox),
+    );
     let subagent_manager = Arc::new(Mutex::new(manager));
 
     WorkflowEngine::new(

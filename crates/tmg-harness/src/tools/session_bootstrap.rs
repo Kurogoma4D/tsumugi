@@ -76,8 +76,14 @@ impl SessionBootstrapTool {
     /// Used by the CLI startup path so the result can be injected as a
     /// system message into the [`AgentLoop`](tmg_core::AgentLoop)
     /// history before the user sends their first turn.
-    pub async fn run_once(&self) -> Result<BootstrapPayload, ToolError> {
-        run_bootstrap(&self.runner).await
+    ///
+    /// The `sandbox` argument is the operator-configured
+    /// [`SandboxContext`] used for the `git log` shell-out. Routing
+    /// the call through the same context as `shell_exec` ensures
+    /// `git log` honours the configured timeout, OOM-score
+    /// adjustment, and (on Linux) network namespace policy.
+    pub async fn run_once(&self, sandbox: &SandboxContext) -> Result<BootstrapPayload, ToolError> {
+        run_bootstrap(&self.runner, sandbox).await
     }
 }
 
@@ -104,19 +110,19 @@ impl Tool for SessionBootstrapTool {
     fn execute<'a>(
         &'a self,
         _params: serde_json::Value,
-        _ctx: &'a SandboxContext,
+        ctx: &'a SandboxContext,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
     > {
-        // The bootstrap shells out to `git log` via its own dedicated
-        // sandbox in `collect_init_script_status` (see below); the
-        // top-level [`SandboxContext`] is intentionally not consulted
-        // here because the bootstrap reads run-internal artefacts
-        // (`features.json`, `init.sh`, `progress.md`) that live under
-        // the workspace by construction.
+        // `git log` is shelled out via `ctx.run_command`, so it
+        // inherits the operator-configured timeout / OOM-score /
+        // network policy (see issue-#47 review item #3). The
+        // run-internal artefacts (`features.json`, `init.sh`,
+        // `progress.md`) live under the workspace by construction
+        // and are read directly without a separate sandbox check.
         let runner = Arc::clone(&self.runner);
         Box::pin(async move {
-            let payload = run_bootstrap(&runner).await?;
+            let payload = run_bootstrap(&runner, ctx).await?;
             let json = serde_json::to_string_pretty(&payload)
                 .map_err(|e| ToolError::json("serializing bootstrap payload", e))?;
             Ok(ToolResult::success(json))
@@ -247,7 +253,10 @@ struct HarnessBootstrapInputs {
     init_script_timeout: Duration,
 }
 
-async fn run_bootstrap(runner: &Arc<Mutex<RunRunner>>) -> Result<BootstrapPayload, ToolError> {
+async fn run_bootstrap(
+    runner: &Arc<Mutex<RunRunner>>,
+    sandbox: &SandboxContext,
+) -> Result<BootstrapPayload, ToolError> {
     // Read everything we need under a single short lock so we never
     // hold the runner while shelling out to `git log` or running
     // `init.sh`.
@@ -277,7 +286,7 @@ async fn run_bootstrap(runner: &Arc<Mutex<RunRunner>>) -> Result<BootstrapPayloa
     };
 
     let working_directory = inputs.workspace_path.display().to_string();
-    let recent_git_log = collect_git_log(&inputs.workspace_path, DEFAULT_GIT_LOG_LIMIT).await;
+    let recent_git_log = collect_git_log(sandbox, DEFAULT_GIT_LOG_LIMIT).await;
     let progress_summary =
         read_recent_progress(&inputs.progress_log_path, DEFAULT_PROGRESS_SESSIONS)?;
 
@@ -413,28 +422,29 @@ fn read_recent_progress(path: &std::path::Path, n: usize) -> Result<String, Tool
         .map_err(|e| ToolError::io("reading progress.md", std::io::Error::other(e.to_string())))
 }
 
-/// Run `git log --oneline -N` inside `workspace`, returning stdout on
-/// success and the empty string when the command fails (e.g. not a git
-/// repo, git not installed, or timeout).
-async fn collect_git_log(workspace: &std::path::Path, limit: usize) -> String {
-    let limit_arg = format!("-{limit}");
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("log")
-        .arg("--oneline")
-        .arg(limit_arg)
-        .current_dir(workspace)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    cmd.kill_on_drop(true);
+/// Run `git log --oneline -N` through the sandbox, returning stdout
+/// on success and the empty string when the command fails (e.g. not
+/// a git repo, git not installed, or timeout).
+///
+/// Routing through [`SandboxContext::run_command_with_timeout`] gives
+/// `git log` the same OOM-score / network-namespace / cancellation
+/// guarantees that `shell_exec` enjoys. The sandbox's workspace is
+/// used as `cwd` (set by [`SandboxContext::run_command`]), so the
+/// emitted log is for the workspace's own repository regardless of
+/// where the agent process was launched.
+async fn collect_git_log(sandbox: &SandboxContext, limit: usize) -> String {
+    // The shell command is fixed and well-formed: `limit` is a
+    // function argument we control (defaults to
+    // `DEFAULT_GIT_LOG_LIMIT`), so there is no untrusted-input
+    // injection risk in this format string.
+    let command = format!("git log --oneline -{limit} 2>/dev/null");
+    let timeout_secs = GIT_LOG_TIMEOUT.as_secs();
 
-    let Ok(child) = cmd.spawn() else {
-        return String::new();
-    };
-
-    match tokio::time::timeout(GIT_LOG_TIMEOUT, child.wait_with_output()).await {
-        Ok(Ok(output)) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).into_owned()
-        }
+    match sandbox
+        .run_command_with_timeout(&command, timeout_secs)
+        .await
+    {
+        Ok(output) if output.success() => output.stdout,
         _ => String::new(),
     }
 }
@@ -643,7 +653,11 @@ mod tests {
         }
 
         let tool = SessionBootstrapTool::new(Arc::clone(&runner));
-        let payload = tool.run_once().await.unwrap_or_else(|e| panic!("{e}"));
+        let sandbox = SandboxContext::test_default();
+        let payload = tool
+            .run_once(&sandbox)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
 
         // Working directory matches workspace_path.
         let expected_workspace = runner.lock().await.workspace_path_owned();
@@ -717,7 +731,11 @@ mod tests {
         }
 
         let tool = SessionBootstrapTool::new(Arc::clone(&runner));
-        let payload = tool.run_once().await.unwrap_or_else(|e| panic!("{e}"));
+        let sandbox = SandboxContext::test_default();
+        let payload = tool
+            .run_once(&sandbox)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         assert!(payload.truncated, "payload should be marked truncated");
         // `working_directory` is preserved unconditionally by
         // `truncate_to_budget`, so the post-truncation payload's
@@ -769,7 +787,11 @@ mod tests {
         }
 
         let tool = SessionBootstrapTool::new(Arc::clone(&runner));
-        let payload = tool.run_once().await.unwrap_or_else(|e| panic!("{e}"));
+        let sandbox = SandboxContext::test_default();
+        let payload = tool
+            .run_once(&sandbox)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         assert!(!payload.truncated, "zero budget must skip truncation");
         // The full progress.md (5 sessions ish) survives.
         assert!(
@@ -814,7 +836,11 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
 
         let tool = SessionBootstrapTool::new(Arc::clone(&runner));
-        let payload = tool.run_once().await.unwrap_or_else(|e| panic!("{e}"));
+        let sandbox = SandboxContext::test_default();
+        let payload = tool
+            .run_once(&sandbox)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
 
         let json = serde_json::to_string_pretty(&payload).unwrap_or_else(|e| panic!("{e}"));
         let injected = format!("[session_bootstrap]\n{json}\n[/session_bootstrap]");
@@ -901,7 +927,11 @@ mod tests {
     async fn ad_hoc_payload_omits_harnessed_fields() {
         let (_tmp, runner) = make_runner();
         let tool = SessionBootstrapTool::new(Arc::clone(&runner));
-        let payload = tool.run_once().await.unwrap_or_else(|e| panic!("{e}"));
+        let sandbox = SandboxContext::test_default();
+        let payload = tool
+            .run_once(&sandbox)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         assert!(payload.features_summary.is_none());
         assert!(payload.init_script_status.is_none());
         assert!(payload.smoke_test_result.is_none());
@@ -932,7 +962,11 @@ mod tests {
         promote_to_harnessed(&runner, Some(sample_features_json()), None).await;
 
         let tool = SessionBootstrapTool::new(Arc::clone(&runner));
-        let payload = tool.run_once().await.unwrap_or_else(|e| panic!("{e}"));
+        let sandbox = SandboxContext::test_default();
+        let payload = tool
+            .run_once(&sandbox)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
 
         let summary = payload
             .features_summary
@@ -976,7 +1010,11 @@ mod tests {
         promote_to_harnessed(&runner, Some(sample_features_json()), Some(init_content)).await;
 
         let tool = SessionBootstrapTool::new(Arc::clone(&runner));
-        let payload = tool.run_once().await.unwrap_or_else(|e| panic!("{e}"));
+        let sandbox = SandboxContext::test_default();
+        let payload = tool
+            .run_once(&sandbox)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         let status = payload
             .init_script_status
             .as_ref()
@@ -1038,7 +1076,11 @@ mod tests {
         }
 
         let tool = SessionBootstrapTool::new(Arc::clone(&runner));
-        let payload = tool.run_once().await.unwrap_or_else(|e| panic!("{e}"));
+        let sandbox = SandboxContext::test_default();
+        let payload = tool
+            .run_once(&sandbox)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         assert!(payload.truncated, "expected payload to be truncated");
 
         // The features_summary entries should have been trimmed (or

@@ -91,6 +91,19 @@ impl UseSkillTool {
         // discovered SKILL.md path; surface a clear sandbox denial if
         // the active mode forbids the read.
         ctx.check_path_access(meta.path.as_path())?;
+        // Defense in depth: `load_skill` also enumerates the
+        // `scripts/` and `references/` siblings of SKILL.md. Those
+        // subdirectories live under the same parent we just approved,
+        // but a maliciously-crafted symlink there could redirect the
+        // walk outside the sandbox boundary. Approving the parent
+        // directly catches that case (`check_path_access`
+        // canonicalises the path, resolving any symlink), and
+        // [`load_skill`] itself guards against symlinked files inside
+        // the subdirectories by relying on `file_type()`, which does
+        // not traverse links.
+        if let Some(parent) = meta.path.as_path().parent() {
+            ctx.check_path_access(parent)?;
+        }
 
         match load_skill(meta).await {
             Ok(content) => {

@@ -157,10 +157,11 @@ pub struct AgentLoop {
     /// Sandbox context every tool dispatch runs under.
     ///
     /// Constructed by the CLI from the operator's `[sandbox]` config
-    /// and threaded into [`Self::dispatch_tool_calls`]. Defaults to
-    /// [`SandboxContext::test_default`] for callers that build the
-    /// agent without going through the CLI startup path (notably the
-    /// crate's own unit tests).
+    /// and threaded into [`Self::dispatch_tool_calls`]. The sandbox is
+    /// a required constructor argument (see [`Self::new`] /
+    /// [`Self::with_context_config`]) so production callers cannot
+    /// silently fall back to an unrestricted [`SandboxContext`] by
+    /// forgetting to install one.
     sandbox: Arc<SandboxContext>,
 
     /// Optional callback invoked at the end of every [`Self::turn`].
@@ -178,6 +179,12 @@ impl AgentLoop {
     /// directory and from `project_root` down to `cwd`, injecting them
     /// as initial user-role messages after the system prompt.
     ///
+    /// The `sandbox` argument is **required**: it is the
+    /// [`SandboxContext`] every dispatched tool runs under. Making it
+    /// a constructor argument prevents callers from accidentally
+    /// running tools under an unrestricted default
+    /// (issue #47 follow-up).
+    ///
     /// # Errors
     ///
     /// Returns [`CoreError::Io`] if a prompt file exists but cannot be read.
@@ -187,6 +194,7 @@ impl AgentLoop {
         cancel: CancellationToken,
         project_root: &Path,
         cwd: &Path,
+        sandbox: Arc<SandboxContext>,
     ) -> Result<Self, CoreError> {
         Self::with_context_config(
             client,
@@ -196,20 +204,21 @@ impl AgentLoop {
             cwd,
             ContextConfig::default(),
             ToolCallingMode::Auto,
+            sandbox,
         )
     }
 
     /// Create a new agent loop with tool support and custom context config.
     ///
-    /// The sandbox defaults to a permissive
-    /// [`SandboxContext::test_default`]; production callers should
-    /// install the operator-configured sandbox via
-    /// [`Self::set_sandbox`] (or use [`Self::with_sandbox`] when the
-    /// sandbox is known up-front).
+    /// The `sandbox` argument is **required**: see [`Self::new`].
     ///
     /// # Errors
     ///
     /// Returns [`CoreError::Io`] if a prompt file exists but cannot be read.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor wires together independent capabilities (LLM, registry, paths, context budget, mode, sandbox); grouping them into a config struct adds boilerplate without clarifying intent"
+    )]
     pub fn with_context_config(
         client: LlmClient,
         registry: ToolRegistry,
@@ -218,6 +227,7 @@ impl AgentLoop {
         cwd: &Path,
         context_config: ContextConfig,
         tool_calling_mode: ToolCallingMode,
+        sandbox: Arc<SandboxContext>,
     ) -> Result<Self, CoreError> {
         let tool_defs = Arc::new(registry.tool_definitions());
 
@@ -243,28 +253,20 @@ impl AgentLoop {
             token_counter,
             compressor,
             tool_calling_mode,
-            sandbox: Arc::new(SandboxContext::test_default()),
+            sandbox,
             turn_observer: None,
         })
     }
 
-    /// Install the [`SandboxContext`] used for every tool dispatch.
+    /// Replace the active [`SandboxContext`].
     ///
-    /// Production callers (the CLI startup path) call this after
-    /// constructing the loop with the sandbox derived from the
-    /// merged `[sandbox]` configuration; tests can rely on the
-    /// permissive default installed by [`Self::with_context_config`].
+    /// Constructor-time installation via [`Self::new`] /
+    /// [`Self::with_context_config`] is the canonical path; this
+    /// setter exists only for explicit reconfiguration (e.g. a future
+    /// `tmg run upgrade` flow that re-derives the sandbox after
+    /// promotion).
     pub fn set_sandbox(&mut self, sandbox: Arc<SandboxContext>) {
         self.sandbox = sandbox;
-    }
-
-    /// Builder-style variant of [`Self::set_sandbox`] for use right
-    /// after [`Self::new`] / [`Self::with_context_config`] when the
-    /// sandbox is known up-front.
-    #[must_use]
-    pub fn with_sandbox(mut self, sandbox: Arc<SandboxContext>) -> Self {
-        self.sandbox = sandbox;
-        self
     }
 
     /// Borrow the active [`SandboxContext`].
