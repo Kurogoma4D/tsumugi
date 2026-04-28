@@ -268,15 +268,16 @@ allow = ["file_read", "grep_search"]
             serde_json::json!({"type": "object"})
         }
 
-        fn execute(
-            &self,
+        fn execute<'a>(
+            &'a self,
             _params: serde_json::Value,
+            _ctx: &'a tmg_sandbox::SandboxContext,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<
                         Output = Result<tmg_tools::ToolResult, tmg_tools::ToolError>,
                     > + Send
-                    + '_,
+                    + 'a,
             >,
         > {
             Box::pin(async { Ok(tmg_tools::ToolResult::success("ok")) })

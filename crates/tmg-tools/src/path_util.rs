@@ -2,6 +2,8 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use tmg_sandbox::SandboxContext;
+
 use crate::error::ToolError;
 
 /// Validate that `path` does not contain path traversal components (e.g. `..`).
@@ -23,6 +25,29 @@ pub fn validate_path(path: impl AsRef<Path>) -> Result<PathBuf, ToolError> {
     }
 
     Ok(path.to_path_buf())
+}
+
+/// Resolve a tool-supplied path against the sandbox workspace.
+///
+/// If `path` is already absolute, it is returned unchanged (after the
+/// `..`-component check performed by [`validate_path`]). Relative paths
+/// are joined with the [`SandboxContext`]'s workspace so the result is
+/// always absolute and can be fed to
+/// [`SandboxContext::check_path_access`] /
+/// [`SandboxContext::check_write_access`] without ambiguity.
+///
+/// Tools should call this in preference to [`validate_path`] alone so
+/// the sandbox sees the same path the OS will see.
+pub fn validate_and_resolve(
+    path: impl AsRef<Path>,
+    ctx: &SandboxContext,
+) -> Result<PathBuf, ToolError> {
+    let path = validate_path(path)?;
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(ctx.workspace().join(path))
+    }
 }
 
 #[expect(clippy::unwrap_used, reason = "test assertions")]
@@ -60,5 +85,27 @@ mod tests {
     fn allows_current_dir_component() {
         let result = validate_path("./src/main.rs");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_and_resolve_keeps_absolute_paths() {
+        let ctx = SandboxContext::test_default();
+        let result = validate_and_resolve("/tmp/test/file.txt", &ctx).unwrap();
+        assert_eq!(result, PathBuf::from("/tmp/test/file.txt"));
+    }
+
+    #[test]
+    fn validate_and_resolve_joins_relative_paths_to_workspace() {
+        let ctx = SandboxContext::test_default();
+        let result = validate_and_resolve("src/main.rs", &ctx).unwrap();
+        assert!(result.is_absolute());
+        assert!(result.ends_with("src/main.rs"));
+    }
+
+    #[test]
+    fn validate_and_resolve_rejects_traversal() {
+        let ctx = SandboxContext::test_default();
+        let result = validate_and_resolve("../escape.txt", &ctx);
+        assert!(matches!(result, Err(ToolError::PathTraversal { .. })));
     }
 }

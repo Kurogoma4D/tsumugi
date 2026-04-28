@@ -3,8 +3,10 @@
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
+use tmg_sandbox::SandboxContext;
+
 use crate::error::ToolError;
-use crate::path_util::validate_path;
+use crate::path_util::{validate_and_resolve, validate_path};
 use crate::types::{Tool, ToolResult};
 
 /// Maximum number of matching lines to return.
@@ -48,18 +50,23 @@ impl Tool for GrepSearchTool {
         })
     }
 
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         params: serde_json::Value,
+        ctx: &'a SandboxContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
     > {
-        Box::pin(self.execute_inner(params))
+        Box::pin(self.execute_inner(params, ctx))
     }
 }
 
 impl GrepSearchTool {
-    async fn execute_inner(&self, params: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn execute_inner(
+        &self,
+        params: serde_json::Value,
+        ctx: &SandboxContext,
+    ) -> Result<ToolResult, ToolError> {
         let Some(pattern_str) = params.get("pattern").and_then(serde_json::Value::as_str) else {
             return Err(ToolError::invalid_params(
                 "missing required parameter: pattern",
@@ -68,9 +75,24 @@ impl GrepSearchTool {
 
         let regex = regex::Regex::new(pattern_str)?;
 
-        let search_path = match params.get("path").and_then(serde_json::Value::as_str) {
-            Some(p) => validate_path(p)?,
-            None => PathBuf::from("."),
+        // When no path is supplied, default to the current directory.
+        // The current directory is then resolved via the same
+        // `validate_and_resolve` path to surface a clear sandbox
+        // denial if the cwd is outside the workspace.
+        let search_path = if let Some(p) = params.get("path").and_then(serde_json::Value::as_str) {
+            let resolved = validate_and_resolve(p, ctx)?;
+            ctx.check_path_access(&resolved)?;
+            resolved
+        } else {
+            let default = PathBuf::from(".");
+            let _ = validate_path(&default)?;
+            let resolved = if default.is_absolute() {
+                default
+            } else {
+                ctx.workspace().join(default)
+            };
+            ctx.check_path_access(&resolved)?;
+            resolved
         };
 
         let include_filter = params
@@ -272,6 +294,10 @@ fn search_single_file(
 mod tests {
     use super::*;
 
+    fn ctx() -> SandboxContext {
+        SandboxContext::test_default()
+    }
+
     #[tokio::test]
     async fn grep_basic_search() {
         let dir = std::env::temp_dir().join("tmg_tools_test_grep");
@@ -281,11 +307,15 @@ mod tests {
         std::fs::write(dir.join("b.txt"), "no match here\n").ok();
 
         let tool = GrepSearchTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({
-                "pattern": "hello",
-                "path": dir.to_str().unwrap()
-            }))
+            .execute(
+                serde_json::json!({
+                    "pattern": "hello",
+                    "path": dir.to_str().unwrap()
+                }),
+                &sandbox,
+            )
             .await
             .unwrap();
 
@@ -306,12 +336,16 @@ mod tests {
         std::fs::write(dir.join("b.txt"), "fn main() {}\n").ok();
 
         let tool = GrepSearchTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({
-                "pattern": "fn main",
-                "path": dir.to_str().unwrap(),
-                "include": "*.rs"
-            }))
+            .execute(
+                serde_json::json!({
+                    "pattern": "fn main",
+                    "path": dir.to_str().unwrap(),
+                    "include": "*.rs"
+                }),
+                &sandbox,
+            )
             .await
             .unwrap();
 
@@ -330,11 +364,15 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "hello\n").ok();
 
         let tool = GrepSearchTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({
-                "pattern": "zzzzz",
-                "path": dir.to_str().unwrap()
-            }))
+            .execute(
+                serde_json::json!({
+                    "pattern": "zzzzz",
+                    "path": dir.to_str().unwrap()
+                }),
+                &sandbox,
+            )
             .await
             .unwrap();
 
@@ -347,11 +385,15 @@ mod tests {
     #[tokio::test]
     async fn grep_invalid_regex() {
         let tool = GrepSearchTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({
-                "pattern": "[invalid",
-                "path": "/tmp"
-            }))
+            .execute(
+                serde_json::json!({
+                    "pattern": "[invalid",
+                    "path": "/tmp"
+                }),
+                &sandbox,
+            )
             .await;
         assert!(result.is_err());
     }

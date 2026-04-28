@@ -26,7 +26,9 @@ pub use custom::{AgentSource, CustomAgentDef, CustomAgentMeta};
 pub use discovery::discover_custom_agents;
 pub use error::AgentError;
 pub use escalator::{EscalatorVerdict, ParseError as EscalatorParseError, parse_verdict};
-pub use manager::{EscalatorOverrides, SubagentId, SubagentManager, SubagentSummary};
+pub use manager::{
+    EscalatorOverrides, SubagentId, SubagentManager, SubagentSummary, derive_sandbox,
+};
 pub use runner::SubagentRunner;
 pub use status::{SubagentStatus, truncate_str};
 pub use tools::SpawnAgentTool;

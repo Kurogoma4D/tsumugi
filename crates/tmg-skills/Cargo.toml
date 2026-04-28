@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 tmg-tools = { workspace = true }
 tmg-llm = { workspace = true }
+tmg-sandbox = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }

@@ -13,6 +13,7 @@ use tmg_llm::{
     LlmClient, StreamEvent, ToolCall, ToolCallingMode, ToolDefinition, build_tool_calling_prompt,
     parse_tool_calls,
 };
+use tmg_sandbox::SandboxContext;
 use tmg_tools::ToolRegistry;
 
 use crate::context::{ContextCompressor, ContextConfig, TokenCounter, truncate_tool_result};
@@ -153,6 +154,15 @@ pub struct AgentLoop {
     /// Tool calling strategy (native, `prompt_based`, or auto).
     tool_calling_mode: ToolCallingMode,
 
+    /// Sandbox context every tool dispatch runs under.
+    ///
+    /// Constructed by the CLI from the operator's `[sandbox]` config
+    /// and threaded into [`Self::dispatch_tool_calls`]. Defaults to
+    /// [`SandboxContext::test_default`] for callers that build the
+    /// agent without going through the CLI startup path (notably the
+    /// crate's own unit tests).
+    sandbox: Arc<SandboxContext>,
+
     /// Optional callback invoked at the end of every [`Self::turn`].
     ///
     /// Installed by the harness wire-up to feed the auto-promotion
@@ -191,6 +201,12 @@ impl AgentLoop {
 
     /// Create a new agent loop with tool support and custom context config.
     ///
+    /// The sandbox defaults to a permissive
+    /// [`SandboxContext::test_default`]; production callers should
+    /// install the operator-configured sandbox via
+    /// [`Self::set_sandbox`] (or use [`Self::with_sandbox`] when the
+    /// sandbox is known up-front).
+    ///
     /// # Errors
     ///
     /// Returns [`CoreError::Io`] if a prompt file exists but cannot be read.
@@ -227,8 +243,34 @@ impl AgentLoop {
             token_counter,
             compressor,
             tool_calling_mode,
+            sandbox: Arc::new(SandboxContext::test_default()),
             turn_observer: None,
         })
+    }
+
+    /// Install the [`SandboxContext`] used for every tool dispatch.
+    ///
+    /// Production callers (the CLI startup path) call this after
+    /// constructing the loop with the sandbox derived from the
+    /// merged `[sandbox]` configuration; tests can rely on the
+    /// permissive default installed by [`Self::with_context_config`].
+    pub fn set_sandbox(&mut self, sandbox: Arc<SandboxContext>) {
+        self.sandbox = sandbox;
+    }
+
+    /// Builder-style variant of [`Self::set_sandbox`] for use right
+    /// after [`Self::new`] / [`Self::with_context_config`] when the
+    /// sandbox is known up-front.
+    #[must_use]
+    pub fn with_sandbox(mut self, sandbox: Arc<SandboxContext>) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
+
+    /// Borrow the active [`SandboxContext`].
+    #[must_use]
+    pub fn sandbox(&self) -> &Arc<SandboxContext> {
+        &self.sandbox
     }
 
     /// Install (or replace) the per-turn observer callback.
@@ -589,6 +631,7 @@ impl AgentLoop {
         let mut join_set = JoinSet::new();
         for tc in tool_calls {
             let registry = Arc::clone(&self.registry);
+            let sandbox = Arc::clone(&self.sandbox);
             let name = tc.function.name.clone();
             let arguments_str = tc.function.arguments.clone();
             let call_id = tc.id.clone();
@@ -610,7 +653,7 @@ impl AgentLoop {
                     }
                 };
 
-                let result = registry.execute(&name, params).await;
+                let result = registry.execute(&name, params, &sandbox).await;
                 match result {
                     Ok(tool_result) => (call_id, name, Ok(tool_result)),
                     Err(e) => {

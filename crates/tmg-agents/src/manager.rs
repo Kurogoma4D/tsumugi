@@ -35,6 +35,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use tmg_llm::LlmClient;
+use tmg_sandbox::{SandboxContext, SandboxMode};
 
 use crate::builtins::{
     RunToolProvider, registry_for_agent_kind, registry_for_agent_kind_with_run_provider,
@@ -168,6 +169,37 @@ pub struct SubagentManager {
     /// disabled" so manager construction stays a single positional
     /// call until a `[harness.escalator]` section is present.
     escalator_overrides: EscalatorOverrides,
+
+    /// Parent [`SandboxContext`] from which each spawn derives its
+    /// per-subagent sandbox.
+    ///
+    /// The agent kind's [`AgentType::sandbox_mode`] picks the
+    /// [`SandboxMode`] for the derivation, while the workspace,
+    /// timeout, and OOM score are inherited from this parent. When
+    /// not configured (legacy callers / unit tests), defaults to
+    /// [`SandboxContext::test_default`] so existing tests still
+    /// build.
+    parent_sandbox: Arc<SandboxContext>,
+}
+
+/// Derive a per-subagent [`SandboxContext`] from a parent context and
+/// a sandbox mode.
+///
+/// The returned context inherits the parent's workspace, allowed
+/// domains, timeout, and OOM-score adjustment, and applies the
+/// supplied [`SandboxMode`] override. The result is **not** activated
+/// at the OS level; subagents that need OS-level enforcement should
+/// call [`SandboxContext::activate`] themselves.
+///
+/// Used by [`SubagentManager::spawn_inner`] to give each spawned
+/// subagent a sandbox matching its
+/// [`AgentType::sandbox_mode`](crate::config::AgentType::sandbox_mode):
+/// `worker` / `initializer` / `tester` get [`SandboxMode::WorkspaceWrite`],
+/// `explore` / `plan` / `qa` / `escalator` get
+/// [`SandboxMode::ReadOnly`].
+#[must_use]
+pub fn derive_sandbox(parent: &SandboxContext, mode: SandboxMode) -> SandboxContext {
+    parent.derive(mode)
 }
 
 impl SubagentManager {
@@ -194,7 +226,35 @@ impl SubagentManager {
             next_id: 1,
             run_tool_provider: None,
             escalator_overrides: EscalatorOverrides::default(),
+            parent_sandbox: Arc::new(SandboxContext::test_default()),
         }
+    }
+
+    /// Install (or replace) the parent [`SandboxContext`] used to
+    /// derive per-subagent sandboxes.
+    ///
+    /// Builder-style consuming method intended for the CLI startup
+    /// sequence. Must be called with a sandbox whose workspace and
+    /// process budgets reflect the operator's `[sandbox]`
+    /// configuration; otherwise spawned subagents fall back to the
+    /// permissive `test_default` sandbox set in [`Self::new`].
+    #[must_use]
+    pub fn with_parent_sandbox(mut self, sandbox: Arc<SandboxContext>) -> Self {
+        self.parent_sandbox = sandbox;
+        self
+    }
+
+    /// Replace the parent [`SandboxContext`] in-place. Used when the
+    /// CLI wires up the manager after construction (e.g. once the
+    /// `[sandbox]` section has been merged with run-scope overrides).
+    pub fn set_parent_sandbox(&mut self, sandbox: Arc<SandboxContext>) {
+        self.parent_sandbox = sandbox;
+    }
+
+    /// Borrow the currently-installed parent [`SandboxContext`].
+    #[must_use]
+    pub fn parent_sandbox(&self) -> &Arc<SandboxContext> {
+        &self.parent_sandbox
     }
 
     /// Install (or replace) the [`EscalatorOverrides`] used when
@@ -385,6 +445,17 @@ impl SubagentManager {
         let cancel = self.parent_cancel.child_token();
         let instances = Arc::clone(&self.instances);
         let run_tool_provider = self.run_tool_provider.clone();
+        // Derive the per-subagent sandbox up-front so the spawn
+        // closure does not need to know the precedence rules.
+        // Built-in agents pick their mode from `AgentType::sandbox_mode`;
+        // custom agents may override via `CustomAgentDef::sandbox_mode`.
+        let subagent_mode = match &agent_kind {
+            AgentKind::Builtin(t) => t.sandbox_mode(),
+            AgentKind::Custom(def) => def
+                .sandbox_mode()
+                .unwrap_or_else(|| self.parent_sandbox.mode()),
+        };
+        let subagent_sandbox = Arc::new(derive_sandbox(&self.parent_sandbox, subagent_mode));
 
         self.join_set.spawn(async move {
             // Build the subagent's tool registry. With a
@@ -398,7 +469,8 @@ impl SubagentManager {
                 }
                 None => registry_for_agent_kind(&agent_kind),
             };
-            let mut runner = SubagentRunner::new(client, registry, &agent_kind, cancel);
+            let mut runner =
+                SubagentRunner::new(client, registry, &agent_kind, cancel, subagent_sandbox);
 
             let result = runner.run(&task).await;
 

@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use tmg_sandbox::SandboxContext;
 use tmg_tools::{Tool, ToolError, ToolResult};
 use tokio::sync::Mutex;
 
@@ -48,12 +49,15 @@ impl Tool for FeatureListReadTool {
         })
     }
 
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         _params: serde_json::Value,
+        _ctx: &'a SandboxContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
     > {
+        // The sandbox parameter is currently advisory: this tool only
+        // reads the run-internal `features.json` via the runner.
         let runner = Arc::clone(&self.runner);
         Box::pin(async move {
             let features_handle = {
@@ -120,8 +124,9 @@ mod tests {
     async fn returns_full_features_json() {
         let (_tmp, runner) = make_harnessed_runner_with_features(sample_json());
         let tool = FeatureListReadTool::new(runner);
+        let ctx = SandboxContext::test_default();
         let res = tool
-            .execute(serde_json::json!({}))
+            .execute(serde_json::json!({}), &ctx)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(!res.is_error);
@@ -153,7 +158,8 @@ mod tests {
         let runner = Arc::new(Mutex::new(runner));
 
         let tool = FeatureListReadTool::new(runner);
-        let res = tool.execute(serde_json::json!({})).await;
+        let ctx = SandboxContext::test_default();
+        let res = tool.execute(serde_json::json!({}), &ctx).await;
         assert!(matches!(res, Err(ToolError::Io { .. })), "got {res:?}");
     }
 }

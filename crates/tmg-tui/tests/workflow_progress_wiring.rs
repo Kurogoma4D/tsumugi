@@ -115,8 +115,9 @@ outputs:
         (saw_workflow_section, saw_step_started, pane)
     });
 
+    let ctx = SandboxContext::test_default();
     let result = tool
-        .execute(serde_json::json!({"workflow": "simple"}))
+        .execute(serde_json::json!({"workflow": "simple"}), &ctx)
         .await
         .unwrap();
     assert!(!result.is_error, "tool reported error: {}", result.output);

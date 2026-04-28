@@ -218,6 +218,47 @@ impl SandboxContext {
     pub fn is_activated(&self) -> bool {
         self.activated
     }
+
+    /// Construct a permissive [`SandboxContext`] suitable for tests.
+    ///
+    /// The returned context uses [`SandboxMode::Full`] (no filesystem
+    /// restrictions), an empty domain allowlist, and the system temp
+    /// directory as the workspace. Path-access checks therefore always
+    /// succeed, so tests that exercise tools through the registry do
+    /// not need to thread their own [`SandboxConfig`] through every
+    /// call site.
+    ///
+    /// This helper is **only** intended for unit and integration tests;
+    /// production code paths should construct a [`SandboxContext`] from
+    /// a real [`SandboxConfig`] derived from the user's
+    /// `[sandbox]` configuration.
+    #[must_use]
+    pub fn test_default() -> Self {
+        let workspace = std::env::temp_dir();
+        let config = SandboxConfig::new(workspace).with_mode(SandboxMode::Full);
+        Self::new(config)
+    }
+
+    /// Derive a child [`SandboxContext`] from this context with the
+    /// given operating mode.
+    ///
+    /// The child inherits the parent's `workspace`, `allowed_domains`,
+    /// `timeout_secs`, and `oom_score_adj` and overrides only the
+    /// [`SandboxMode`]. The resulting context is **not** activated;
+    /// subagents that need OS-level enforcement should call
+    /// [`activate`](Self::activate) themselves.
+    ///
+    /// Used by [`SubagentManager`](https://docs.rs/tmg-agents) to
+    /// spawn each subagent under the [`SandboxMode`] declared by its
+    /// [`AgentType::sandbox_mode`](https://docs.rs/tmg-agents) (e.g.
+    /// `WorkspaceWrite` for `worker` / `initializer` / `tester`,
+    /// `ReadOnly` for `explore` / `plan` / `qa` / `escalator`).
+    #[must_use]
+    pub fn derive(&self, mode: SandboxMode) -> Self {
+        let mut config = self.config.clone();
+        config.mode = mode;
+        Self::new(config)
+    }
 }
 
 /// Normalize a path for sandbox access checks.

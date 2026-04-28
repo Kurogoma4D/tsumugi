@@ -1146,6 +1146,34 @@ impl SandboxConfigSection {
             self.oom_score_adj = other.oom_score_adj;
         }
     }
+
+    /// Build a fully-resolved [`tmg_sandbox::SandboxConfig`] for the
+    /// given `workspace`, applying defaults for fields the operator
+    /// did not explicitly configure.
+    ///
+    /// Defaults follow [`tmg_sandbox::SandboxConfig::new`]
+    /// (`WorkspaceWrite` mode, no allowed domains, 30 s timeout, 500
+    /// OOM score). Operator overrides on this struct take precedence.
+    #[must_use]
+    pub fn to_sandbox_config(
+        &self,
+        workspace: impl Into<std::path::PathBuf>,
+    ) -> tmg_sandbox::SandboxConfig {
+        let mut cfg = tmg_sandbox::SandboxConfig::new(workspace);
+        if let Some(mode) = self.mode {
+            cfg = cfg.with_mode(mode);
+        }
+        if let Some(domains) = self.allowed_domains.clone() {
+            cfg = cfg.with_allowed_domains(domains);
+        }
+        if let Some(timeout) = self.timeout_secs {
+            cfg = cfg.with_timeout(timeout);
+        }
+        if let Some(oom) = self.oom_score_adj {
+            cfg.oom_score_adj = oom;
+        }
+        cfg
+    }
 }
 
 impl TuiConfig {

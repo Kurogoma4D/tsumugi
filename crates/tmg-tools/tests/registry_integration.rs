@@ -2,11 +2,20 @@
 
 #![expect(clippy::unwrap_used, reason = "integration test assertions")]
 
+use tmg_sandbox::{SandboxConfig, SandboxContext, SandboxMode};
 use tmg_tools::{ToolRegistry, default_registry};
+
+/// Test helper that builds a permissive `Full`-mode sandbox so the
+/// existing dispatch tests (which use `/tmp/*` paths) keep working
+/// without rewriting their workspace layout.
+fn sandbox() -> SandboxContext {
+    SandboxContext::test_default()
+}
 
 #[tokio::test]
 async fn dispatch_file_write_then_read() {
     let registry = default_registry();
+    let ctx = sandbox();
 
     let dir = std::env::temp_dir().join("tmg_tools_integration_test");
     let _ = std::fs::remove_dir_all(&dir);
@@ -21,6 +30,7 @@ async fn dispatch_file_write_then_read() {
                 "path": file.to_str().unwrap(),
                 "content": "integration test content"
             }),
+            &ctx,
         )
         .await
         .unwrap();
@@ -33,6 +43,7 @@ async fn dispatch_file_write_then_read() {
         .execute(
             "file_read",
             serde_json::json!({ "path": file.to_str().unwrap() }),
+            &ctx,
         )
         .await
         .unwrap();
@@ -49,6 +60,7 @@ async fn dispatch_file_write_then_read() {
                 "old_string": "integration test",
                 "new_string": "patched"
             }),
+            &ctx,
         )
         .await
         .unwrap();
@@ -60,6 +72,7 @@ async fn dispatch_file_write_then_read() {
         .execute(
             "file_read",
             serde_json::json!({ "path": file.to_str().unwrap() }),
+            &ctx,
         )
         .await
         .unwrap();
@@ -72,6 +85,7 @@ async fn dispatch_file_write_then_read() {
 #[tokio::test]
 async fn dispatch_list_dir() {
     let registry = default_registry();
+    let ctx = sandbox();
 
     let dir = std::env::temp_dir().join("tmg_tools_integration_list");
     let _ = std::fs::remove_dir_all(&dir);
@@ -82,6 +96,7 @@ async fn dispatch_list_dir() {
         .execute(
             "list_dir",
             serde_json::json!({ "path": dir.to_str().unwrap() }),
+            &ctx,
         )
         .await
         .unwrap();
@@ -96,6 +111,7 @@ async fn dispatch_list_dir() {
 #[tokio::test]
 async fn dispatch_grep_search() {
     let registry = default_registry();
+    let ctx = sandbox();
 
     let dir = std::env::temp_dir().join("tmg_tools_integration_grep");
     let _ = std::fs::remove_dir_all(&dir);
@@ -113,6 +129,7 @@ async fn dispatch_grep_search() {
                 "pattern": "fn main",
                 "path": dir.to_str().unwrap()
             }),
+            &ctx,
         )
         .await
         .unwrap();
@@ -126,11 +143,13 @@ async fn dispatch_grep_search() {
 #[tokio::test]
 async fn dispatch_shell_exec() {
     let registry = default_registry();
+    let ctx = sandbox();
 
     let result = registry
         .execute(
             "shell_exec",
             serde_json::json!({ "command": "echo integration_test" }),
+            &ctx,
         )
         .await
         .unwrap();
@@ -142,9 +161,10 @@ async fn dispatch_shell_exec() {
 #[tokio::test]
 async fn dispatch_nonexistent_tool() {
     let registry = default_registry();
+    let ctx = sandbox();
 
     let result = registry
-        .execute("nonexistent_tool", serde_json::json!({}))
+        .execute("nonexistent_tool", serde_json::json!({}), &ctx)
         .await;
 
     assert!(result.is_err());
@@ -208,10 +228,11 @@ fn custom_tool_registration() {
             serde_json::json!({ "type": "object" })
         }
 
-        fn execute(
-            &self,
+        fn execute<'a>(
+            &'a self,
             _params: serde_json::Value,
-        ) -> Pin<Box<dyn Future<Output = Result<ToolResult, ToolError>> + Send + '_>> {
+            _ctx: &'a SandboxContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolResult, ToolError>> + Send + 'a>> {
             Box::pin(async { Ok(ToolResult::success("custom output")) })
         }
     }
@@ -221,4 +242,80 @@ fn custom_tool_registration() {
 
     assert!(registry.get("custom").is_some());
     assert_eq!(registry.get("custom").unwrap().name(), "custom");
+}
+
+/// Issue #47 acceptance: file ops MUST block writes outside the
+/// configured workspace under `WorkspaceWrite` mode. The integration
+/// test exercises the full registry dispatch path so any tool that
+/// forgot to call `ctx.check_write_access` would be caught here.
+#[tokio::test]
+async fn workspace_write_blocks_external_file_writes() {
+    let registry = default_registry();
+
+    let workspace = std::env::temp_dir().join("tmg_tools_integration_workspace_external_block");
+    let _ = std::fs::remove_dir_all(&workspace);
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let outside = std::env::temp_dir().join("tmg_tools_integration_outside.txt");
+    let _ = std::fs::remove_file(&outside);
+
+    let ctx =
+        SandboxContext::new(SandboxConfig::new(&workspace).with_mode(SandboxMode::WorkspaceWrite));
+
+    // file_write must be denied.
+    let write_result = registry
+        .execute(
+            "file_write",
+            serde_json::json!({
+                "path": outside.to_str().unwrap(),
+                "content": "should not land",
+            }),
+            &ctx,
+        )
+        .await;
+    match &write_result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("sandbox") || msg.contains("access denied"),
+                "expected sandbox/access-denied message, got `{msg}`"
+            );
+        }
+        Ok(_) => unreachable!("workspace-external file_write must be denied"),
+    }
+    assert!(!outside.exists(), "denied write must not create the file");
+
+    // Pre-populate the outside target so file_patch sees a real file
+    // to refuse — without this, the test would fail on "file not
+    // found" and we wouldn't be exercising the sandbox check.
+    std::fs::write(&outside, "original content").unwrap();
+    let patch_result = registry
+        .execute(
+            "file_patch",
+            serde_json::json!({
+                "path": outside.to_str().unwrap(),
+                "old_string": "original",
+                "new_string": "patched",
+            }),
+            &ctx,
+        )
+        .await;
+    match &patch_result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("sandbox") || msg.contains("access denied"),
+                "expected sandbox/access-denied message, got `{msg}`"
+            );
+        }
+        Ok(_) => unreachable!("workspace-external file_patch must be denied"),
+    }
+    // Confirm the file is unchanged.
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "original content",
+    );
+
+    let _ = std::fs::remove_file(&outside);
+    let _ = std::fs::remove_dir_all(&workspace);
 }

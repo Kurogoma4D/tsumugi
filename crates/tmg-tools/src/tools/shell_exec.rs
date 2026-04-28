@@ -1,15 +1,18 @@
-//! `shell_exec` tool: command execution with timeout support.
+//! `shell_exec` tool: command execution under the sandbox context.
 
 use std::fmt::Write;
-use std::time::Duration;
+
+use tmg_sandbox::{SandboxConfig, SandboxContext, SandboxError};
 
 use crate::error::ToolError;
 use crate::types::{Tool, ToolResult};
 
-/// Default timeout in seconds for shell commands.
-const DEFAULT_TIMEOUT_SECS: u64 = 30;
-
-/// Execute a shell command with timeout support.
+/// Execute a shell command under the active [`SandboxContext`].
+///
+/// All command execution flows through
+/// [`SandboxContext::run_command`], which applies the configured
+/// timeout, OOM-score adjustment, and (on Linux) network namespace
+/// restrictions in one place.
 pub struct ShellExecTool;
 
 impl Tool for ShellExecTool {
@@ -18,8 +21,9 @@ impl Tool for ShellExecTool {
     }
 
     fn description(&self) -> &'static str {
-        "Execute a shell command and return its output. The command is run via `sh -c`. \
-         A timeout can be specified (default: 30 seconds)."
+        "Execute a shell command and return its output. The command runs through the \
+         configured sandbox (timeout, OOM-score adjustment, network policy). \
+         A per-call `timeout_secs` may shorten the sandbox-wide default."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -32,7 +36,7 @@ impl Tool for ShellExecTool {
                 },
                 "timeout_secs": {
                     "type": "integer",
-                    "description": "Maximum execution time in seconds (default: 30)."
+                    "description": "Maximum execution time in seconds (default: inherited from the sandbox)."
                 }
             },
             "required": ["command"],
@@ -40,72 +44,70 @@ impl Tool for ShellExecTool {
         })
     }
 
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         params: serde_json::Value,
+        ctx: &'a SandboxContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
     > {
-        Box::pin(self.execute_inner(params))
+        Box::pin(self.execute_inner(params, ctx))
     }
 }
 
 impl ShellExecTool {
-    async fn execute_inner(&self, params: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn execute_inner(
+        &self,
+        params: serde_json::Value,
+        ctx: &SandboxContext,
+    ) -> Result<ToolResult, ToolError> {
         let Some(command) = params.get("command").and_then(serde_json::Value::as_str) else {
             return Err(ToolError::invalid_params(
                 "missing required parameter: command",
             ));
         };
 
-        let timeout_secs = params
+        // Allow the LLM to shorten the sandbox-wide default timeout
+        // for a single call, but never extend it (the sandbox owns
+        // the process-budget contract). When `timeout_secs` is set
+        // and is below the sandbox default, derive a one-shot
+        // [`SandboxContext`] with the tighter timeout; otherwise
+        // delegate to the live context unchanged.
+        let per_call_timeout = params
             .get("timeout_secs")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+            .and_then(serde_json::Value::as_u64);
 
-        let timeout = Duration::from_secs(timeout_secs);
+        let result = match per_call_timeout {
+            Some(t) if t < ctx.config().timeout_secs => {
+                // Build a derived sandbox with the shorter timeout.
+                let mut cfg: SandboxConfig = ctx.config().clone();
+                cfg.timeout_secs = t;
+                let derived = SandboxContext::new(cfg);
+                derived.run_command(command).await
+            }
+            _ => ctx.run_command(command).await,
+        };
 
-        let child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| ToolError::io("spawning shell command", e))?;
-
-        let wait_result = tokio::time::timeout(timeout, child.wait_with_output()).await;
-
-        match wait_result {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-                let exit_code = output.status.code().unwrap_or(-1);
-
+        match result {
+            Ok(output) => {
                 let mut text = String::new();
-                let _ = writeln!(text, "Exit code: {exit_code}");
+                let _ = writeln!(text, "Exit code: {}", output.exit_code);
 
-                if !stdout.is_empty() {
-                    let _ = write!(text, "\n--- stdout ---\n{stdout}");
+                if !output.stdout.is_empty() {
+                    let _ = write!(text, "\n--- stdout ---\n{}", output.stdout);
                 }
-                if !stderr.is_empty() {
-                    let _ = write!(text, "\n--- stderr ---\n{stderr}");
+                if !output.stderr.is_empty() {
+                    let _ = write!(text, "\n--- stderr ---\n{}", output.stderr);
                 }
 
-                if output.status.success() {
+                if output.success() {
                     Ok(ToolResult::success(text))
                 } else {
                     Ok(ToolResult::error(text))
                 }
             }
-            Ok(Err(e)) => Err(ToolError::io("waiting for command", e)),
-            Err(_) => {
-                // Timeout exceeded. The child process was consumed by
-                // `wait_with_output`, which handles cleanup internally.
-                Err(ToolError::Timeout {
-                    seconds: timeout_secs,
-                })
-            }
+            Err(SandboxError::Timeout { seconds }) => Err(ToolError::Timeout { seconds }),
+            Err(e) => Err(ToolError::Sandbox { source: e }),
         }
     }
 }
@@ -115,11 +117,16 @@ impl ShellExecTool {
 mod tests {
     use super::*;
 
+    fn ctx() -> SandboxContext {
+        SandboxContext::test_default()
+    }
+
     #[tokio::test]
     async fn exec_simple_command() {
         let tool = ShellExecTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({ "command": "echo hello" }))
+            .execute(serde_json::json!({ "command": "echo hello" }), &sandbox)
             .await
             .unwrap();
 
@@ -131,8 +138,9 @@ mod tests {
     #[tokio::test]
     async fn exec_failing_command() {
         let tool = ShellExecTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({ "command": "exit 1" }))
+            .execute(serde_json::json!({ "command": "exit 1" }), &sandbox)
             .await
             .unwrap();
 
@@ -143,11 +151,15 @@ mod tests {
     #[tokio::test]
     async fn exec_timeout() {
         let tool = ShellExecTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({
-                "command": "sleep 60",
-                "timeout_secs": 1
-            }))
+            .execute(
+                serde_json::json!({
+                    "command": "sleep 60",
+                    "timeout_secs": 1
+                }),
+                &sandbox,
+            )
             .await;
 
         assert!(result.is_err());
@@ -158,8 +170,9 @@ mod tests {
     #[tokio::test]
     async fn exec_stderr_output() {
         let tool = ShellExecTool;
+        let sandbox = ctx();
         let result = tool
-            .execute(serde_json::json!({ "command": "echo error >&2" }))
+            .execute(serde_json::json!({ "command": "echo error >&2" }), &sandbox)
             .await
             .unwrap();
 
@@ -171,7 +184,8 @@ mod tests {
     #[tokio::test]
     async fn exec_missing_command_param() {
         let tool = ShellExecTool;
-        let result = tool.execute(serde_json::json!({})).await;
+        let sandbox = ctx();
+        let result = tool.execute(serde_json::json!({}), &sandbox).await;
         assert!(result.is_err());
     }
 }

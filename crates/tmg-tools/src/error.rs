@@ -61,6 +61,19 @@ pub enum ToolError {
         #[source]
         source: serde_json::Error,
     },
+
+    /// A sandbox policy denied the operation.
+    ///
+    /// Returned when a tool's pre-execution check against the active
+    /// [`SandboxContext`](tmg_sandbox::SandboxContext) fails — e.g. a
+    /// workspace-external write under `WorkspaceWrite` mode, or any
+    /// write under `ReadOnly` mode.
+    #[error("sandbox denied operation: {source}")]
+    Sandbox {
+        /// The underlying sandbox error.
+        #[from]
+        source: tmg_sandbox::SandboxError,
+    },
 }
 
 impl ToolError {

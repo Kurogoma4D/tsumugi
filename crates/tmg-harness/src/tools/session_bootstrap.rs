@@ -101,12 +101,19 @@ impl Tool for SessionBootstrapTool {
         })
     }
 
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         _params: serde_json::Value,
+        _ctx: &'a SandboxContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
     > {
+        // The bootstrap shells out to `git log` via its own dedicated
+        // sandbox in `collect_init_script_status` (see below); the
+        // top-level [`SandboxContext`] is intentionally not consulted
+        // here because the bootstrap reads run-internal artefacts
+        // (`features.json`, `init.sh`, `progress.md`) that live under
+        // the workspace by construction.
         let runner = Arc::clone(&self.runner);
         Box::pin(async move {
             let payload = run_bootstrap(&runner).await?;
@@ -667,8 +674,9 @@ mod tests {
     async fn execute_returns_json_string() {
         let (_tmp, runner) = make_runner();
         let tool = SessionBootstrapTool::new(runner);
+        let ctx = SandboxContext::test_default();
         let res = tool
-            .execute(serde_json::json!({}))
+            .execute(serde_json::json!({}), &ctx)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(!res.is_error);
@@ -898,8 +906,9 @@ mod tests {
         assert!(payload.init_script_status.is_none());
         assert!(payload.smoke_test_result.is_none());
 
+        let ctx = SandboxContext::test_default();
         let res = tool
-            .execute(serde_json::json!({}))
+            .execute(serde_json::json!({}), &ctx)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         let parsed: serde_json::Value =

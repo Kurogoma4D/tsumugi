@@ -628,6 +628,21 @@ fn run_tui(
         let custom_agent_defs: Vec<tmg_agents::CustomAgentDef> =
             custom_agent_metas.iter().map(|m| m.def().clone()).collect();
 
+        // Build the parent [`SandboxContext`] from the merged
+        // `[sandbox]` configuration. This context is shared with
+        // `AgentLoop` (for top-level tool dispatch) and
+        // `SubagentManager` (which derives a per-subagent context with
+        // each agent kind's `sandbox_mode`).
+        //
+        // The workspace is the canonicalised cwd so workspace-write
+        // checks line up with where the user invoked `tmg`. We do not
+        // call `activate()` here (Linux-only Landlock + network
+        // namespace setup); software-level path checks already block
+        // workspace-external writes regardless of OS.
+        let sandbox_ctx = Arc::new(tmg_sandbox::SandboxContext::new(
+            sandbox_config.to_sandbox_config(&canonical_cwd),
+        ));
+
         // Create the subagent manager. The escalator's
         // endpoint/model/disable knobs flow through
         // [`tmg_agents::EscalatorOverrides`] so the resolver in
@@ -641,7 +656,8 @@ fn run_tui(
         );
         let subagent_manager = Arc::new(Mutex::new(
             tmg_agents::SubagentManager::new(client.clone(), cancel.clone(), endpoint, model)
-                .with_escalator_overrides(escalator_overrides),
+                .with_escalator_overrides(escalator_overrides)
+                .with_parent_sandbox(Arc::clone(&sandbox_ctx)),
         ));
 
         // Wire the active `RunRunner` into the subagent manager so
@@ -786,6 +802,10 @@ fn run_tui(
             context_config,
             tool_calling_mode,
         )?;
+        // Install the operator-configured sandbox so file / shell
+        // tools dispatched at the top level run under the same policy
+        // the subagent manager hands its children.
+        agent.set_sandbox(Arc::clone(&sandbox_ctx));
 
         // Wire the auto-promotion gate (issue #37): after every turn,
         // the harness observer records the turn metrics into

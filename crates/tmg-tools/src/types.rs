@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
+use tmg_sandbox::SandboxContext;
+
 use crate::error::{MAX_OUTPUT_LENGTH, ToolError};
 
 /// The result of a tool execution.
@@ -87,6 +89,22 @@ fn ceil_char_boundary(s: &str, index: usize) -> usize {
 ///
 /// Implementations must provide a name, description, JSON Schema for
 /// parameters, and an async `execute` method.
+///
+/// # Sandbox enforcement
+///
+/// Every `execute` call receives a borrowed [`SandboxContext`] that
+/// represents the active filesystem / process policy. Tools that
+/// touch the filesystem (read or write) MUST validate every absolute
+/// path through [`SandboxContext::check_path_access`] for reads and
+/// [`SandboxContext::check_write_access`] for writes before performing
+/// the operation; tools that spawn processes MUST go through
+/// [`SandboxContext::run_command`] rather than calling
+/// [`tokio::process::Command`] directly.
+///
+/// Stateless tools that do not interact with the filesystem (e.g.
+/// `progress_append` editing a workspace-internal file under the
+/// runner's protection) may treat the parameter as advisory but must
+/// still accept it for trait uniformity.
 pub trait Tool: Send + Sync {
     /// The unique name of this tool (e.g. `"file_read"`).
     fn name(&self) -> &'static str;
@@ -97,15 +115,17 @@ pub trait Tool: Send + Sync {
     /// JSON Schema describing the parameters this tool accepts.
     fn parameters_schema(&self) -> serde_json::Value;
 
-    /// Execute the tool with the given JSON parameters.
+    /// Execute the tool with the given JSON parameters under the
+    /// supplied [`SandboxContext`].
     ///
     /// Returns a boxed future to allow dyn-compatible trait objects in the
     /// registry. This is _not_ using the `#[async_trait]` macro; implementors
     /// can write `async fn` bodies and wrap them with [`Box::pin`].
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         params: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolResult, ToolError>> + Send + '_>>;
+        ctx: &'a SandboxContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult, ToolError>> + Send + 'a>>;
 }
 
 /// A registry of available tools, supporting lookup by name and batch schema
@@ -133,18 +153,20 @@ impl ToolRegistry {
         self.tools.get(name).map(AsRef::as_ref)
     }
 
-    /// Execute a tool by name with the given parameters.
+    /// Execute a tool by name with the given parameters under the
+    /// supplied [`SandboxContext`].
     pub async fn execute(
         &self,
         name: &str,
         params: serde_json::Value,
+        ctx: &SandboxContext,
     ) -> Result<ToolResult, ToolError> {
         let Some(tool) = self.tools.get(name) else {
             return Err(ToolError::NotFound {
                 name: name.to_owned(),
             });
         };
-        tool.execute(params).await
+        tool.execute(params, ctx).await
     }
 
     /// Return the JSON Schema definitions for all registered tools.

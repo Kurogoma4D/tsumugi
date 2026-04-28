@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use tmg_sandbox::SandboxContext;
 use tmg_tools::{Tool, ToolError, ToolResult};
 use tokio::sync::Mutex;
 
@@ -52,12 +53,16 @@ impl Tool for ProgressAppendTool {
         })
     }
 
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         params: serde_json::Value,
+        _ctx: &'a SandboxContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
     > {
+        // The sandbox parameter is currently advisory: this tool only
+        // appends to `progress.md` via the runner-owned log, which
+        // lives under the workspace by construction.
         let runner = Arc::clone(&self.runner);
         Box::pin(async move {
             let Some(entry) = params.get("entry").and_then(serde_json::Value::as_str) else {
@@ -119,8 +124,9 @@ mod tests {
     async fn append_appends_one_bullet() {
         let (_tmp, runner) = make_runner();
         let tool = ProgressAppendTool::new(Arc::clone(&runner));
+        let ctx = SandboxContext::test_default();
         let res = tool
-            .execute(serde_json::json!({ "entry": "first note" }))
+            .execute(serde_json::json!({ "entry": "first note" }), &ctx)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(!res.is_error);
@@ -134,7 +140,8 @@ mod tests {
     async fn missing_entry_param_is_error() {
         let (_tmp, runner) = make_runner();
         let tool = ProgressAppendTool::new(runner);
-        let res = tool.execute(serde_json::json!({})).await;
+        let ctx = SandboxContext::test_default();
+        let res = tool.execute(serde_json::json!({}), &ctx).await;
         assert!(matches!(res, Err(ToolError::InvalidParams { .. })));
     }
 
@@ -142,7 +149,10 @@ mod tests {
     async fn empty_entry_is_error() {
         let (_tmp, runner) = make_runner();
         let tool = ProgressAppendTool::new(runner);
-        let res = tool.execute(serde_json::json!({ "entry": "   \n" })).await;
+        let ctx = SandboxContext::test_default();
+        let res = tool
+            .execute(serde_json::json!({ "entry": "   \n" }), &ctx)
+            .await;
         assert!(matches!(res, Err(ToolError::InvalidParams { .. })));
     }
 
@@ -162,8 +172,9 @@ mod tests {
         let runner = Arc::new(Mutex::new(RunRunner::new(run, store)));
 
         let tool = ProgressAppendTool::new(runner);
+        let ctx = SandboxContext::test_default();
         let res = tool
-            .execute(serde_json::json!({ "entry": "should fail" }))
+            .execute(serde_json::json!({ "entry": "should fail" }), &ctx)
             .await;
         assert!(
             matches!(res, Err(ToolError::InvalidParams { ref message }) if message.contains("no active session")),
@@ -183,8 +194,9 @@ mod tests {
         let path = runner.lock().await.progress_log().path().to_path_buf();
         let initial = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}"));
 
+        let ctx = SandboxContext::test_default();
         for i in 0..10 {
-            tool.execute(serde_json::json!({ "entry": format!("note {i}") }))
+            tool.execute(serde_json::json!({ "entry": format!("note {i}") }), &ctx)
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
         }
