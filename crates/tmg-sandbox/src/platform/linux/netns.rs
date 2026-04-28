@@ -49,14 +49,22 @@ pub fn create_network_namespace() -> Result<(), SandboxError> {
 /// chosen to fall back gracefully. The returned [`SandboxError`] should
 /// be propagated only when strict enforcement is desired.
 ///
+/// # Cancellation safety
+///
+/// This function awaits `tokio::process::Command::output`, which is
+/// cancel-safe in the sense that dropping the future kills the spawned
+/// `ip` process. No kernel-side mutation has been observed before
+/// cancellation as long as the process is killed before it exits.
+///
 /// # Errors
 ///
 /// Returns [`SandboxError::NetworkAcl`] if `ip link set lo up` cannot be
 /// executed or exits with a non-zero status.
-pub fn bring_up_loopback() -> Result<(), SandboxError> {
-    let output = std::process::Command::new("ip")
+pub async fn bring_up_loopback() -> Result<(), SandboxError> {
+    let output = tokio::process::Command::new("ip")
         .args(["link", "set", "dev", "lo", "up"])
         .output()
+        .await
         .map_err(|e| SandboxError::NetworkAcl {
             reason: format!("failed to spawn `ip link set lo up`: {e}"),
         })?;

@@ -15,7 +15,7 @@ pub mod network_acl;
 
 pub use landlock::apply_landlock;
 pub use netns::{bring_up_loopback, create_network_namespace};
-pub use network_acl::{NetworkAcl, apply_network_acl, has_cap_net_admin};
+pub use network_acl::{NetworkAcl, has_cap_net_admin, install_iptables_chain, resolve_domains};
 
 use crate::error::SandboxError;
 

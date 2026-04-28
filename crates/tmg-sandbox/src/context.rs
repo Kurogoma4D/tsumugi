@@ -135,30 +135,37 @@ impl SandboxContext {
 
     /// Apply the network restriction phase of [`activate`](Self::activate).
     ///
-    /// Splits out so the activation path stays linear. The behavior is:
+    /// Splits out so the activation path stays linear. The order is
+    /// important and **must not be reshuffled**:
     ///
-    /// 1. Always create an empty netns (existing behavior).
-    /// 2. If `effective_allowed_domains` is empty, stop here -- the
-    ///    netns alone already blocks all outbound traffic.
-    /// 3. Otherwise, attempt to install the iptables ACL. On
-    ///    `CAP_NET_ADMIN` failure: respect `strict` to decide whether
-    ///    to error or fall back with a warning.
+    /// 1. Resolve `effective_allowed_domains` to IPs **before** the
+    ///    netns is created. Once the process is in an empty netns
+    ///    there is no veth and no default route, so DNS lookups would
+    ///    fail for every non-`/etc/hosts` domain.
+    /// 2. Create the empty netns via `unshare(CLONE_NEWNET)`. This is
+    ///    the point at which the process loses external connectivity.
+    /// 3. Bring `lo` up so locally-bound services still work.
+    /// 4. Install the iptables ACL using the IPs resolved in step 1.
+    ///
+    /// On `CAP_NET_ADMIN` failure or any error in steps 1/3/4: respect
+    /// `strict` to decide whether to error or fall back with a warning.
     async fn activate_network(&self) -> Result<(), SandboxError> {
-        platform::create_network_namespace()?;
-
         let domains = self.config.effective_allowed_domains();
+
         if domains.is_empty() {
             // No allowlist configured: the netns alone blocks
             // everything (no veth, no default route). The historical
             // behavior is preserved exactly.
+            platform::create_network_namespace()?;
             return Ok(());
         }
 
         // Capability gate: on Linux we can detect CAP_NET_ADMIN absence
         // up front and respect the operator's `strict` toggle. On
         // non-Linux platforms `has_cap_net_admin` returns `false`, but
-        // the platform `apply_network_acl` is itself a no-op, so the
-        // net effect of the strict / non-strict branches is the same.
+        // the platform `install_iptables_chain` is itself a no-op, so
+        // the net effect of the strict / non-strict branches is the
+        // same.
         if !platform::has_cap_net_admin() {
             if self.config.network_strict() {
                 return Err(SandboxError::NetworkAcl {
@@ -169,23 +176,51 @@ impl SandboxContext {
                 });
             }
             emit_capability_warning();
+            // We still want the netns isolation even when we can't
+            // install per-IP rules, because an empty netns blocks
+            // outbound by default. Fall through and create it.
+            platform::create_network_namespace()?;
             return Ok(());
         }
 
-        // Best-effort: bring loopback up so locally-bound services keep
-        // working. Failure here is not fatal in non-strict mode.
-        if let Err(e) = platform::bring_up_loopback() {
+        // Step 1: resolve domains BEFORE entering the netns. This MUST
+        // happen first because `lookup_host` cannot work inside an
+        // empty netns (no default route, no resolver reachable).
+        let resolved_ips = match platform::resolve_domains(&domains).await {
+            Ok(ips) => ips,
+            Err(e) => {
+                if self.config.network_strict() {
+                    return Err(e);
+                }
+                emit_resolve_warning(&e);
+                // Fall back to "empty netns + nothing else": still
+                // create the namespace so outbound is blocked, but
+                // skip the per-IP rules entirely.
+                platform::create_network_namespace()?;
+                return Ok(());
+            }
+        };
+
+        // Step 2: enter the empty netns. After this point the process
+        // has no external connectivity until the iptables ACCEPT rules
+        // are installed.
+        platform::create_network_namespace()?;
+
+        // Step 3: best-effort loopback bring-up. Failure here is not
+        // fatal in non-strict mode -- it only affects services that
+        // bind to 127.0.0.1.
+        if let Err(e) = platform::bring_up_loopback().await {
             if self.config.network_strict() {
                 return Err(e);
             }
             emit_loopback_warning(&e);
         }
 
-        // Install the ACL. In strict mode, propagate any error; in
-        // non-strict mode, downgrade to a warning so the agent keeps
-        // working with whatever rules made it in (the netns itself
-        // still blocks outbound by default).
-        match platform::apply_network_acl(&domains).await {
+        // Step 4: install the ACL using the pre-resolved IPs. In
+        // strict mode, propagate any error; in non-strict mode,
+        // downgrade to a warning. On error the chain is flushed so
+        // the netns is in a default-DROP state with no allow rules.
+        match platform::install_iptables_chain(&resolved_ips).await {
             Ok(_acl) => Ok(()),
             Err(e) => {
                 if self.config.network_strict() {
@@ -548,6 +583,12 @@ fn emit_loopback_warning(err: &SandboxError) {
 
 /// Emit a warning to stderr when iptables installation fails but the
 /// operator opted out of strict enforcement.
+///
+/// On the `install_iptables_chain` error path the chain is flushed
+/// (best-effort) so the netns ends up in a deterministic
+/// "drop everything" state: default OUTPUT/INPUT policy is `DROP` and
+/// no ACCEPT rules are present. That is no worse than a netns-only
+/// blocking baseline -- nothing outbound is permitted.
 #[expect(
     clippy::print_stderr,
     reason = "intentional warning when iptables ACL fails in non-strict mode"
@@ -555,7 +596,22 @@ fn emit_loopback_warning(err: &SandboxError) {
 fn emit_acl_warning(err: &SandboxError) {
     eprintln!(
         "[tmg-sandbox] WARNING: failed to install network ACL ({err}); \
-         the netns still blocks outbound traffic but no domain-specific allowlist is active"
+         the netns is in default-DROP state, so no allowlist is active and no outbound \
+         traffic is permitted"
+    );
+}
+
+/// Emit a warning to stderr when DNS resolution for the allowed
+/// domains fails entirely but the operator opted out of strict
+/// enforcement.
+#[expect(
+    clippy::print_stderr,
+    reason = "intentional warning when DNS resolution fails in non-strict mode"
+)]
+fn emit_resolve_warning(err: &SandboxError) {
+    eprintln!(
+        "[tmg-sandbox] WARNING: failed to resolve any allowed domain ({err}); \
+         falling back to an empty netns -- outbound is blocked, no allowlist is active"
     );
 }
 

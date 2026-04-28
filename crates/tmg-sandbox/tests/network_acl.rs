@@ -109,6 +109,13 @@ async fn strict_mode_without_capability_errors() {
 /// ```sh
 /// sudo -E cargo test -p tmg-sandbox --test network_acl -- --ignored
 /// ```
+///
+/// Note: `localhost` resolves to both `127.0.0.1` (A) and `::1` (AAAA)
+/// on dual-stack hosts. The ACL implementation is IPv4-only and
+/// silently filters out the v6 entry, so the smoke test stays safe on
+/// any host. IPv6 outbound is still blocked because the empty netns
+/// has no v6 default route -- see the module-level docs in
+/// `network_acl.rs` for the rationale.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires CAP_NET_ADMIN and iptables; run with --ignored under sudo"]
