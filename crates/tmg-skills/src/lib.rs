@@ -37,7 +37,7 @@ pub use discovery::{discover_skills, discover_skills_with_config};
 pub use error::SkillError;
 pub use loader::{format_skill_for_tool_result, format_skill_metadata, load_skill};
 pub use parse::parse_skill_md;
-pub use slash::{format_skills_list, parse_slash_command};
+pub use slash::{SlashParseError, SlashParseResult, format_skills_list, parse_slash_command};
 pub use tool::UseSkillTool;
 pub use types::{
     InvocationPolicy, SkillContent, SkillFrontmatter, SkillMeta, SkillName, SkillPath, SkillSource,

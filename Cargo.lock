@@ -2084,6 +2084,7 @@ dependencies = [
  "tmg-harness",
  "tmg-llm",
  "tmg-sandbox",
+ "tmg-skills",
  "tmg-tools",
  "tmg-workflow",
  "tokio",

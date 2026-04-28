@@ -85,6 +85,11 @@ pub enum WorkflowProgress {
         options: Vec<String>,
         /// Optional rendered `show:` payload.
         show: Option<String>,
+        /// Optional `revise_target` declared on the human step. The TUI
+        /// uses this to populate `HumanResponse::target` when the user
+        /// picks `revise`; without it, a `revise` choice cannot be
+        /// satisfied and the TUI surfaces an error.
+        revise_target: Option<String>,
         /// One-shot reply channel (see type docs for the
         /// take-once contract).
         response_tx: HumanResponder,

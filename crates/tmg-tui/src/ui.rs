@@ -33,10 +33,159 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_main_area(frame, app, vertical[1]);
     draw_input_area(frame, app, vertical[2]);
 
+    // Draw the transient scope-upgrade banner overlay (SPEC §7.1).
+    // Uses the chat-pane region so it sits above the conversation.
+    if let Some(banner) = app.transient_banner() {
+        draw_transient_banner(frame, banner, vertical[1]);
+    }
+
+    // Draw the human-prompt modal (SPEC §8.4) on top of everything
+    // so it dominates the screen until dismissed.
+    if let Some(prompt) = app.human_prompt() {
+        draw_human_prompt(frame, prompt, size);
+    }
+
     // Draw error overlay if present.
     if let Some(err) = app.error_message() {
         draw_error_overlay(frame, err, size);
     }
+}
+
+/// Draw the transient scope-upgrade banner at the top of the chat
+/// pane.
+fn draw_transient_banner(frame: &mut Frame, banner: &crate::TransientBanner, area: Rect) {
+    let banner_height: u16 = 3;
+    if area.height < banner_height {
+        return;
+    }
+    // Position: top edge of the supplied region (typically the main
+    // area); width spans the full pane minus a small inset so it
+    // doesn't cover the activity pane border.
+    let banner_area = Rect {
+        x: area.x + 1,
+        y: area.y,
+        width: area.width.saturating_sub(2),
+        height: banner_height,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Notice ")
+        .style(Style::default().fg(Color::Yellow));
+    let text = Paragraph::new(Span::styled(
+        format!("⚡ {}", banner.text),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ))
+    .block(block)
+    .wrap(Wrap { trim: true });
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        banner_area,
+    );
+    frame.render_widget(text, banner_area);
+}
+
+/// Draw the human-prompt modal centred on the screen.
+fn draw_human_prompt(frame: &mut Frame, prompt: &crate::HumanPrompt, area: Rect) {
+    // Centre a box that's 60% of the screen wide and at most 16 lines
+    // tall (smaller for short messages).
+    let modal_width =
+        u16::try_from((u32::from(area.width) * 60 / 100).clamp(40, 100)).unwrap_or(u16::MAX);
+    let body_lines: u16 = u16::try_from(prompt.message.lines().count()).unwrap_or(u16::MAX);
+    let show_lines: u16 = prompt
+        .show
+        .as_ref()
+        .map_or(0, |s| u16::try_from(s.lines().count()).unwrap_or(u16::MAX));
+    // `options_lines` is an upper bound — the renderer collapses every
+    // option into a single ratatui `Line` (see `lines.push(Line::from(opt_spans))`
+    // below), so the actual height contribution is 1 row regardless of
+    // option count. We keep the per-option count here as a generous
+    // upper bound for narrow terminals where wrap can cause overflow,
+    // and clamp the final value to `area.height` regardless.
+    let options_lines: u16 = u16::try_from(prompt.options.len().max(1)).unwrap_or(u16::MAX);
+    // Rendered rows (upper bound, clamped to `area.height`):
+    //   borders (2) + body + spacer-before-options (1) + options (1)
+    //   + spacer-before-footer (1) + footer (1)                = body + 6
+    //   plus, when `show` is present:
+    //       spacer-before-show (1) + show_lines                = show + 1
+    // The formula below sums those plus `options_lines` (an upper
+    // bound — see comment above) so it can over-estimate by
+    // `options_lines - 1` rows; `min(area.height)` papers over both
+    // the over- and under-estimate in practice.
+    let show_block = if show_lines > 0 { show_lines + 1 } else { 0 };
+    let modal_height = (6 + body_lines + show_block + options_lines).min(area.height);
+
+    if area.width < modal_width || area.height < modal_height {
+        return;
+    }
+
+    let modal_area = Rect {
+        x: area.x + (area.width.saturating_sub(modal_width)) / 2,
+        y: area.y + (area.height.saturating_sub(modal_height)) / 2,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    // Clear behind the modal so the underlying chat doesn't bleed through.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        modal_area,
+    );
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Human input — {} ", prompt.step_id))
+        .style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    for ml in prompt.message.lines() {
+        lines.push(Line::from(Span::styled(
+            ml.to_owned(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    if let Some(show) = &prompt.show {
+        lines.push(Line::from(""));
+        for s in show.lines() {
+            lines.push(Line::from(Span::styled(
+                s.to_owned(),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    let mut opt_spans: Vec<Span<'_>> = Vec::new();
+    for (idx, opt) in prompt.options.iter().enumerate() {
+        let focused = idx == prompt.focused;
+        let style = if focused {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        let label = if focused {
+            format!(" › {opt} ")
+        } else {
+            format!("   {opt} ")
+        };
+        opt_spans.push(Span::styled(label, style));
+    }
+    lines.push(Line::from(opt_spans));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Tab/←→: focus | Enter: confirm | a/r/v: jump | Esc: cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let p = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    frame.render_widget(p, inner);
 }
 
 /// Draw the header bar: model name, context usage, run header
