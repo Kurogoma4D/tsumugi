@@ -2012,6 +2012,7 @@ dependencies = [
  "tmg-core",
  "tmg-harness",
  "tmg-llm",
+ "tmg-memory",
  "tmg-sandbox",
  "tmg-skills",
  "tmg-tools",
@@ -2081,6 +2082,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tmg-memory"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dirs",
+ "serde",
+ "serde_json",
+ "serde_yml",
+ "tempfile",
+ "thiserror",
+ "tmg-sandbox",
+ "tmg-tools",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "tmg-sandbox"
 version = "0.1.0"
 dependencies = [
@@ -2143,6 +2161,7 @@ dependencies = [
  "tmg-core",
  "tmg-harness",
  "tmg-llm",
+ "tmg-memory",
  "tmg-sandbox",
  "tmg-skills",
  "tmg-tools",

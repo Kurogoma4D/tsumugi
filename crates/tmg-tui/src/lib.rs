@@ -32,6 +32,7 @@ use crossterm::execute;
 use tmg_agents::{CustomAgentDef, SubagentManager};
 use tmg_core::AgentLoop;
 use tmg_harness::{RunProgressReceiver, RunRunner, RunSummary};
+use tmg_memory::MemoryStore;
 use tmg_skills::SkillMeta;
 use tmg_workflow::{WorkflowMeta, WorkflowProgress};
 use tokio::sync::{Mutex, mpsc};
@@ -93,6 +94,7 @@ pub async fn run(
     workflow_progress_rx: Option<mpsc::Receiver<WorkflowProgress>>,
     workflows: Vec<WorkflowMeta>,
     skills: Vec<SkillMeta>,
+    memory_store: Option<Arc<MemoryStore>>,
 ) -> Result<(), TuiError> {
     // Pre-warm the syntect bundle off the rendering thread. Loading
     // `SyntaxSet::load_defaults_newlines` + `ThemeSet::load_defaults`
@@ -167,6 +169,10 @@ pub async fn run(
 
     if !skills.is_empty() {
         app.set_skills(skills);
+    }
+
+    if let Some(store) = memory_store {
+        app.set_memory_store(store);
     }
 
     let result = event::run_event_loop(&mut terminal, &mut app, cancel).await;

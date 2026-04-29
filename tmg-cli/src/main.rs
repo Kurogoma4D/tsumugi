@@ -14,6 +14,7 @@ mod config;
 mod error;
 mod harness_init;
 mod init_command;
+mod memory_commands;
 mod pool_setup;
 mod run_commands;
 mod workflow_commands;
@@ -104,6 +105,29 @@ enum Command {
     },
     /// Scaffold a `.tsumugi/` directory from the built-in templates.
     Init(InitArgs),
+    /// Inspect or edit the project memory store (issue #52).
+    Memory {
+        /// Sub-operation on the memory store.
+        #[command(subcommand)]
+        op: MemoryCommand,
+    },
+}
+
+/// Operations under `tmg memory`. Issue #52.
+#[derive(Subcommand, Debug)]
+enum MemoryCommand {
+    /// List entry names in the project memory store.
+    List,
+    /// Print the body of a single memory entry.
+    Show {
+        /// Topic name (file stem, without `.md`).
+        name: String,
+    },
+    /// Open the named entry in `$EDITOR` for manual editing.
+    Edit {
+        /// Topic name (file stem). Created on first save.
+        name: String,
+    },
 }
 
 /// Operations under `tmg workflow`. SPEC §8.13.
@@ -268,6 +292,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Init(args)) => {
             init_command::cmd_init(&args.workflows, &args.harness, args.all, args.force)
         }
+        Some(Command::Memory { op }) => dispatch_memory_command(op, &config),
         None => {
             if let Some(prompt) = cli.prompt {
                 run_prompt(
@@ -275,6 +300,7 @@ fn main() -> anyhow::Result<()> {
                     &config.llm.model,
                     &prompt,
                     cli.event_log.as_deref(),
+                    &config.memory,
                 )
             } else {
                 run_tui(
@@ -287,6 +313,7 @@ fn main() -> anyhow::Result<()> {
                     &config.sandbox,
                     &config.workflow,
                     &config.skills,
+                    &config.memory,
                     config.llm.subagent_pool.as_ref(),
                     None,
                 )
@@ -332,6 +359,39 @@ fn resolve_runs_dir(harness_config: &HarnessConfig) -> anyhow::Result<(PathBuf, 
         canonical_cwd.join(&harness_config.runs_dir)
     };
     Ok((runs_dir, canonical_cwd))
+}
+
+/// Dispatch one `tmg memory <op>` invocation.
+fn dispatch_memory_command(op: MemoryCommand, config: &TsumugiConfig) -> anyhow::Result<()> {
+    memory_commands::dispatch(op, config)
+}
+
+/// Read the merged `MEMORY.md` index from the configured memory dirs
+/// and render it with the prompt header [`tmg_core::prompt::MEMORY_PROMPT_HEADER`].
+///
+/// Returns an empty string when the index does not exist or both
+/// directories are absent — callers can fall through to a no-op
+/// injection without inspecting the result further.
+fn load_memory_index_for_prompt(memory_config: &config::MemoryConfig) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let canonical = cwd.canonicalize().unwrap_or(cwd);
+    let project_dir = memory_config.resolve_project_dir(&canonical);
+    let global_dir = memory_config.resolve_global_dir();
+    let store =
+        tmg_memory::MemoryStore::with_dirs(project_dir, global_dir, memory_config.to_budget());
+    let index = store.read_merged_index().ok()?;
+    let trimmed = index.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let report = store.budget_report().ok();
+    let mut out = format!("{}\n\n{}", tmg_core::prompt::MEMORY_PROMPT_HEADER, trimmed);
+    if let Some(r) = report
+        && let Some(nudge) = tmg_memory::capacity_nudge(&r, store.budget())
+    {
+        out.push_str(&nudge);
+    }
+    Some(out)
 }
 
 /// Dispatch one `tmg workflow <op>` invocation. None of these
@@ -404,6 +464,7 @@ fn dispatch_run_command(op: RunCommand, config: &TsumugiConfig) -> anyhow::Resul
                 &config.sandbox,
                 &config.workflow,
                 &config.skills,
+                &config.memory,
                 config.llm.subagent_pool.as_ref(),
                 resolved.as_ref(),
             )
@@ -462,6 +523,7 @@ fn run_prompt(
     model: &str,
     prompt: &str,
     event_log: Option<&std::path::Path>,
+    memory_config: &config::MemoryConfig,
 ) -> anyhow::Result<()> {
     use std::io::Write as _;
     use tokio_stream::StreamExt as _;
@@ -471,17 +533,37 @@ fn run_prompt(
         .transpose()
         .context("opening event log file")?;
 
+    // One-shot mode reads memory normally so the LLM has the same
+    // context block the TUI sees. Writes via the `memory` tool are
+    // not available here (no agent loop / tool dispatch in this
+    // streaming-only path), but reads through the index header still
+    // surface to the model.
+    let memory_block = if memory_config.enabled {
+        load_memory_index_for_prompt(memory_config).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let config = tmg_llm::LlmClientConfig::new(endpoint, model);
         let client = tmg_llm::LlmClient::new(config)?;
 
-        let messages = vec![tmg_llm::ChatMessage {
+        let mut messages = Vec::with_capacity(2);
+        if !memory_block.is_empty() {
+            messages.push(tmg_llm::ChatMessage {
+                role: tmg_llm::Role::System,
+                content: Some(memory_block),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+        messages.push(tmg_llm::ChatMessage {
             role: tmg_llm::Role::User,
             content: Some(prompt.to_owned()),
             tool_calls: None,
             tool_call_id: None,
-        }];
+        });
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut stream = client.chat_streaming(messages, vec![], cancel).await?;
@@ -560,6 +642,7 @@ fn run_tui(
     sandbox_config: &SandboxConfigSection,
     workflow_config: &tmg_workflow::WorkflowConfig,
     skills_config: &tmg_skills::SkillsConfig,
+    memory_config: &config::MemoryConfig,
     subagent_pool: Option<&tmg_llm::PoolConfig>,
     explicit_run_id: Option<&tmg_harness::RunId>,
 ) -> anyhow::Result<()> {
@@ -783,12 +866,27 @@ fn run_tui(
             .await
             .set_run_tool_provider(Some(Arc::clone(&run_tool_provider)));
 
-        // Create the tool registry: built-ins, then spawn_agent, then
-        // the Run-scoped harness tools. `register_run_tools` is the
-        // single authoritative place where the harnessed-vs-ad-hoc
-        // tool set is decided; the CLI does not branch on `scope()`
-        // itself so the gating logic lives in one place.
+        // Build the project memory store from `[memory]` config so the
+        // `memory` tool and the prompt injection share one source of
+        // truth. Construction is cheap (no I/O) and is always done so
+        // the index can be re-read mid-session by the slash-command
+        // path without re-parsing config.
+        let memory_store = Arc::new(tmg_memory::MemoryStore::with_dirs(
+            memory_config.resolve_project_dir(&canonical_cwd),
+            memory_config.resolve_global_dir(),
+            memory_config.to_budget(),
+        ));
+
+        // Create the tool registry: built-ins, then `memory`, then
+        // spawn_agent, then the Run-scoped harness tools.
+        // `register_run_tools` is the single authoritative place where
+        // the harnessed-vs-ad-hoc tool set is decided; the CLI does
+        // not branch on `scope()` itself so the gating logic lives in
+        // one place.
         let mut registry = tmg_tools::default_registry();
+        if memory_config.enabled {
+            registry.register(tmg_memory::MemoryTool::new(Arc::clone(&memory_store)));
+        }
         registry.register(tmg_agents::SpawnAgentTool::with_custom_agents(
             Arc::clone(&subagent_manager),
             custom_agent_defs.clone(),
@@ -920,6 +1018,35 @@ fn run_tui(
             Arc::clone(&sandbox_ctx),
         )?;
 
+        // Inject the memory index into the system prompt for this
+        // session. Reading the merged index is best-effort: an I/O
+        // error here downgrades to "no memory in prompt" so the agent
+        // still starts. The capacity nudge is appended when the store
+        // is at or above the configured caps so the agent knows to
+        // curate before adding new entries.
+        if memory_config.enabled {
+            match memory_store.read_merged_index() {
+                Ok(index) if !index.trim().is_empty() => {
+                    let report = memory_store.budget_report().ok();
+                    let mut payload = index.trim().to_owned();
+                    if let Some(r) = report
+                        && let Some(nudge) =
+                            tmg_memory::capacity_nudge(&r, memory_store.budget())
+                    {
+                        payload.push_str(&nudge);
+                    }
+                    agent.set_memory_index(Some(payload));
+                    agent.inject_memory_index_now();
+                }
+                Ok(_) => {
+                    // Index empty / absent: nothing to inject.
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to read memory index for prompt");
+                }
+            }
+        }
+
         // Wire the auto-promotion gate (issue #37): after every turn,
         // the harness observer records the turn metrics into
         // `RunRunner::session_state` so the
@@ -969,6 +1096,11 @@ fn run_tui(
             };
 
         let tui_cancel = cancel.clone();
+        let memory_store_for_tui = if memory_config.enabled {
+            Some(Arc::clone(&memory_store))
+        } else {
+            None
+        };
         let tui_result = tmg_tui::run(
             agent,
             model,
@@ -984,6 +1116,7 @@ fn run_tui(
             workflow_progress_rx,
             workflow_metas.clone(),
             skill_metas,
+            memory_store_for_tui,
         )
         .await;
 

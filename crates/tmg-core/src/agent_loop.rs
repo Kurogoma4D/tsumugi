@@ -27,7 +27,10 @@ You are tsumugi, a helpful coding assistant running locally. \
 Answer concisely and accurately. You have access to tools for \
 reading, writing, and patching files, running shell commands, \
 listing directories, and searching with grep. Use them when \
-appropriate to answer the user's requests.";
+appropriate to answer the user's requests. Before starting on a \
+task, scan the [memory] index for topics related to the request \
+and call the `memory` tool's `read` action on any that look \
+relevant; record durable lessons via `add` / `update`.";
 
 /// Maximum number of consecutive tool-call rounds before the loop is
 /// forcibly terminated. This prevents infinite loops when the model
@@ -216,6 +219,14 @@ pub struct AgentLoop {
     /// gate (SPEC §9.10). The default is `None`, so non-harness
     /// callers (e.g. one-shot CLI mode) pay nothing.
     turn_observer: Option<TurnObserver>,
+
+    /// Optional memory index injected into the prompt (issue #52).
+    ///
+    /// Stored so that [`Self::clear_history`] can re-inject the same
+    /// payload without forcing the caller to thread it back in. Set
+    /// via [`Self::set_memory_index`]; `None` means the memory layer
+    /// is disabled or the index is empty.
+    memory_index: Option<String>,
 }
 
 impl AgentLoop {
@@ -281,9 +292,14 @@ impl AgentLoop {
 
         let mut history = vec![Message::system(system_prompt)];
 
-        // Load prompt files and inject as initial messages.
+        // Load prompt files (and the memory index, if available)
+        // and inject as initial messages.
         let prompt_messages = prompt::load_prompt_files(project_root, cwd)?;
         history.extend(prompt_messages);
+        // The memory index is wired in lazily via `set_memory_index`;
+        // the initial constructor cannot read it without forcing every
+        // call site to provide a `MemoryStore`. The CLI startup path
+        // calls `set_memory_index` immediately after construction.
 
         let registry = Arc::new(registry);
         let token_counter = TokenCounter::new(client.clone());
@@ -304,7 +320,42 @@ impl AgentLoop {
             tool_calling_mode,
             sandbox,
             turn_observer: None,
+            memory_index: None,
         })
+    }
+
+    /// Install (or replace) the memory index injected into the system
+    /// prompt on every [`Self::clear_history`].
+    ///
+    /// Pass `None` to disable the injection. The caller is responsible
+    /// for refreshing this whenever the index changes (e.g. after a
+    /// `memory` tool write). To make the new value visible to the LLM
+    /// without re-reading prompt files, follow up with
+    /// [`Self::clear_history`] (which re-injects from
+    /// [`prompt::load_prompt_files_with_memory`]).
+    pub fn set_memory_index(&mut self, index: Option<String>) {
+        self.memory_index = index;
+    }
+
+    /// Inject the carried memory index as a user-role message at the
+    /// end of the current history. Idempotent only when called once
+    /// per construction; subsequent calls would duplicate the message,
+    /// so callers should prefer [`Self::clear_history`] for refresh.
+    pub fn inject_memory_index_now(&mut self) {
+        let Some(index) = self.memory_index.as_deref() else {
+            return;
+        };
+        if index.trim().is_empty() {
+            return;
+        }
+        let payload = format!("{}\n\n{index}", prompt::MEMORY_PROMPT_HEADER);
+        self.history.push(Message::user(payload));
+    }
+
+    /// Borrow the active memory index (if any).
+    #[must_use]
+    pub fn memory_index(&self) -> Option<&str> {
+        self.memory_index.as_deref()
     }
 
     /// Replace the active [`SandboxContext`].
@@ -404,7 +455,8 @@ impl AgentLoop {
     pub fn clear_history(&mut self, project_root: &Path, cwd: &Path) -> Result<(), CoreError> {
         let system_prompt = Self::build_system_prompt(self.tool_calling_mode, &self.tool_defs);
         let mut history = vec![Message::system(system_prompt)];
-        let prompt_messages = prompt::load_prompt_files(project_root, cwd)?;
+        let prompt_messages =
+            prompt::load_prompt_files_with_memory(project_root, cwd, self.memory_index.as_deref())?;
         history.extend(prompt_messages);
         self.history = history;
         Ok(())

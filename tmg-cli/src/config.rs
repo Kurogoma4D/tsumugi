@@ -552,6 +552,54 @@ fn parse_humantime_duration(field: &str, value: &str) -> Result<std::time::Durat
 
 /// Partial top-level config used for deserialization and merging.
 ///
+/// Partial memory config used for deserialization / merging. Each
+/// field is `Option` so a partial layer can override one knob without
+/// resetting the others to their defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PartialMemoryConfig {
+    pub enabled: Option<bool>,
+    pub project_dir: Option<PathBuf>,
+    pub global_dir: Option<PathBuf>,
+    pub index_max_lines: Option<usize>,
+    pub entry_max_chars: Option<usize>,
+    pub total_files_limit: Option<usize>,
+}
+
+impl PartialMemoryConfig {
+    fn merge_from(&mut self, other: &Self) {
+        if other.enabled.is_some() {
+            self.enabled = other.enabled;
+        }
+        if other.project_dir.is_some() {
+            self.project_dir.clone_from(&other.project_dir);
+        }
+        if other.global_dir.is_some() {
+            self.global_dir.clone_from(&other.global_dir);
+        }
+        if other.index_max_lines.is_some() {
+            self.index_max_lines = other.index_max_lines;
+        }
+        if other.entry_max_chars.is_some() {
+            self.entry_max_chars = other.entry_max_chars;
+        }
+        if other.total_files_limit.is_some() {
+            self.total_files_limit = other.total_files_limit;
+        }
+    }
+
+    fn into_final(self) -> MemoryConfig {
+        let defaults = MemoryConfig::default();
+        MemoryConfig {
+            enabled: self.enabled.unwrap_or(defaults.enabled),
+            project_dir: self.project_dir.unwrap_or(defaults.project_dir),
+            global_dir: self.global_dir.unwrap_or(defaults.global_dir),
+            index_max_lines: self.index_max_lines.unwrap_or(defaults.index_max_lines),
+            entry_max_chars: self.entry_max_chars.unwrap_or(defaults.entry_max_chars),
+            total_files_limit: self.total_files_limit.unwrap_or(defaults.total_files_limit),
+        }
+    }
+}
+
 /// Deserialized from TOML, merged across sources, then converted to
 /// the final [`TsumugiConfig`] via [`into_final`](Self::into_final).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -568,6 +616,8 @@ struct PartialTsumugiConfig {
     pub harness: PartialHarnessConfig,
     #[serde(default)]
     pub workflow: PartialWorkflowConfig,
+    #[serde(default)]
+    pub memory: PartialMemoryConfig,
 }
 
 impl PartialTsumugiConfig {
@@ -580,6 +630,7 @@ impl PartialTsumugiConfig {
         self.skills.merge_from(&other.skills);
         self.harness.merge_from(&other.harness);
         self.workflow.merge_from(&other.workflow);
+        self.memory.merge_from(&other.memory);
     }
 
     /// Apply environment variable overrides (`TMG_*` prefix).
@@ -863,6 +914,7 @@ impl PartialTsumugiConfig {
             skills: self.skills.into_final(),
             harness: self.harness.into_final()?,
             workflow: self.workflow.into_final()?,
+            memory: self.memory.into_final(),
         })
     }
 }
@@ -1198,6 +1250,109 @@ pub struct TsumugiConfig {
     /// Workflow runtime settings (SPEC §8 / issue #39).
     #[serde(default)]
     pub workflow: tmg_workflow::WorkflowConfig,
+
+    /// Memory layer settings (issue #52).
+    #[serde(default)]
+    pub memory: MemoryConfig,
+}
+
+/// `[memory]` section: project-scoped persistent memory configuration.
+///
+/// Mirrors [`tmg_memory::MemoryBudget`] for the capacity caps and adds
+/// the directory overrides that let operators relocate the project /
+/// global stores. An empty `global_dir` falls back to
+/// `~/.config/tsumugi/memory/` via [`dirs::config_dir`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    /// Master switch — `false` keeps the tool unregistered and skips
+    /// the prompt injection.
+    #[serde(default = "default_memory_enabled")]
+    pub enabled: bool,
+    /// Project memory directory, relative to the project root or
+    /// absolute. Defaults to `.tsumugi/memory`.
+    #[serde(default = "default_memory_project_dir")]
+    pub project_dir: PathBuf,
+    /// Global memory directory. Empty (or `""`) means "use
+    /// `~/.config/tsumugi/memory`".
+    #[serde(default)]
+    pub global_dir: PathBuf,
+    /// Maximum number of lines in `MEMORY.md`.
+    #[serde(default = "default_memory_index_max_lines")]
+    pub index_max_lines: usize,
+    /// Maximum body character count per entry.
+    #[serde(default = "default_memory_entry_max_chars")]
+    pub entry_max_chars: usize,
+    /// Maximum number of memory files (excluding the index).
+    #[serde(default = "default_memory_total_files_limit")]
+    pub total_files_limit: usize,
+}
+
+const fn default_memory_enabled() -> bool {
+    true
+}
+
+fn default_memory_project_dir() -> PathBuf {
+    PathBuf::from(".tsumugi/memory")
+}
+
+const fn default_memory_index_max_lines() -> usize {
+    200
+}
+
+const fn default_memory_entry_max_chars() -> usize {
+    600
+}
+
+const fn default_memory_total_files_limit() -> usize {
+    50
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_memory_enabled(),
+            project_dir: default_memory_project_dir(),
+            global_dir: PathBuf::new(),
+            index_max_lines: default_memory_index_max_lines(),
+            entry_max_chars: default_memory_entry_max_chars(),
+            total_files_limit: default_memory_total_files_limit(),
+        }
+    }
+}
+
+impl MemoryConfig {
+    /// Resolve `project_dir` against `project_root` (relative paths
+    /// only) and return the absolute path.
+    #[must_use]
+    pub fn resolve_project_dir(&self, project_root: &Path) -> PathBuf {
+        if self.project_dir.is_absolute() {
+            self.project_dir.clone()
+        } else {
+            project_root.join(&self.project_dir)
+        }
+    }
+
+    /// Resolve `global_dir` to a concrete path. An empty path falls
+    /// back to `~/.config/tsumugi/memory`. Returns `None` when neither
+    /// the override nor the platform config dir is available.
+    #[must_use]
+    pub fn resolve_global_dir(&self) -> Option<PathBuf> {
+        if self.global_dir.as_os_str().is_empty() {
+            dirs::config_dir().map(|d| d.join("tsumugi").join("memory"))
+        } else {
+            Some(self.global_dir.clone())
+        }
+    }
+
+    /// Build the [`tmg_memory::MemoryBudget`] from the configured caps.
+    #[must_use]
+    pub fn to_budget(&self) -> tmg_memory::MemoryBudget {
+        tmg_memory::MemoryBudget {
+            index_max_lines: self.index_max_lines,
+            entry_max_chars: self.entry_max_chars,
+            total_files_limit: self.total_files_limit,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ use tmg_agents::{AgentType, CustomAgentDef, SubagentManager, truncate_str};
 use tmg_core::{AgentLoop, CoreError, StreamSink, format_context_usage};
 use tmg_harness::{HarnessStreamSink, RunProgressEvent, RunRunner, RunSummary};
 use tmg_llm::Role;
+use tmg_memory::MemoryStore;
 use tmg_skills::{SkillMeta, SlashCommand};
 use tmg_workflow::{WorkflowMeta, WorkflowProgress};
 use tokio::sync::Mutex;
@@ -272,6 +273,12 @@ pub struct App {
     /// [`Self::dispatch_slash`] (`SlashDispatch::Async`) and
     /// drained by the event loop on the next tick.
     pending_slash: Option<SlashCommand>,
+
+    /// Optional memory store for `/memory` slash commands. Constructed
+    /// once in `tmg-cli::run_tui` and shared with the `MemoryTool` on
+    /// the registry so the TUI display path and the LLM's tool calls
+    /// see exactly the same on-disk state.
+    memory_store: Option<Arc<MemoryStore>>,
 }
 
 impl App {
@@ -316,7 +323,15 @@ impl App {
             workflows: Vec::new(),
             skills: Vec::new(),
             pending_slash: None,
+            memory_store: None,
         }
+    }
+
+    /// Install the shared memory store so the `/memory` slash commands
+    /// can render index / entries without round-tripping through the
+    /// LLM. When unset (or `None`), `/memory` reports memory disabled.
+    pub fn set_memory_store(&mut self, store: Arc<MemoryStore>) {
+        self.memory_store = Some(store);
     }
 
     /// Dequeue any pending async slash command so the event loop can
@@ -819,6 +834,12 @@ impl App {
             SlashCommand::ListWorkflows => {
                 self.show_workflows_list();
             }
+            SlashCommand::MemoryIndex => {
+                self.show_memory_index();
+            }
+            SlashCommand::MemoryShow { name } => {
+                self.show_memory_entry(&name);
+            }
             // The /run family and /<skill> need async work (harness
             // mutex, workflow tools). Defer to the event loop.
             other @ (SlashCommand::RunStart { .. }
@@ -920,6 +941,64 @@ impl App {
             role: Role::System,
             text,
         });
+    }
+
+    /// Render the merged memory index in the chat pane.
+    fn show_memory_index(&mut self) {
+        let Some(store) = self.memory_store.as_ref() else {
+            self.error_message =
+                Some("memory is disabled; enable [memory] in tsumugi.toml".to_owned());
+            return;
+        };
+        match store.read_merged_index() {
+            Ok(index) if !index.trim().is_empty() => {
+                let mut text = String::from("Memory index:\n\n");
+                text.push_str(&index);
+                self.chat_entries.push(ChatEntry {
+                    role: Role::System,
+                    text,
+                });
+            }
+            Ok(_) => {
+                self.chat_entries.push(ChatEntry {
+                    role: Role::System,
+                    text: "(memory is empty — use the `memory` tool's `add` action or \
+                          `tmg memory edit <name>`)"
+                        .to_owned(),
+                });
+            }
+            Err(e) => {
+                self.error_message = Some(format!("failed to read memory index: {e}"));
+            }
+        }
+    }
+
+    /// Render one memory entry in the chat pane.
+    fn show_memory_entry(&mut self, name: &str) {
+        let Some(store) = self.memory_store.as_ref() else {
+            self.error_message =
+                Some("memory is disabled; enable [memory] in tsumugi.toml".to_owned());
+            return;
+        };
+        match store.read(name) {
+            Ok((entry, scope)) => {
+                let mut text = format!(
+                    "[{}] {} ({}) — {}\n\n",
+                    scope.as_str(),
+                    entry.frontmatter.name,
+                    entry.frontmatter.kind,
+                    entry.frontmatter.description,
+                );
+                text.push_str(&entry.body);
+                self.chat_entries.push(ChatEntry {
+                    role: Role::System,
+                    text,
+                });
+            }
+            Err(e) => {
+                self.error_message = Some(format!("memory: {e}"));
+            }
+        }
     }
 
     /// Append a system message describing slash-command output (e.g. a
