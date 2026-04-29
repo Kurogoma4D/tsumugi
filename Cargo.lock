@@ -2087,6 +2087,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "dirs",
+ "regex",
  "serde",
  "serde_json",
  "serde_yml",

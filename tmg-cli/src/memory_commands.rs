@@ -11,6 +11,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{Context as _, anyhow};
+use tmg_core::EventLogWriter;
 use tmg_memory::MemoryStore;
 
 use crate::config::{MemoryConfig, TsumugiConfig};
@@ -35,12 +36,17 @@ fn make_store(config: &MemoryConfig) -> anyhow::Result<Arc<MemoryStore>> {
     clippy::print_stdout,
     reason = "CLI subcommand: this is the documented stdout surface"
 )]
-pub fn cmd_list(config: &TsumugiConfig) -> anyhow::Result<()> {
+pub fn cmd_list(config: &TsumugiConfig, event_log: Option<&Path>) -> anyhow::Result<()> {
     if !config.memory.enabled {
         return Err(anyhow!("memory is disabled in [memory].enabled"));
     }
     let store = make_store(&config.memory)?;
     let names = store.list_project().context("listing project memory")?;
+    write_memory_event(
+        event_log,
+        "memory_list",
+        &format!("{} entries", names.len()),
+    );
     if names.is_empty() {
         println!("(no memory entries yet — use `tmg memory edit <name>` or the `memory` tool)");
         return Ok(());
@@ -56,7 +62,11 @@ pub fn cmd_list(config: &TsumugiConfig) -> anyhow::Result<()> {
     clippy::print_stdout,
     reason = "CLI subcommand: this is the documented stdout surface"
 )]
-pub fn cmd_show(config: &TsumugiConfig, name: &str) -> anyhow::Result<()> {
+pub fn cmd_show(
+    config: &TsumugiConfig,
+    name: &str,
+    event_log: Option<&Path>,
+) -> anyhow::Result<()> {
     if !config.memory.enabled {
         return Err(anyhow!("memory is disabled in [memory].enabled"));
     }
@@ -64,6 +74,11 @@ pub fn cmd_show(config: &TsumugiConfig, name: &str) -> anyhow::Result<()> {
     let (entry, scope) = store
         .read(name)
         .with_context(|| format!("reading memory entry {name:?}"))?;
+    write_memory_event(
+        event_log,
+        "memory_show",
+        &format!("scope={} name={name}", scope.as_str()),
+    );
     println!(
         "[{}] {} ({}) — {}\n",
         scope.as_str(),
@@ -80,7 +95,15 @@ pub fn cmd_show(config: &TsumugiConfig, name: &str) -> anyhow::Result<()> {
 /// Missing entries are scaffolded with a frontmatter template so the
 /// user can complete the file in the editor; no entry is written
 /// before the editor exits successfully.
-pub fn cmd_edit(config: &TsumugiConfig, name: &str) -> anyhow::Result<()> {
+///
+/// `$EDITOR` is parsed as a shell-quoted argv (so values like
+/// `EDITOR="code --wait"` work); on parse failure we fall back to
+/// invoking the raw value as a single executable.
+pub fn cmd_edit(
+    config: &TsumugiConfig,
+    name: &str,
+    event_log: Option<&Path>,
+) -> anyhow::Result<()> {
     if !config.memory.enabled {
         return Err(anyhow!("memory is disabled in [memory].enabled"));
     }
@@ -94,11 +117,16 @@ pub fn cmd_edit(config: &TsumugiConfig, name: &str) -> anyhow::Result<()> {
     if !path.exists() {
         scaffold_entry(&path, name)?;
     }
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_owned());
-    let status = Command::new(&editor)
+    let editor_raw = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_owned());
+    let argv = split_editor_command(&editor_raw);
+    let (program, extra_args) = argv
+        .split_first()
+        .ok_or_else(|| anyhow!("EDITOR is set to an empty string"))?;
+    let status = Command::new(program)
+        .args(extra_args)
         .arg(&path)
         .status()
-        .with_context(|| format!("launching editor {editor:?}"))?;
+        .with_context(|| format!("launching editor {editor_raw:?}"))?;
     if !status.success() {
         return Err(anyhow!("editor exited with non-zero status"));
     }
@@ -110,7 +138,70 @@ pub fn cmd_edit(config: &TsumugiConfig, name: &str) -> anyhow::Result<()> {
         .with_context(|| format!("validating memory entry at {}", path.display()))?;
     // Re-sync the index row in case the description was edited.
     sync_index_row(&store, name)?;
+    write_memory_event(
+        event_log,
+        "memory_edit",
+        &format!("name={name} path={}", path.display()),
+    );
     Ok(())
+}
+
+/// Best-effort split of an `$EDITOR` value into argv. Honours simple
+/// double- and single-quoted segments so values like
+/// `EDITOR="code --wait"` parse to `["code", "--wait"]`. On any
+/// failure (e.g. unterminated quote) we fall back to the raw value as
+/// a single argv entry — which matches the previous behaviour and
+/// fails predictably if the user intended to embed flags.
+fn split_editor_command(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut chars = trimmed.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if !in_single => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if in_single || in_double {
+        // Unterminated quote: fall back to the raw value verbatim so
+        // the operator gets a clear error from `Command::status`
+        // rather than a silently mis-split argv.
+        return vec![raw.to_owned()];
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Best-effort write of a `tmg memory <op>` audit event. The event
+/// log is optional; a missing or unwritable path is silently
+/// tolerated because the CLI surfaces have their own stdout output.
+fn write_memory_event(event_log: Option<&Path>, op: &str, summary: &str) {
+    let Some(path) = event_log else {
+        return;
+    };
+    let Ok(mut writer) = EventLogWriter::open_append(path) else {
+        return;
+    };
+    writer.write_memory(op, summary);
 }
 
 /// Write a placeholder entry so the editor opens to a sensible
@@ -147,10 +238,14 @@ fn sync_index_row(store: &MemoryStore, name: &str) -> anyhow::Result<()> {
 }
 
 /// Resolve a memory subcommand and dispatch.
-pub fn dispatch(op: crate::MemoryCommand, config: &TsumugiConfig) -> anyhow::Result<()> {
+pub fn dispatch(
+    op: crate::MemoryCommand,
+    config: &TsumugiConfig,
+    event_log: Option<&Path>,
+) -> anyhow::Result<()> {
     match op {
-        crate::MemoryCommand::List => cmd_list(config),
-        crate::MemoryCommand::Show { name } => cmd_show(config, &name),
-        crate::MemoryCommand::Edit { name } => cmd_edit(config, &name),
+        crate::MemoryCommand::List => cmd_list(config, event_log),
+        crate::MemoryCommand::Show { name } => cmd_show(config, &name, event_log),
+        crate::MemoryCommand::Edit { name } => cmd_edit(config, &name, event_log),
     }
 }

@@ -12,6 +12,13 @@ pub enum MemoryError {
         reason: String,
     },
 
+    /// Memory entry description failed validation (empty, contains newline, etc.).
+    #[error("invalid memory description: {reason}")]
+    InvalidDescription {
+        /// Why it was rejected.
+        reason: String,
+    },
+
     /// A memory entry with the requested name already exists.
     #[error("memory entry already exists: {name}")]
     AlreadyExists {
@@ -80,6 +87,13 @@ impl MemoryError {
     pub fn invalid_name(name: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::InvalidName {
             name: name.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// Convenience: construct an [`Self::InvalidDescription`].
+    pub fn invalid_description(reason: impl Into<String>) -> Self {
+        Self::InvalidDescription {
             reason: reason.into(),
         }
     }

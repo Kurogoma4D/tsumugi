@@ -69,6 +69,10 @@ enum EventKind {
         estimate: usize,
         error: String,
     },
+    /// Records a `tmg memory <op>` invocation or a prompt-time memory
+    /// index injection. Issue #12 of PR #76 review.
+    #[serde(rename = "memory")]
+    Memory { op: String, summary: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +175,21 @@ impl EventLogWriter {
         let event = EventKind::PoolSelected {
             endpoint: endpoint.to_owned(),
             strategy: strategy.to_owned(),
+        };
+        self.write_event(&event);
+    }
+
+    /// Log a memory CLI / prompt-injection event (issue #52, PR #76 review).
+    ///
+    /// `op` should be a short identifier such as `"memory_list"`,
+    /// `"memory_show"`, `"memory_edit"`, or `"memory_prompt_inject"`.
+    /// `summary` is a free-form one-line description (e.g. entry name,
+    /// scope, or character count) — kept short because event logs are
+    /// JSONL streams.
+    pub fn write_memory(&mut self, op: &str, summary: &str) {
+        let event = EventKind::Memory {
+            op: op.to_owned(),
+            summary: summary.to_owned(),
         };
         self.write_event(&event);
     }

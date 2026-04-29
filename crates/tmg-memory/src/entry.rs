@@ -156,16 +156,16 @@ pub fn parse_entry(content: &str, path_hint: &str) -> Result<MemoryEntry, Memory
             source: e,
         })?;
 
-    if frontmatter.name.is_empty() {
+    if frontmatter.name.trim().is_empty() {
         return Err(MemoryError::invalid_frontmatter(
             path_hint,
-            "frontmatter `name` is empty",
+            "frontmatter `name` is empty or whitespace-only",
         ));
     }
-    if frontmatter.description.is_empty() {
+    if frontmatter.description.trim().is_empty() {
         return Err(MemoryError::invalid_frontmatter(
             path_hint,
-            "frontmatter `description` is empty",
+            "frontmatter `description` is empty or whitespace-only",
         ));
     }
 
@@ -253,6 +253,23 @@ Body text here.
     #[test]
     fn rejects_empty_required_field() {
         let content = "---\nname: \"\"\ndescription: bar\ntype: user\n---\nbody\n";
+        let err = parse_entry(content, "test").expect_err("must reject");
+        assert!(matches!(err, MemoryError::InvalidFrontmatter { .. }));
+    }
+
+    /// Regression test for issue #15: a whitespace-only name passes
+    /// YAML deserialisation but cannot be looked up later. Reject at
+    /// parse time so the entry never enters the store.
+    #[test]
+    fn rejects_whitespace_only_name() {
+        let content = "---\nname: \"   \"\ndescription: bar\ntype: user\n---\nbody\n";
+        let err = parse_entry(content, "test").expect_err("must reject");
+        assert!(matches!(err, MemoryError::InvalidFrontmatter { .. }));
+    }
+
+    #[test]
+    fn rejects_whitespace_only_description() {
+        let content = "---\nname: foo\ndescription: \"   \"\ntype: user\n---\nbody\n";
         let err = parse_entry(content, "test").expect_err("must reject");
         assert!(matches!(err, MemoryError::InvalidFrontmatter { .. }));
     }

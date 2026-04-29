@@ -19,7 +19,8 @@ pub mod status;
 pub mod tools;
 
 pub use builtins::{
-    RunToolProvider, registry_for_agent_kind, registry_for_agent_kind_with_run_provider,
+    MemoryToolProvider, RunToolProvider, registry_for_agent_kind,
+    registry_for_agent_kind_with_providers, registry_for_agent_kind_with_run_provider,
     registry_for_agent_type,
 };
 pub use config::{AgentKind, AgentType, SubagentConfig};

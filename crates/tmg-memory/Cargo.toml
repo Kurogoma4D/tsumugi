@@ -14,12 +14,18 @@ serde_yml = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-util"] }
+regex = { workspace = true }
+# `tracing` is wired into store / tool mutation paths so debugging
+# memory regressions is possible without `--event-log`. Issue #10 of
+# PR #76 review suggested either dropping `tracing` (it had been
+# unused) or wiring it; we wire it.
 tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+# Tests use `#[tokio::test]` for the async tool surface; keep tokio in
+# `dev-dependencies` only since the production code is synchronous.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true

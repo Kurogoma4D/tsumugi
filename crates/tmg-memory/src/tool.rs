@@ -17,6 +17,16 @@ use crate::store::MemoryStore;
 /// Name of the tool registered in the [`tmg_tools::ToolRegistry`].
 pub const MEMORY_TOOL_NAME: &str = "memory";
 
+/// Callback fired after every successful write (`add` / `update` /
+/// `remove`) with the freshly-rendered merged index. The agent loop
+/// installs one of these so the in-memory copy of the index stays in
+/// sync with disk and a "memory updated" hint can be surfaced in the
+/// TUI Activity Pane.
+///
+/// The closure must be `Send + Sync` so it can be moved into the
+/// async tool dispatch path.
+pub type MemoryRefreshCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Agent-facing CRUD tool over a [`MemoryStore`].
 ///
 /// All write operations target the project layer; the global layer is
@@ -24,13 +34,53 @@ pub const MEMORY_TOOL_NAME: &str = "memory";
 /// internally so the LLM cannot inject arbitrary write targets.
 pub struct MemoryTool {
     store: Arc<MemoryStore>,
+    /// Optional refresh callback fired after every successful write.
+    /// `None` means the tool runs without notifying anyone, which is
+    /// the right default for code paths that don't have an
+    /// `AgentLoop` to update (e.g. unit tests).
+    refresh: Option<MemoryRefreshCallback>,
 }
 
 impl MemoryTool {
-    /// Construct a tool around an existing store.
+    /// Construct a tool around an existing store, with no refresh
+    /// hook installed.
     #[must_use]
     pub fn new(store: Arc<MemoryStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            refresh: None,
+        }
+    }
+
+    /// Construct a tool with a refresh callback that fires after every
+    /// successful write. The callback receives the freshly-rendered
+    /// merged index payload (matching what the system prompt saw at
+    /// startup).
+    ///
+    /// Used by the CLI startup wiring to keep [`tmg_core::AgentLoop`]'s
+    /// in-memory index up to date and to emit a "memory updated"
+    /// stream event into the TUI Activity Pane (issue #4 of PR #76).
+    #[must_use]
+    pub fn with_refresh(store: Arc<MemoryStore>, refresh: MemoryRefreshCallback) -> Self {
+        Self {
+            store,
+            refresh: Some(refresh),
+        }
+    }
+
+    /// Fire the refresh callback (if any) with the latest merged
+    /// index. Best-effort: a stale read is silently ignored so a
+    /// transient I/O error never aborts a successful write.
+    fn fire_refresh(&self) {
+        let Some(cb) = self.refresh.as_ref() else {
+            return;
+        };
+        match self.store.read_merged_index() {
+            Ok(index) => cb(&index),
+            Err(e) => {
+                tracing::debug!(error = %e, "memory refresh: read_merged_index failed; skipping callback");
+            }
+        }
     }
 }
 
@@ -190,17 +240,36 @@ impl MemoryTool {
         let target_dir = self.store.project_dir();
         ctx.check_write_access(target_dir)?;
 
+        // Validate body length BEFORE the store write so an oversized
+        // entry never persists. Issue #9 of PR #76: previously the
+        // length check fired after `store.add(...)` and the entry was
+        // already on disk by the time the warning surfaced.
+        let body_chars = content.chars().count();
+        let budget = self.store.budget();
+        if body_chars > budget.entry_max_chars {
+            return Ok(ToolResult::error(format!(
+                "body is {body_chars} chars (limit {}). Trim or split the entry before adding.",
+                budget.entry_max_chars,
+            )));
+        }
+
         match self.store.add(name, kind, description, content) {
-            Ok(report) => Ok(success_with_budget(
-                format!("added memory entry {name:?} ({kind}). Index updated."),
-                &report,
-                self.store.budget(),
-                content.chars().count(),
-            )),
+            Ok(report) => {
+                self.fire_refresh();
+                Ok(success_with_budget(
+                    format!("added memory entry {name:?} ({kind}). Index updated."),
+                    &report,
+                    self.store.budget(),
+                    body_chars,
+                ))
+            }
             Err(MemoryError::AlreadyExists { .. }) => Ok(ToolResult::error(format!(
                 "memory entry {name:?} already exists; use action=update to modify it"
             ))),
             Err(MemoryError::InvalidName { reason, .. }) => Err(ToolError::invalid_params(reason)),
+            Err(MemoryError::InvalidDescription { reason }) => {
+                Err(ToolError::invalid_params(reason))
+            }
             Err(other) => Err(map_memory_error(other)),
         }
     }
@@ -214,20 +283,34 @@ impl MemoryTool {
         ctx: &SandboxContext,
     ) -> Result<ToolResult, ToolError> {
         ctx.check_write_access(self.store.project_dir())?;
+        // Same budget gate as `add`: reject before mutating disk.
+        let body_chars = content.map_or(0, |c| c.chars().count());
+        let budget = self.store.budget();
+        if let Some(_c) = content
+            && body_chars > budget.entry_max_chars
+        {
+            return Ok(ToolResult::error(format!(
+                "body is {body_chars} chars (limit {}). Trim or split the entry before updating.",
+                budget.entry_max_chars,
+            )));
+        }
         match self.store.update(name, kind, description, content) {
             Ok(report) => {
-                let chars = content.map_or(0, |c| c.chars().count());
+                self.fire_refresh();
                 Ok(success_with_budget(
                     format!("updated memory entry {name:?}."),
                     &report,
                     self.store.budget(),
-                    chars,
+                    body_chars,
                 ))
             }
             Err(MemoryError::NotFound { .. }) => Ok(ToolResult::error(format!(
                 "no project-layer memory entry named {name:?}"
             ))),
             Err(MemoryError::InvalidName { reason, .. }) => Err(ToolError::invalid_params(reason)),
+            Err(MemoryError::InvalidDescription { reason }) => {
+                Err(ToolError::invalid_params(reason))
+            }
             Err(other) => Err(map_memory_error(other)),
         }
     }
@@ -235,12 +318,15 @@ impl MemoryTool {
     fn handle_remove(&self, name: &str, ctx: &SandboxContext) -> Result<ToolResult, ToolError> {
         ctx.check_write_access(self.store.project_dir())?;
         match self.store.remove(name) {
-            Ok(report) => Ok(success_with_budget(
-                format!("removed memory entry {name:?}."),
-                &report,
-                self.store.budget(),
-                0,
-            )),
+            Ok(report) => {
+                self.fire_refresh();
+                Ok(success_with_budget(
+                    format!("removed memory entry {name:?}."),
+                    &report,
+                    self.store.budget(),
+                    0,
+                ))
+            }
             Err(MemoryError::NotFound { .. }) => Ok(ToolResult::error(format!(
                 "no project-layer memory entry named {name:?}"
             ))),
@@ -254,35 +340,47 @@ fn success_with_budget(
     base_message: String,
     report: &BudgetReport,
     budget: &crate::budget::MemoryBudget,
-    body_chars: usize,
+    _body_chars: usize,
 ) -> ToolResult {
-    use std::fmt::Write as _;
     let mut msg = base_message;
-    if body_chars > budget.entry_max_chars {
-        // Best-effort: writing into a `String` cannot fail.
-        let _ = write!(
-            msg,
-            " warning: body is {} chars (limit {}). Consider summarising.",
-            body_chars, budget.entry_max_chars,
-        );
-    }
+    // Body-length check now lives in `handle_add` / `handle_update`
+    // (before the write). Here we only surface the index/file-count
+    // capacity nudge.
     if let Some(nudge) = capacity_nudge(report, budget) {
         msg.push_str(&nudge);
     }
     ToolResult::success(msg)
 }
 
+/// Map a [`MemoryError`] to the right [`ToolError`] / [`ToolResult`]
+/// variant. Issue #8 of PR #76: lossy mapping (everything → `ToolError::Io`)
+/// produced misleading error messages and lost variant info.
+///
+/// Callers handle [`MemoryError::AlreadyExists`] and
+/// [`MemoryError::NotFound`] inline because those map to a soft
+/// `ToolResult::error` so the LLM can adapt; everything else flows
+/// through this function.
 fn map_memory_error(err: MemoryError) -> ToolError {
     match err {
         MemoryError::Io { context, source } => ToolError::Io { context, source },
-        MemoryError::Yaml { path, source } => ToolError::Io {
-            context: format!("yaml at {path}"),
-            source: std::io::Error::other(source.to_string()),
-        },
-        other => ToolError::Io {
-            context: "memory store".to_owned(),
-            source: std::io::Error::other(other.to_string()),
-        },
+        // Frontmatter / YAML / Type / Description failures are user-
+        // input errors from the LLM's perspective, not I/O failures.
+        MemoryError::InvalidFrontmatter { path, reason } => {
+            ToolError::invalid_params(format!("invalid frontmatter at {path}: {reason}"))
+        }
+        MemoryError::InvalidType { path, value } => ToolError::invalid_params(format!(
+            "invalid memory type {value:?} at {path}: must be one of user, feedback, project, reference",
+        )),
+        MemoryError::InvalidDescription { reason } => ToolError::invalid_params(reason),
+        MemoryError::Yaml { path, source } => {
+            ToolError::invalid_params(format!("yaml error at {path}: {source}"))
+        }
+        // The handlers route AlreadyExists / NotFound / InvalidName
+        // before calling here; if any reach this fallthrough it is a
+        // bug, but surface a useful message anyway.
+        other @ (MemoryError::AlreadyExists { .. }
+        | MemoryError::NotFound { .. }
+        | MemoryError::InvalidName { .. }) => ToolError::invalid_params(other.to_string()),
     }
 }
 
@@ -509,6 +607,146 @@ mod tests {
             res.output.contains("near capacity"),
             "expected capacity nudge, got: {}",
             res.output
+        );
+    }
+
+    /// Regression test for issue #4 of PR #76: after a successful
+    /// `add` / `update` / `remove`, the registered refresh callback
+    /// fires with the freshly-rendered merged index so the agent loop
+    /// can re-inject it into the system prompt.
+    #[tokio::test]
+    async fn refresh_callback_fires_after_successful_writes() {
+        use std::sync::Mutex;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = make_store(dir.path());
+        let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = Arc::clone(&received);
+        let cb: super::MemoryRefreshCallback = Arc::new(move |index: &str| {
+            received_clone.lock().expect("lock").push(index.to_owned());
+        });
+        let tool = MemoryTool::with_refresh(Arc::clone(&store), cb);
+        let ctx = SandboxContext::test_default();
+
+        // add
+        let _ = tool
+            .execute(
+                serde_json::json!({
+                    "action": "add",
+                    "name": "topic_one",
+                    "type": "project",
+                    "description": "first",
+                    "content": "body",
+                }),
+                &ctx,
+            )
+            .await
+            .expect("add");
+        // update
+        let _ = tool
+            .execute(
+                serde_json::json!({
+                    "action": "update",
+                    "name": "topic_one",
+                    "description": "renamed",
+                }),
+                &ctx,
+            )
+            .await
+            .expect("update");
+        // remove
+        let _ = tool
+            .execute(
+                serde_json::json!({
+                    "action": "remove",
+                    "name": "topic_one",
+                }),
+                &ctx,
+            )
+            .await
+            .expect("remove");
+
+        let received = received.lock().expect("lock");
+        assert_eq!(
+            received.len(),
+            3,
+            "expected 3 callback invocations (one per write), got {}: {received:?}",
+            received.len(),
+        );
+        // First snapshot: contains topic_one with "first" desc.
+        assert!(received[0].contains("topic_one"));
+        assert!(received[0].contains("first"));
+        // Second snapshot: still contains topic_one but renamed.
+        assert!(received[1].contains("topic_one"));
+        assert!(received[1].contains("renamed"));
+        // Third snapshot: topic_one removed.
+        assert!(!received[2].contains("topic_one"));
+    }
+
+    /// Regression test for issue #1 of PR #76: `add(name="MEMORY")`
+    /// must be rejected at validation time so the index file cannot
+    /// be overwritten by an entry that shares its stem.
+    #[tokio::test]
+    async fn add_with_reserved_name_is_invalid_params() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = make_store(dir.path());
+        let tool = MemoryTool::new(store);
+        let ctx = SandboxContext::test_default();
+        let err = tool
+            .execute(
+                serde_json::json!({
+                    "action": "add",
+                    "name": "MEMORY",
+                    "type": "project",
+                    "description": "should fail",
+                    "content": "body",
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("MEMORY must be rejected");
+        assert!(
+            matches!(err, ToolError::InvalidParams { .. }),
+            "expected InvalidParams, got {err:?}",
+        );
+    }
+
+    /// Regression test for issue #9 of PR #76: oversized bodies must
+    /// be rejected BEFORE the store write so the entry file never
+    /// lands on disk in an over-budget state.
+    #[tokio::test]
+    async fn oversized_body_is_rejected_before_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let small = MemoryBudget {
+            index_max_lines: 200,
+            entry_max_chars: 10,
+            total_files_limit: 50,
+        };
+        let store = Arc::new(MemoryStore::with_dirs(
+            dir.path().join(".tsumugi").join("memory"),
+            None,
+            small,
+        ));
+        let tool = MemoryTool::new(Arc::clone(&store));
+        let ctx = SandboxContext::test_default();
+        let res = tool
+            .execute(
+                serde_json::json!({
+                    "action": "add",
+                    "name": "big",
+                    "type": "project",
+                    "description": "d",
+                    "content": "this body is way over the ten-character limit",
+                }),
+                &ctx,
+            )
+            .await
+            .expect("call");
+        assert!(res.is_error, "oversized body must be a soft error result");
+        // The entry file must NOT exist on disk.
+        let entry_path = dir.path().join(".tsumugi").join("memory").join("big.md");
+        assert!(
+            !entry_path.exists(),
+            "oversized entry file should not have been written",
         );
     }
 

@@ -34,7 +34,8 @@ use tmg_llm::LlmClient;
 use tmg_sandbox::{SandboxContext, SandboxMode};
 
 use crate::builtins::{
-    RunToolProvider, registry_for_agent_kind, registry_for_agent_kind_with_run_provider,
+    MemoryToolProvider, RunToolProvider, registry_for_agent_kind,
+    registry_for_agent_kind_with_providers, registry_for_agent_kind_with_run_provider,
 };
 use crate::config::{AgentKind, AgentType, SubagentConfig};
 use crate::endpoint_resolver::{EndpointResolver, ResolvedEndpoint};
@@ -194,6 +195,13 @@ pub struct SubagentManager {
     /// behaviour for Run-less code paths.
     run_tool_provider: Option<Arc<dyn RunToolProvider>>,
 
+    /// Optional source of the agent-facing `memory` tool. When set,
+    /// every spawned subagent's registry contains `memory` so the
+    /// subagent can read and curate the project memory the same way
+    /// the top-level agent does. When unset, subagents simply do not
+    /// see the `memory` tool. Issue #3 of PR #76 review.
+    memory_tool_provider: Option<Arc<dyn MemoryToolProvider>>,
+
     /// Parent [`SandboxContext`] from which each spawn derives its
     /// per-subagent sandbox.
     ///
@@ -270,6 +278,7 @@ impl SubagentManager {
             instances: Arc::new(Mutex::new(BTreeMap::new())),
             next_id: 1,
             run_tool_provider: None,
+            memory_tool_provider: None,
             parent_sandbox,
             resolved_hook: None,
         }
@@ -358,6 +367,23 @@ impl SubagentManager {
     #[must_use]
     pub fn run_tool_provider(&self) -> Option<&Arc<dyn RunToolProvider>> {
         self.run_tool_provider.as_ref()
+    }
+
+    /// Install (or replace) the [`MemoryToolProvider`] used to register
+    /// the `memory` tool into every spawned subagent's registry.
+    ///
+    /// Pass `None` to clear a previously-installed provider (e.g. when
+    /// the user has disabled `[memory].enabled`). Subsequent spawns
+    /// will not see a `memory` tool just as if no provider had ever
+    /// been set. Issue #3 of PR #76 review.
+    pub fn set_memory_tool_provider(&mut self, provider: Option<Arc<dyn MemoryToolProvider>>) {
+        self.memory_tool_provider = provider;
+    }
+
+    /// Borrow the currently-installed [`MemoryToolProvider`], if any.
+    #[must_use]
+    pub fn memory_tool_provider(&self) -> Option<&Arc<dyn MemoryToolProvider>> {
+        self.memory_tool_provider.as_ref()
     }
 
     /// Test/inspection helper that returns the resolved
@@ -475,6 +501,7 @@ impl SubagentManager {
         let cancel = self.parent_cancel.child_token();
         let instances = Arc::clone(&self.instances);
         let run_tool_provider = self.run_tool_provider.clone();
+        let memory_tool_provider = self.memory_tool_provider.clone();
         // Derive the per-subagent sandbox up-front so the spawn
         // closure does not need to know the precedence rules.
         // Built-in agents pick their mode from `AgentType::sandbox_mode`;
@@ -492,12 +519,17 @@ impl SubagentManager {
             // `RunToolProvider` installed, harnessed agents get
             // Run-aware tools (`progress_append`, `feature_list_*`)
             // registered as well; without one, those names are
-            // silently dropped.
-            let registry = match &run_tool_provider {
-                Some(provider) => {
-                    registry_for_agent_kind_with_run_provider(&agent_kind, &**provider)
-                }
-                None => registry_for_agent_kind(&agent_kind),
+            // silently dropped. With a `MemoryToolProvider`, the
+            // `memory` tool is registered unconditionally so subagents
+            // share access to the project memory store.
+            let registry = match (&run_tool_provider, &memory_tool_provider) {
+                (None, None) => registry_for_agent_kind(&agent_kind),
+                (Some(rp), None) => registry_for_agent_kind_with_run_provider(&agent_kind, &**rp),
+                (rp, mp) => registry_for_agent_kind_with_providers(
+                    &agent_kind,
+                    rp.as_deref(),
+                    mp.as_deref(),
+                ),
             };
             let mut runner =
                 SubagentRunner::new(client, registry, &agent_kind, cancel, subagent_sandbox);

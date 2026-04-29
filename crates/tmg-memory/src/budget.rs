@@ -55,10 +55,17 @@ pub struct BudgetReport {
 
 impl BudgetReport {
     /// Compute a [`BudgetReport`] for the given measurements.
+    ///
+    /// "Near capacity" fires at 80% of either limit (rounded down):
+    /// the agent is nudged to curate before any limit is met, so the
+    /// store has room to accept the next legitimate entry. Issue #9
+    /// of PR #76 raised that the previous `>= limit` threshold fired
+    /// only after the store was already full.
     #[must_use]
     pub fn from_measurements(index_lines: usize, file_count: usize, budget: &MemoryBudget) -> Self {
-        let near_capacity =
-            index_lines >= budget.index_max_lines || file_count >= budget.total_files_limit;
+        let lines_threshold = (budget.index_max_lines * 4) / 5;
+        let files_threshold = (budget.total_files_limit * 4) / 5;
+        let near_capacity = index_lines >= lines_threshold || file_count >= files_threshold;
         Self {
             index_lines,
             file_count,
@@ -105,6 +112,7 @@ mod tests {
     #[test]
     fn report_near_capacity_lines() {
         let b = MemoryBudget::default();
+        // 200 lines: well past the 80% threshold of 160 lines.
         let r = BudgetReport::from_measurements(200, 10, &b);
         assert!(r.near_capacity());
     }
@@ -112,13 +120,33 @@ mod tests {
     #[test]
     fn report_near_capacity_files() {
         let b = MemoryBudget::default();
+        // 50 files: at the limit, well past the 80% threshold of 40.
         let r = BudgetReport::from_measurements(10, 50, &b);
         assert!(r.near_capacity());
+    }
+
+    /// Issue #9 regression: nudge fires at 80% of limit, not just at
+    /// 100%, so the agent has time to curate before being blocked.
+    #[test]
+    fn nudge_fires_at_80_percent_lines() {
+        let b = MemoryBudget::default();
+        // 80% of 200 = 160 — exactly at the threshold.
+        let r = BudgetReport::from_measurements(160, 5, &b);
+        assert!(r.near_capacity(), "nudge must fire at 80% of index lines");
+    }
+
+    #[test]
+    fn nudge_fires_at_80_percent_files() {
+        let b = MemoryBudget::default();
+        // 80% of 50 = 40 — exactly at the threshold.
+        let r = BudgetReport::from_measurements(10, 40, &b);
+        assert!(r.near_capacity(), "nudge must fire at 80% of file count");
     }
 
     #[test]
     fn report_under_budget() {
         let b = MemoryBudget::default();
+        // Well under 80% on both axes.
         let r = BudgetReport::from_measurements(10, 5, &b);
         assert!(!r.near_capacity());
         assert!(capacity_nudge(&r, &b).is_none());

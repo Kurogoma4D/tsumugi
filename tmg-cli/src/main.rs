@@ -292,7 +292,9 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Init(args)) => {
             init_command::cmd_init(&args.workflows, &args.harness, args.all, args.force)
         }
-        Some(Command::Memory { op }) => dispatch_memory_command(op, &config),
+        Some(Command::Memory { op }) => {
+            dispatch_memory_command(op, &config, cli.event_log.as_deref())
+        }
         None => {
             if let Some(prompt) = cli.prompt {
                 run_prompt(
@@ -301,6 +303,9 @@ fn main() -> anyhow::Result<()> {
                     &prompt,
                     cli.event_log.as_deref(),
                     &config.memory,
+                    &config.sandbox,
+                    context_config,
+                    config.llm.tool_calling,
                 )
             } else {
                 run_tui(
@@ -362,37 +367,19 @@ fn resolve_runs_dir(harness_config: &HarnessConfig) -> anyhow::Result<(PathBuf, 
 }
 
 /// Dispatch one `tmg memory <op>` invocation.
-fn dispatch_memory_command(op: MemoryCommand, config: &TsumugiConfig) -> anyhow::Result<()> {
-    memory_commands::dispatch(op, config)
+fn dispatch_memory_command(
+    op: MemoryCommand,
+    config: &TsumugiConfig,
+    event_log: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    memory_commands::dispatch(op, config, event_log)
 }
 
-/// Read the merged `MEMORY.md` index from the configured memory dirs
-/// and render it with the prompt header [`tmg_core::prompt::MEMORY_PROMPT_HEADER`].
-///
-/// Returns an empty string when the index does not exist or both
-/// directories are absent — callers can fall through to a no-op
-/// injection without inspecting the result further.
-fn load_memory_index_for_prompt(memory_config: &config::MemoryConfig) -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    let canonical = cwd.canonicalize().unwrap_or(cwd);
-    let project_dir = memory_config.resolve_project_dir(&canonical);
-    let global_dir = memory_config.resolve_global_dir();
-    let store =
-        tmg_memory::MemoryStore::with_dirs(project_dir, global_dir, memory_config.to_budget());
-    let index = store.read_merged_index().ok()?;
-    let trimmed = index.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let report = store.budget_report().ok();
-    let mut out = format!("{}\n\n{}", tmg_core::prompt::MEMORY_PROMPT_HEADER, trimmed);
-    if let Some(r) = report
-        && let Some(nudge) = tmg_memory::capacity_nudge(&r, store.budget())
-    {
-        out.push_str(&nudge);
-    }
-    Some(out)
-}
+// `load_memory_index_for_prompt` was the bespoke helper used by the
+// pre-AgentLoop one-shot path. Issue #2 of PR #76 review moved
+// one-shot mode through the full agent loop, which already injects
+// the index via `AgentLoop::inject_memory_index_now`, so the helper
+// is no longer needed.
 
 /// Dispatch one `tmg workflow <op>` invocation. None of these
 /// operations attach to an active TUI; they all read or run workflows
@@ -512,11 +499,13 @@ fn dispatch_run_command(op: RunCommand, config: &TsumugiConfig) -> anyhow::Resul
 
 /// Run a one-shot streaming prompt against the LLM server.
 ///
-/// This function is the integration check for issue #2: it sends a prompt
-/// to the llama-server and streams the response token-by-token to stdout.
+/// One-shot mode runs through the full [`tmg_core::AgentLoop`] (issue
+/// #2 of PR #76 review) so memory `add` / `read` and the standard
+/// file/grep tool surface are available the same way they are in the
+/// TUI. Output is streamed to stdout via a custom [`StdoutSink`].
 #[expect(
-    clippy::print_stdout,
-    reason = "integration check: intentional stdout streaming output"
+    clippy::too_many_arguments,
+    reason = "linear setup helper takes the merged config sections as discrete refs"
 )]
 fn run_prompt(
     endpoint: &str,
@@ -524,88 +513,258 @@ fn run_prompt(
     prompt: &str,
     event_log: Option<&std::path::Path>,
     memory_config: &config::MemoryConfig,
+    sandbox_config: &SandboxConfigSection,
+    context_config: tmg_core::ContextConfig,
+    tool_calling_mode: tmg_llm::ToolCallingMode,
 ) -> anyhow::Result<()> {
-    use std::io::Write as _;
-    use tokio_stream::StreamExt as _;
-
-    let mut log_writer = event_log
-        .map(tmg_core::EventLogWriter::new)
-        .transpose()
-        .context("opening event log file")?;
-
-    // One-shot mode reads memory normally so the LLM has the same
-    // context block the TUI sees. Writes via the `memory` tool are
-    // not available here (no agent loop / tool dispatch in this
-    // streaming-only path), but reads through the index header still
-    // surface to the model.
-    let memory_block = if memory_config.enabled {
-        load_memory_index_for_prompt(memory_config).unwrap_or_default()
-    } else {
-        String::new()
-    };
-
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let config = tmg_llm::LlmClientConfig::new(endpoint, model);
         let client = tmg_llm::LlmClient::new(config)?;
 
-        let mut messages = Vec::with_capacity(2);
-        if !memory_block.is_empty() {
-            messages.push(tmg_llm::ChatMessage {
-                role: tmg_llm::Role::System,
-                content: Some(memory_block),
-                tool_calls: None,
-                tool_call_id: None,
-            });
-        }
-        messages.push(tmg_llm::ChatMessage {
-            role: tmg_llm::Role::User,
-            content: Some(prompt.to_owned()),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut stream = client.chat_streaming(messages, vec![], cancel).await?;
+        let cwd = std::env::current_dir()?;
+        let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+        let project_root = canonical_cwd.clone();
 
-        while let Some(event) = stream.next().await {
-            match event? {
-                tmg_llm::StreamEvent::ThinkingDelta(token) => {
-                    if let Some(ref mut log) = log_writer {
-                        log.write_thinking(&token);
+        // Build the project memory store from the same `[memory]`
+        // config the TUI consumes, so one-shot mode and TUI agree on
+        // the index payload and the directory layout.
+        let memory_store = Arc::new(tmg_memory::MemoryStore::with_dirs(
+            memory_config.resolve_project_dir(&canonical_cwd),
+            memory_config.resolve_global_dir(),
+            memory_config.to_budget(),
+        ));
+
+        // Build the sandbox context from the operator's `[sandbox]`
+        // config. We don't `activate()` it because one-shot mode is
+        // expected to be the user's interactive integration smoke
+        // test; activating would require platform-specific privileges
+        // (Landlock, netns) that the user might not have.
+        let sandbox_ctx = Arc::new(tmg_sandbox::SandboxContext::new(
+            sandbox_config.to_sandbox_config(&canonical_cwd),
+        ));
+
+        // Build the tool registry: built-ins + (optionally) the memory
+        // tool. No subagent registration in one-shot mode because
+        // there's no Run/Workflow/Subagent context here; the goal is
+        // a self-contained tool surface that lets the model curate
+        // memory and read/write files.
+        let mut registry = tmg_tools::default_registry();
+        if memory_config.enabled {
+            registry.register(tmg_memory::MemoryTool::new(Arc::clone(&memory_store)));
+        }
+
+        let mut agent = tmg_core::AgentLoop::with_context_config(
+            client,
+            registry,
+            cancel.clone(),
+            &project_root,
+            &canonical_cwd,
+            context_config,
+            tool_calling_mode,
+            Arc::clone(&sandbox_ctx),
+        )?;
+
+        // Inject the memory index into the system prompt the same way
+        // the TUI does so the model sees the curated `MEMORY.md` rows
+        // before its first reply.
+        if memory_config.enabled {
+            match memory_store.read_merged_index() {
+                Ok(index) if !index.trim().is_empty() => {
+                    let report = memory_store.budget_report().ok();
+                    let mut payload = index.trim().to_owned();
+                    if let Some(r) = report
+                        && let Some(nudge) = tmg_memory::capacity_nudge(&r, memory_store.budget())
+                    {
+                        payload.push_str(&nudge);
                     }
-                    // Thinking tokens are not displayed in one-shot mode.
-                }
-                tmg_llm::StreamEvent::ContentDelta(text) => {
-                    if let Some(ref mut log) = log_writer {
-                        log.write_token(&text);
-                    }
-                    print!("{text}");
-                    std::io::stdout().flush()?;
-                }
-                tmg_llm::StreamEvent::ToolCallComplete(tc) => {
-                    if let Some(ref mut log) = log_writer {
-                        log.write_tool_call(&tc.function.name, &tc.function.arguments);
-                    }
-                    println!(
-                        "\n[tool_call] {}({})",
-                        tc.function.name, tc.function.arguments
+                    let summary = format!(
+                        "merged index: {} chars / {} lines",
+                        payload.len(),
+                        payload.lines().count(),
                     );
+                    agent.set_memory_index(Some(payload));
+                    agent.inject_memory_index_now();
+                    if let Some(path) = event_log
+                        && let Ok(mut writer) = tmg_core::EventLogWriter::open_append(path)
+                    {
+                        writer.write_memory("memory_prompt_inject", &summary);
+                    }
                 }
-                tmg_llm::StreamEvent::Done(reason) => {
-                    if let Some(ref mut log) = log_writer {
-                        log.write_done();
-                    }
-                    println!();
-                    if let Some(r) = reason {
-                        println!("[done: {r}]");
-                    }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to read memory index for one-shot prompt");
                 }
             }
         }
 
+        // The agent's `turn` method takes `&mut impl StreamSink` which
+        // is `Sized`, so we cannot use `Box<dyn StreamSink>` here.
+        // Branch on the event-log presence and call `turn` separately
+        // in each arm so the sink type is statically known.
+        if let Some(path) = event_log {
+            let log = tmg_core::EventLogWriter::new(path).context("opening event log file")?;
+            let mut sink = tmg_core::TeeStreamSink::new(StdoutSink::default(), log);
+            agent
+                .turn(prompt, &mut sink)
+                .await
+                .context("running one-shot agent turn")?;
+        } else {
+            let mut sink = StdoutSink::default();
+            agent
+                .turn(prompt, &mut sink)
+                .await
+                .context("running one-shot agent turn")?;
+        }
+
         Ok::<(), anyhow::Error>(())
     })
+}
+
+/// One-shot stdout sink that mirrors [`StreamEvent`] output to the
+/// terminal. Tool calls and warnings are surfaced as bracketed lines
+/// so the user can see what the agent is doing without the TUI.
+#[derive(Default)]
+struct StdoutSink {
+    /// True while the model is still emitting content tokens. Used to
+    /// add a newline before printing tool-call markers / warnings so
+    /// they don't fuse onto the same line as the streamed text.
+    streaming_text: bool,
+}
+
+impl tmg_core::agent_loop::StreamSink for StdoutSink {
+    #[expect(
+        clippy::print_stdout,
+        reason = "stdout is the contract for one-shot mode"
+    )]
+    fn on_token(&mut self, token: &str) -> Result<(), tmg_core::CoreError> {
+        use std::io::Write as _;
+        self.streaming_text = true;
+        print!("{token}");
+        let _ = std::io::stdout().flush();
+        Ok(())
+    }
+
+    #[expect(
+        clippy::print_stdout,
+        reason = "stdout is the contract for one-shot mode"
+    )]
+    fn on_done(&mut self) -> Result<(), tmg_core::CoreError> {
+        if self.streaming_text {
+            println!();
+            self.streaming_text = false;
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::print_stdout,
+        reason = "stdout is the contract for one-shot mode"
+    )]
+    fn on_tool_call(
+        &mut self,
+        _call_id: &str,
+        name: &str,
+        arguments: &str,
+    ) -> Result<(), tmg_core::CoreError> {
+        if self.streaming_text {
+            println!();
+            self.streaming_text = false;
+        }
+        println!("[tool_call] {name}({arguments})");
+        Ok(())
+    }
+
+    #[expect(
+        clippy::print_stdout,
+        reason = "stdout is the contract for one-shot mode"
+    )]
+    fn on_tool_result(
+        &mut self,
+        _call_id: &str,
+        name: &str,
+        output: &str,
+        is_error: bool,
+    ) -> Result<(), tmg_core::CoreError> {
+        let tag = if is_error {
+            "tool_error"
+        } else {
+            "tool_result"
+        };
+        // Truncate noisy tool output to one line so the terminal stays
+        // readable; the full payload is in the event log when one is
+        // configured.
+        let preview: String = output.chars().take(160).collect();
+        let suffix = if output.len() > preview.len() {
+            "…"
+        } else {
+            ""
+        };
+        println!("[{tag}] {name}: {preview}{suffix}");
+        Ok(())
+    }
+
+    #[expect(
+        clippy::print_stdout,
+        reason = "stdout is the contract for one-shot mode"
+    )]
+    fn on_warning(&mut self, message: &str) -> Result<(), tmg_core::CoreError> {
+        if self.streaming_text {
+            println!();
+            self.streaming_text = false;
+        }
+        println!("[warning] {message}");
+        Ok(())
+    }
+}
+
+/// Concrete [`tmg_agents::MemoryToolProvider`] used by the CLI to
+/// register a memory tool into every spawned subagent's registry.
+/// Issue #3 of PR #76 review: previously the memory tool was wired
+/// only into the top-level agent's registry, so subagents could not
+/// curate the project memory.
+///
+/// Each invocation constructs a fresh [`tmg_memory::MemoryTool`] that
+/// shares the parent's [`MemoryStore`] via `Arc` and the same
+/// pending-swap slot. When a subagent successfully writes through
+/// `memory`, the parent agent loop's next `turn` picks up the new
+/// snapshot just as if the parent had performed the write itself.
+struct CliMemoryToolProvider {
+    store: Arc<tmg_memory::MemoryStore>,
+    pending: Option<Arc<std::sync::Mutex<Option<String>>>>,
+}
+
+impl tmg_agents::MemoryToolProvider for CliMemoryToolProvider {
+    fn register_memory_tool(&self, registry: &mut tmg_tools::ToolRegistry) {
+        if let Some(slot) = self.pending.clone() {
+            let store_for_cb = Arc::clone(&self.store);
+            let cb: tmg_memory::tool::MemoryRefreshCallback = Arc::new(move |_index: &str| {
+                let snapshot = match store_for_cb.read_merged_index() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "subagent memory refresh: read_merged_index failed",
+                        );
+                        return;
+                    }
+                };
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Some(snapshot);
+                }
+            });
+            registry.register(tmg_memory::MemoryTool::with_refresh(
+                Arc::clone(&self.store),
+                cb,
+            ));
+        } else {
+            // No shared slot configured (memory was disabled for the
+            // top-level loop); register without a refresh hook so
+            // the subagent still has read access.
+            registry.register(tmg_memory::MemoryTool::new(Arc::clone(&self.store)));
+        }
+    }
 }
 
 /// Run the TUI-based interactive session.
@@ -877,6 +1036,32 @@ fn run_tui(
             memory_config.to_budget(),
         ));
 
+        // Shared pending-swap slot bridging the `memory` tool's
+        // refresh callback (which fires from the JoinSet task that
+        // dispatched the tool call) and the agent loop (which drains
+        // the slot at the top of every `turn`). When memory is
+        // disabled, we keep the option `None` so the agent loop's
+        // `set_pending_memory_index(None)` keeps the cost zero.
+        let pending_memory_index: Option<Arc<std::sync::Mutex<Option<String>>>> =
+            memory_config
+                .enabled
+                .then(|| Arc::new(std::sync::Mutex::new(None)));
+
+        // When memory is enabled, wire a [`MemoryToolProvider`] into
+        // the subagent manager so every spawned subagent's registry
+        // contains the `memory` tool. Issue #3 of PR #76 review.
+        if memory_config.enabled {
+            let provider: Arc<dyn tmg_agents::MemoryToolProvider> =
+                Arc::new(CliMemoryToolProvider {
+                    store: Arc::clone(&memory_store),
+                    pending: pending_memory_index.clone(),
+                });
+            subagent_manager
+                .lock()
+                .await
+                .set_memory_tool_provider(Some(provider));
+        }
+
         // Create the tool registry: built-ins, then `memory`, then
         // spawn_agent, then the Run-scoped harness tools.
         // `register_run_tools` is the single authoritative place where
@@ -885,7 +1070,42 @@ fn run_tui(
         // one place.
         let mut registry = tmg_tools::default_registry();
         if memory_config.enabled {
-            registry.register(tmg_memory::MemoryTool::new(Arc::clone(&memory_store)));
+            // Top-level agent gets a `MemoryTool` carrying a refresh
+            // callback that re-reads the merged index after every
+            // successful write and parks the snapshot in the shared
+            // pending-swap slot. The agent loop drains the slot at
+            // the top of its next `turn` so the LLM observes the
+            // post-mutation state. Issue #4 of PR #76 review.
+            let store_for_cb = Arc::clone(&memory_store);
+            let pending_for_cb = pending_memory_index.clone();
+            let cb: tmg_memory::tool::MemoryRefreshCallback =
+                Arc::new(move |_index: &str| {
+                    let Some(slot) = pending_for_cb.as_ref() else {
+                        return;
+                    };
+                    let snapshot = match store_for_cb.read_merged_index() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                "memory refresh: read_merged_index failed",
+                            );
+                            return;
+                        }
+                    };
+                    match slot.lock() {
+                        Ok(mut guard) => {
+                            *guard = Some(snapshot);
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "memory refresh: pending slot poisoned");
+                        }
+                    }
+                });
+            registry.register(tmg_memory::MemoryTool::with_refresh(
+                Arc::clone(&memory_store),
+                cb,
+            ));
         }
         registry.register(tmg_agents::SpawnAgentTool::with_custom_agents(
             Arc::clone(&subagent_manager),
@@ -1025,6 +1245,12 @@ fn run_tui(
         // is at or above the configured caps so the agent knows to
         // curate before adding new entries.
         if memory_config.enabled {
+            // Plug the shared pending-swap slot into the agent loop
+            // BEFORE the first turn, so post-write refreshes from
+            // `MemoryTool::with_refresh` are picked up automatically.
+            // Issue #4 of PR #76 review.
+            agent.set_pending_memory_index(pending_memory_index.clone());
+
             match memory_store.read_merged_index() {
                 Ok(index) if !index.trim().is_empty() => {
                     let report = memory_store.budget_report().ok();
@@ -1035,8 +1261,21 @@ fn run_tui(
                     {
                         payload.push_str(&nudge);
                     }
+                    let summary = format!(
+                        "merged index: {} chars / {} lines",
+                        payload.len(),
+                        payload.lines().count(),
+                    );
                     agent.set_memory_index(Some(payload));
                     agent.inject_memory_index_now();
+                    // Issue #12 of PR #76 review: record prompt-time
+                    // memory injection so log readers can audit what
+                    // the LLM saw at the start of the session.
+                    if let Some(path) = event_log.as_deref()
+                        && let Ok(mut writer) = tmg_core::EventLogWriter::open_append(path)
+                    {
+                        writer.write_memory("memory_prompt_inject", &summary);
+                    }
                 }
                 Ok(_) => {
                     // Index empty / absent: nothing to inject.
