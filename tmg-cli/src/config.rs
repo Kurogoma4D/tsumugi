@@ -108,6 +108,51 @@ struct PartialSkillsConfig {
     pub discovery_paths: Vec<PathBuf>,
     pub compat_claude: Option<bool>,
     pub compat_agent_skills: Option<bool>,
+    /// Issue #54: `[skills.critic]` subagent config.
+    #[serde(default)]
+    pub critic: PartialSkillCriticConfig,
+}
+
+/// Partial `[skills.critic]` config used for deserialization (issue #54).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PartialSkillCriticConfig {
+    pub enabled: Option<bool>,
+    pub endpoint: Option<String>,
+    pub model: Option<String>,
+    pub max_per_session: Option<u32>,
+    pub system_prompt_override: Option<String>,
+}
+
+impl PartialSkillCriticConfig {
+    fn merge_from(&mut self, other: &Self) {
+        if other.enabled.is_some() {
+            self.enabled = other.enabled;
+        }
+        if other.endpoint.is_some() {
+            self.endpoint.clone_from(&other.endpoint);
+        }
+        if other.model.is_some() {
+            self.model.clone_from(&other.model);
+        }
+        if other.max_per_session.is_some() {
+            self.max_per_session = other.max_per_session;
+        }
+        if other.system_prompt_override.is_some() {
+            self.system_prompt_override
+                .clone_from(&other.system_prompt_override);
+        }
+    }
+
+    fn into_final(self) -> tmg_skills::SkillCriticConfig {
+        let defaults = tmg_skills::SkillCriticConfig::default();
+        tmg_skills::SkillCriticConfig {
+            enabled: self.enabled.unwrap_or(defaults.enabled),
+            endpoint: self.endpoint.unwrap_or(defaults.endpoint),
+            model: self.model.unwrap_or(defaults.model),
+            max_per_session: self.max_per_session.unwrap_or(defaults.max_per_session),
+            system_prompt_override: self.system_prompt_override,
+        }
+    }
 }
 
 impl PartialSkillsConfig {
@@ -123,15 +168,44 @@ impl PartialSkillsConfig {
         if other.compat_agent_skills.is_some() {
             self.compat_agent_skills = other.compat_agent_skills;
         }
+        self.critic.merge_from(&other.critic);
     }
 
     /// Convert to final `SkillsConfig`, filling in defaults for unset fields.
-    fn into_final(self) -> tmg_skills::SkillsConfig {
-        tmg_skills::SkillsConfig {
-            discovery_paths: self.discovery_paths,
-            compat_claude: self.compat_claude.unwrap_or(true),
-            compat_agent_skills: self.compat_agent_skills.unwrap_or(true),
+    fn into_final(self) -> SkillsSection {
+        SkillsSection {
+            inner: tmg_skills::SkillsConfig {
+                discovery_paths: self.discovery_paths,
+                compat_claude: self.compat_claude.unwrap_or(true),
+                compat_agent_skills: self.compat_agent_skills.unwrap_or(true),
+            },
+            critic: self.critic.into_final(),
         }
+    }
+}
+
+/// Final `[skills]` section: discovery config plus the `[skills.critic]`
+/// subsection (issue #54).
+///
+/// Wraps [`tmg_skills::SkillsConfig`] so existing call sites that read
+/// the discovery config don't need to change shape, while exposing the
+/// new critic config to the CLI startup wiring.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct SkillsSection {
+    /// Discovery + compat-flag config.
+    #[serde(flatten)]
+    pub inner: tmg_skills::SkillsConfig,
+    /// `[skills.critic]` autonomous-creation config.
+    #[serde(default)]
+    pub critic: tmg_skills::SkillCriticConfig,
+}
+
+impl SkillsSection {
+    /// Borrow the discovery config (for callers that previously took
+    /// `&tmg_skills::SkillsConfig`).
+    #[must_use]
+    pub fn discovery(&self) -> &tmg_skills::SkillsConfig {
+        &self.inner
     }
 }
 
@@ -1277,9 +1351,9 @@ pub struct TsumugiConfig {
     #[serde(default)]
     pub tui: TuiConfig,
 
-    /// Skill discovery settings.
+    /// Skill discovery + critic settings.
     #[serde(default)]
-    pub skills: tmg_skills::SkillsConfig,
+    pub skills: SkillsSection,
 
     /// Harness settings (run persistence and resume policy).
     #[serde(default)]
@@ -1781,8 +1855,8 @@ mod tests {
         global.merge_from(&project);
         let final_config = global.into_final().unwrap_or_else(|e| panic!("{e}"));
 
-        assert!(!final_config.skills.compat_claude);
-        assert!(final_config.skills.compat_agent_skills);
+        assert!(!final_config.skills.inner.compat_claude);
+        assert!(final_config.skills.inner.compat_agent_skills);
     }
 
     #[test]
@@ -1797,7 +1871,7 @@ mod tests {
         global.merge_from(&project);
         let final_config = global.into_final().unwrap_or_else(|e| panic!("{e}"));
 
-        assert!(final_config.skills.compat_claude);
+        assert!(final_config.skills.inner.compat_claude);
     }
 
     #[test]
@@ -1970,7 +2044,7 @@ compat_claude = false
         assert_eq!(config.sandbox.mode, Some(SandboxMode::ReadOnly));
         assert_eq!(config.sandbox.timeout_secs, Some(60));
         assert_eq!(config.tui.show_token_usage, Some(true));
-        assert!(!config.skills.compat_claude);
+        assert!(!config.skills.inner.compat_claude);
     }
 
     #[test]

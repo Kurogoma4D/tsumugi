@@ -34,7 +34,7 @@ use tmg_core::AgentLoop;
 use tmg_harness::{RunProgressReceiver, RunRunner, RunSummary};
 use tmg_memory::MemoryStore;
 use tmg_search::SearchIndex;
-use tmg_skills::SkillMeta;
+use tmg_skills::{SkillMeta, SkillsRuntime, TurnOutcomeRecorder};
 use tmg_workflow::{WorkflowMeta, WorkflowProgress};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -97,6 +97,9 @@ pub async fn run(
     skills: Vec<SkillMeta>,
     memory_store: Option<Arc<MemoryStore>>,
     search_index: Option<Arc<SearchIndex>>,
+    startup_banner: Option<String>,
+    skills_runtime: Option<Arc<Mutex<SkillsRuntime>>>,
+    skill_outcome_recorder: Option<Arc<TurnOutcomeRecorder>>,
 ) -> Result<(), TuiError> {
     // Pre-warm the syntect bundle off the rendering thread. Loading
     // `SyntaxSet::load_defaults_newlines` + `ThemeSet::load_defaults`
@@ -179,6 +182,26 @@ pub async fn run(
 
     if let Some(idx) = search_index {
         app.set_search_index(idx);
+    }
+
+    if let Some(runtime) = skills_runtime {
+        app.set_skills_runtime(runtime);
+    }
+
+    if let Some(recorder) = skill_outcome_recorder {
+        app.set_skill_outcome_recorder(recorder);
+    }
+
+    // Issue #54: surface the auto-generated-skill banner at startup
+    // when the previous session left unacknowledged `provenance: agent`
+    // skills behind. The CLI computes the banner text via
+    // `tmg_skills::pending_banner_names` + `format_banner` and threads
+    // it in here.
+    if let Some(text) = startup_banner {
+        app.set_transient_banner(TransientBanner::with_ttl(
+            text,
+            std::time::Duration::from_secs(8),
+        ));
     }
 
     let result = event::run_event_loop(&mut terminal, &mut app, cancel).await;

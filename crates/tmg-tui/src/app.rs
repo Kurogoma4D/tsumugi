@@ -10,7 +10,7 @@ use tmg_harness::{HarnessStreamSink, RunProgressEvent, RunRunner, RunSummary};
 use tmg_llm::Role;
 use tmg_memory::MemoryStore;
 use tmg_search::SearchIndex;
-use tmg_skills::{SkillMeta, SlashCommand};
+use tmg_skills::{SkillMeta, SkillsRuntime, SlashCommand, TurnOutcomeRecorder};
 use tmg_workflow::{WorkflowMeta, WorkflowProgress};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -149,6 +149,10 @@ struct TurnHandle {
     turn_cancel: CancellationToken,
     /// Join handle for the spawned task.
     _join: JoinHandle<()>,
+    /// User input that opened this turn. Stashed here so the
+    /// `Done`/`Error` drain branches can populate the
+    /// [`TurnFinishedSignal`] with it (issue #54).
+    user_input: String,
 }
 
 /// The main application state.
@@ -286,6 +290,66 @@ pub struct App {
     /// on the registry so the TUI display path and the LLM tool see the
     /// same on-disk state.
     search_index: Option<Arc<SearchIndex>>,
+
+    /// Whether `/skills disable-auto` was issued during this session
+    /// (issue #54). The harness inspects this flag through
+    /// [`Self::skill_auto_disabled`] before invoking `skill_critic`.
+    skill_auto_disabled: bool,
+
+    /// Set when `/skill capture` is requested. The harness flips it
+    /// back to `false` once the manual signal is consumed. Tracked
+    /// here so the request survives a brief gap between dispatch and
+    /// the next agent-loop turn.
+    skill_capture_requested: bool,
+
+    /// Names of skills awaiting rejection via `/skills reject <name>`
+    /// (issue #54). Drained by the harness, which deletes each skill
+    /// directory and writes a feedback memory entry.
+    skill_rejection_requests: Vec<String>,
+
+    /// Shared autonomous-skill-creation runtime (issue #54). When set,
+    /// the TUI's slash-command handler and the per-turn observer talk
+    /// to the same [`SkillsRuntime`] instance so manual capture
+    /// requests / disable-auto / rejections flow into the runtime
+    /// rather than being captured-and-dropped on App-local fields.
+    skills_runtime: Option<Arc<Mutex<SkillsRuntime>>>,
+
+    /// Per-turn outcome recorder used by the skill emergence pipeline
+    /// (issue #54). Wired into the [`HarnessStreamSink`] so every
+    /// `on_tool_result` is recorded; the per-turn observer drains this
+    /// at turn end. `None` disables the autonomous pipeline.
+    skill_outcome_recorder: Option<Arc<TurnOutcomeRecorder>>,
+
+    /// Sequential turn index used by the per-turn observer so the
+    /// skills [`tmg_skills::TurnSummary`] carries a usable
+    /// `turn_index`. Bumped after every successful or errored turn
+    /// (cancellation does not bump). Distinct from the run's
+    /// session-scoped counters.
+    skill_turn_index: usize,
+
+    /// Set when [`Self::drain_turn_messages`] observes a turn-finished
+    /// `TurnMessage` (Done or Error, but not cancellation). The event
+    /// loop drains this via [`Self::take_turn_finished`] each tick to
+    /// drive the autonomous skill pipeline. Carries the user message
+    /// associated with the turn for downstream consumers.
+    turn_finished_signal: Option<TurnFinishedSignal>,
+}
+
+/// Signal emitted on the App once per completed turn — drives the
+/// autonomous skill pipeline (issue #54). Carries enough context for
+/// the per-turn observer to construct a meaningful
+/// [`tmg_skills::TurnSummary`] and follow up with `skill_critic`.
+#[derive(Debug, Clone)]
+pub struct TurnFinishedSignal {
+    /// 0-based turn index within the session. Forwarded into
+    /// [`tmg_skills::TurnSummary::turn_index`].
+    pub turn_index: usize,
+    /// The user message that opened the just-completed turn. Used by
+    /// downstream consumers (e.g. `skill_critic` context).
+    pub user_message: String,
+    /// `true` when the turn ended with an error (used as an additional
+    /// hint into [`tmg_skills::TurnOutcomeRecorder::mark_turn_errored`]).
+    pub errored: bool,
 }
 
 impl App {
@@ -332,6 +396,78 @@ impl App {
             pending_slash: None,
             memory_store: None,
             search_index: None,
+            skill_auto_disabled: false,
+            skill_capture_requested: false,
+            skill_rejection_requests: Vec::new(),
+            skills_runtime: None,
+            skill_outcome_recorder: None,
+            skill_turn_index: 0,
+            turn_finished_signal: None,
+        }
+    }
+
+    /// Drain any pending turn-finished signal (issue #54). Returns
+    /// `Some` exactly once per completed turn so the event loop can
+    /// drive the autonomous skill pipeline (signal collector → critic
+    /// spawn → apply verdict). Cancelled turns do NOT produce a
+    /// signal — their outcome buffer is reset instead.
+    #[must_use = "the consumed turn-finished signal must be acted on or skill emergence is lost"]
+    pub fn take_turn_finished(&mut self) -> Option<TurnFinishedSignal> {
+        self.turn_finished_signal.take()
+    }
+
+    /// Whether `/skills disable-auto` was issued during this session.
+    ///
+    /// The harness consults this flag before spawning `skill_critic`;
+    /// when `true`, autonomous skill creation is suppressed for the
+    /// remainder of the session.
+    #[must_use]
+    pub fn skill_auto_disabled(&self) -> bool {
+        self.skill_auto_disabled
+    }
+
+    /// Take the pending `/skill capture` request, if any. Returns
+    /// `true` exactly once per dispatch.
+    #[must_use = "the consumed capture request must be acted on or it is lost"]
+    pub fn take_skill_capture_request(&mut self) -> bool {
+        std::mem::replace(&mut self.skill_capture_requested, false)
+    }
+
+    /// Drain pending `/skills reject <name>` requests. The harness is
+    /// expected to remove each skill directory and write a feedback
+    /// memory entry.
+    #[must_use = "the drained rejection list must be processed or the user request is lost"]
+    pub fn drain_skill_rejection_requests(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.skill_rejection_requests)
+    }
+
+    /// Forward TUI-side skill flags into the shared
+    /// [`SkillsRuntime`] (issue #54). Drains
+    /// [`Self::take_skill_capture_request`] into
+    /// [`SkillsRuntime::trigger_manual_capture`] and forwards
+    /// [`Self::skill_auto_disabled`] into
+    /// [`SkillsRuntime::disable_auto`]. Rejection requests are NOT
+    /// drained here — they are handled by the per-turn observer which
+    /// also writes a feedback memory entry — but this method is the
+    /// canonical bridge for the *runtime-only* signals.
+    ///
+    /// The CLI calls this from the event loop before each turn so the
+    /// runtime sees the user's intent before the next signal evaluation.
+    pub async fn forward_skill_flags_to_runtime(&mut self) {
+        let Some(runtime) = self.skills_runtime.clone() else {
+            return;
+        };
+        let manual = self.take_skill_capture_request();
+        let auto_disabled = self.skill_auto_disabled;
+        if !manual && !auto_disabled {
+            return;
+        }
+        let mut guard = runtime.lock().await;
+        if manual {
+            guard.trigger_manual_capture();
+        }
+        if auto_disabled && !guard.auto_disabled() {
+            guard.disable_auto();
         }
     }
 
@@ -507,6 +643,51 @@ impl App {
         self.runner = Some(runner);
     }
 
+    /// Install the shared [`SkillsRuntime`] (issue #54). The TUI's slash
+    /// commands forward `/skill capture`, `/skills disable-auto`, and
+    /// `/skills reject` into the runtime, and the per-turn observer
+    /// uses it to call `record_turn` and apply parsed critic verdicts.
+    pub fn set_skills_runtime(&mut self, runtime: Arc<Mutex<SkillsRuntime>>) {
+        self.skills_runtime = Some(runtime);
+    }
+
+    /// Borrow the shared [`SkillsRuntime`], if any.
+    #[must_use]
+    pub fn skills_runtime(&self) -> Option<&Arc<Mutex<SkillsRuntime>>> {
+        self.skills_runtime.as_ref()
+    }
+
+    /// Install the [`TurnOutcomeRecorder`] used by the skill emergence
+    /// pipeline. Wired into the [`HarnessStreamSink`] for the next
+    /// turn so `on_tool_result` populates per-call outcomes.
+    pub fn set_skill_outcome_recorder(&mut self, recorder: Arc<TurnOutcomeRecorder>) {
+        self.skill_outcome_recorder = Some(recorder);
+    }
+
+    /// Borrow the [`TurnOutcomeRecorder`], if any.
+    #[must_use]
+    pub fn skill_outcome_recorder(&self) -> Option<&Arc<TurnOutcomeRecorder>> {
+        self.skill_outcome_recorder.as_ref()
+    }
+
+    /// Return the next turn index for the skills pipeline (the value
+    /// the per-turn observer should pass to
+    /// [`tmg_skills::TurnOutcomeRecorder::take_for_turn`]). Reading
+    /// this method does NOT bump the counter; call
+    /// [`Self::bump_skill_turn_index`] after the observer has
+    /// consumed the turn.
+    #[must_use]
+    pub fn next_skill_turn_index(&self) -> usize {
+        self.skill_turn_index
+    }
+
+    /// Bump the skills turn index after a successful/errored turn so
+    /// the next observer call sees a fresh index. Cancelled turns do
+    /// not bump (they discard the outcome buffer instead).
+    pub fn bump_skill_turn_index(&mut self) {
+        self.skill_turn_index = self.skill_turn_index.saturating_add(1);
+    }
+
     /// Borrow the shared [`RunRunner`] handle, if any. The async slash
     /// dispatcher uses this to drive `tmg_harness::commands` calls.
     #[must_use]
@@ -522,6 +703,18 @@ impl App {
     /// Set the subagent manager for status display.
     pub fn set_subagent_manager(&mut self, manager: Arc<Mutex<SubagentManager>>) {
         self.subagent_manager = Some(manager);
+    }
+
+    /// Borrow the subagent manager handle, if any.
+    #[must_use]
+    pub fn subagent_manager(&self) -> Option<&Arc<Mutex<SubagentManager>>> {
+        self.subagent_manager.as_ref()
+    }
+
+    /// Borrow the memory store handle, if any.
+    #[must_use]
+    pub fn memory_store(&self) -> Option<&Arc<MemoryStore>> {
+        self.memory_store.as_ref()
     }
 
     /// Set the custom agent definitions for display in `/agents` list.
@@ -807,6 +1000,10 @@ impl App {
             rx,
             turn_cancel,
             _join: join,
+            // No user-input stash for compaction turns — the skills
+            // pipeline does not observe these (a successful compaction
+            // is not user activity worth memorialising).
+            user_input: String::new(),
         });
     }
 
@@ -856,6 +1053,41 @@ impl App {
             }
             SlashCommand::Search { query } => {
                 self.show_search_results(&query);
+            }
+            // Skill capture / reject / disable-auto (issue #54). The
+            // actual signal-collector and skill_critic spawn happen on
+            // the harness side; the TUI just records the user intent
+            // here as a system chat entry so the next agent turn can
+            // observe it. When the harness wiring lands the body of
+            // these branches will dispatch to the SignalCollector.
+            SlashCommand::SkillCapture => {
+                self.skill_capture_requested = true;
+                self.chat_entries.push(ChatEntry {
+                    role: Role::System,
+                    text: "Skill capture requested for the current turn range. The next \
+                           agent loop will run the skill_critic over the recent activity."
+                        .to_owned(),
+                });
+            }
+            SlashCommand::SkillsDisableAuto => {
+                self.skill_auto_disabled = true;
+                self.chat_entries.push(ChatEntry {
+                    role: Role::System,
+                    text: "Autonomous skill creation is disabled for this session. Use \
+                           /skill capture to opt back in for a single turn."
+                        .to_owned(),
+                });
+            }
+            SlashCommand::SkillReject { name } => {
+                self.skill_rejection_requests.push(name.as_str().to_owned());
+                self.chat_entries.push(ChatEntry {
+                    role: Role::System,
+                    text: format!(
+                        "Queued rejection for skill {:?}; the harness will delete the \
+                         skill directory and record the reason in feedback memory.",
+                        name.as_str()
+                    ),
+                });
             }
             // The /run family and /<skill> need async work (harness
             // mutex, workflow tools). Defer to the event loop.
@@ -1096,6 +1328,11 @@ impl App {
             return;
         };
 
+        // Stash a copy of the input for the autonomous-skill-pipeline
+        // hook (issue #54). The original is moved into the spawn task
+        // below; we keep this clone alongside the `TurnHandle`.
+        let stashed_user_input = user_input.clone();
+
         // Create a child token for this turn.
         let turn_cancel = parent_cancel.child_token();
 
@@ -1119,6 +1356,7 @@ impl App {
             .and_then(|path| tmg_core::EventLogWriter::open_append(path).ok());
 
         let runner = self.runner.clone();
+        let outcome_recorder = self.skill_outcome_recorder.clone();
 
         let join = tokio::spawn(async move {
             let channel_sink = ChannelStreamSink { tx: tx.clone() };
@@ -1127,10 +1365,21 @@ impl App {
             // `HarnessStreamSink` wraps them so harness session-stat
             // updates fire on every event without changing the in-flight
             // forwarding to the TUI.
+            //
+            // When the autonomous skill pipeline is active
+            // (`outcome_recorder` is `Some`), the harness sink also
+            // records per-call outcomes so the per-turn observer
+            // (driven by the run-finished branch in
+            // `App::drain_turn_messages`) can build a
+            // [`tmg_skills::TurnSummary`] with proper outcomes — issue
+            // #54.
             let result = match (event_log_writer, runner) {
                 (Some(log), Some(runner)) => {
                     let tee = tmg_core::TeeStreamSink::new(channel_sink, log);
                     let mut wrapped = HarnessStreamSink::new(tee, runner);
+                    if let Some(rec) = outcome_recorder.as_ref() {
+                        wrapped = wrapped.with_skill_outcome_recorder(Arc::clone(rec));
+                    }
                     agent.turn(&user_input, &mut wrapped).await
                 }
                 (Some(log), None) => {
@@ -1139,6 +1388,9 @@ impl App {
                 }
                 (None, Some(runner)) => {
                     let mut wrapped = HarnessStreamSink::new(channel_sink, runner);
+                    if let Some(rec) = outcome_recorder.as_ref() {
+                        wrapped = wrapped.with_skill_outcome_recorder(Arc::clone(rec));
+                    }
                     agent.turn(&user_input, &mut wrapped).await
                 }
                 (None, None) => {
@@ -1186,6 +1438,10 @@ impl App {
             rx,
             turn_cancel,
             _join: join,
+            // Stash a copy of the user input so the Done/Error drain
+            // branches can populate the autonomous-skill-pipeline's
+            // turn-finished signal (issue #54).
+            user_input: stashed_user_input,
         });
     }
 
@@ -1315,8 +1571,26 @@ impl App {
                     self.agent = Some(agent);
                     self.streaming = false;
                     self.thinking = false;
+                    // Issue #54: emit the autonomous-skill-pipeline
+                    // turn-finished signal BEFORE clearing the
+                    // `turn_handle` so we can recover the stashed
+                    // user input.
+                    let user_message = self
+                        .turn_handle
+                        .as_ref()
+                        .map(|h| h.user_input.clone())
+                        .unwrap_or_default();
                     self.turn_handle = None;
                     self.context_usage = format_context_usage(token_count, max_tokens);
+                    if !user_message.is_empty() {
+                        let idx = self.skill_turn_index;
+                        self.bump_skill_turn_index();
+                        self.turn_finished_signal = Some(TurnFinishedSignal {
+                            turn_index: idx,
+                            user_message,
+                            errored: false,
+                        });
+                    }
                     self.set_chat_scroll(0);
                     return true;
                 }
@@ -1328,6 +1602,16 @@ impl App {
                     self.agent = Some(agent);
                     self.streaming = false;
                     self.thinking = false;
+                    // Issue #54: capture the stashed user input *before*
+                    // clearing the turn handle. Cancelled turns reset
+                    // the outcome buffer instead of emitting a signal,
+                    // so the next turn's signals are not contaminated
+                    // by a half-finished cancellation.
+                    let user_message = self
+                        .turn_handle
+                        .as_ref()
+                        .map(|h| h.user_input.clone())
+                        .unwrap_or_default();
                     self.turn_handle = None;
                     self.error_message = Some(message);
                     if cancelled {
@@ -1337,6 +1621,20 @@ impl App {
                                 self.chat_entries.pop();
                             }
                         }
+                        if let Some(rec) = self.skill_outcome_recorder.as_ref() {
+                            rec.reset();
+                        }
+                    } else if !user_message.is_empty() {
+                        if let Some(rec) = self.skill_outcome_recorder.as_ref() {
+                            rec.mark_turn_errored();
+                        }
+                        let idx = self.skill_turn_index;
+                        self.bump_skill_turn_index();
+                        self.turn_finished_signal = Some(TurnFinishedSignal {
+                            turn_index: idx,
+                            user_message,
+                            errored: true,
+                        });
                     }
                     self.set_chat_scroll(0);
                     return true;

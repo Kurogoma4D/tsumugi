@@ -18,8 +18,9 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 syntect = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["signal", "sync"] }
+tokio = { workspace = true, features = ["signal", "sync", "time"] }
 tokio-util = { workspace = true }
+tracing = { workspace = true }
 thiserror = { workspace = true }
 unicode-width = { workspace = true }
 

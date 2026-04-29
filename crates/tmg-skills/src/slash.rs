@@ -28,6 +28,9 @@ pub enum SlashParseError {
     UnknownRunSubcommand(String),
     /// `/run start` requires a workflow id.
     MissingWorkflowId,
+    /// `/skill <body>` body did not match any recognised subcommand.
+    /// The carried string is the offending subcommand name.
+    UnknownSkillSubcommand(String),
 }
 
 impl std::fmt::Display for SlashParseError {
@@ -54,6 +57,9 @@ impl std::fmt::Display for SlashParseError {
                     f,
                     "/run start requires a workflow id (e.g. /run start build)"
                 )
+            }
+            Self::UnknownSkillSubcommand(rest) => {
+                write!(f, "unknown /skill subcommand: {rest:?}; expected `capture`",)
             }
         }
     }
@@ -117,7 +123,8 @@ pub fn parse_slash_command(input: &str) -> SlashParseResult {
     // skill invocation" path lives at the bottom so it never shadows
     // a typed command.
     match command {
-        "skills" => return Ok(Some(SlashCommand::ListSkills)),
+        "skills" => return Ok(Some(parse_skills_subcommand(args.as_deref()))),
+        "skill" => return parse_skill_subcommand(args.as_deref()).map(Some),
         "clear" => return Ok(Some(SlashCommand::Clear)),
         "compact" => return Ok(Some(SlashCommand::Compact)),
         "exit" | "quit" => return Ok(Some(SlashCommand::Exit)),
@@ -197,6 +204,53 @@ fn parse_run_subcommand(args: Option<&str>) -> Result<SlashCommand, SlashParseEr
     }
 }
 
+/// Parse the body of a `/skills ...` invocation.
+///
+/// `/skills` (no body) → [`SlashCommand::ListSkills`].
+/// `/skills disable-auto` → [`SlashCommand::SkillsDisableAuto`].
+/// `/skills reject <name>` → [`SlashCommand::SkillReject`].
+/// Anything else falls back to `ListSkills` (the malformed shape is
+/// printed in the body the TUI shows for the listing).
+fn parse_skills_subcommand(args: Option<&str>) -> SlashCommand {
+    let body = args.unwrap_or("").trim();
+    if body.is_empty() {
+        return SlashCommand::ListSkills;
+    }
+    let (sub, rest) = match body.split_once(char::is_whitespace) {
+        Some((s, r)) => (s, r.trim()),
+        None => (body, ""),
+    };
+    match sub {
+        "disable-auto" | "disable_auto" => SlashCommand::SkillsDisableAuto,
+        "reject" if !rest.is_empty() => SlashCommand::SkillReject {
+            name: SkillName::new(rest),
+        },
+        _ => SlashCommand::ListSkills,
+    }
+}
+
+/// Parse the body of a `/skill ...` invocation.
+///
+/// `/skill` (no body) → [`SlashCommand::ListSkills`].
+/// `/skill capture` → [`SlashCommand::SkillCapture`].
+/// Anything else returns [`SlashParseError::UnknownSkillSubcommand`]
+/// so typos like `/skill captuer` surface as an explicit error rather
+/// than silently falling back to listing.
+fn parse_skill_subcommand(args: Option<&str>) -> Result<SlashCommand, SlashParseError> {
+    let body = args.unwrap_or("").trim();
+    if body.is_empty() {
+        return Ok(SlashCommand::ListSkills);
+    }
+    let (sub, _rest) = match body.split_once(char::is_whitespace) {
+        Some((s, r)) => (s, r.trim()),
+        None => (body, ""),
+    };
+    if sub.eq_ignore_ascii_case("capture") {
+        return Ok(SlashCommand::SkillCapture);
+    }
+    Err(SlashParseError::UnknownSkillSubcommand(sub.to_owned()))
+}
+
 /// Parse the body of a `/memory ...` invocation.
 ///
 /// `/memory` (no body) → [`SlashCommand::MemoryIndex`].
@@ -222,17 +276,34 @@ fn parse_memory_subcommand(args: Option<&str>) -> SlashCommand {
 }
 
 /// Format a list of skills for display (e.g. in TUI).
+///
+/// Skills authored autonomously by the agent (`provenance: agent`) are
+/// marked with a leading `[agent]` badge so the user can see at a
+/// glance which entries were created by the `skill_critic` flow rather
+/// than by hand. This pairs with [`SlashCommand::SkillReject`], which
+/// uses the same `provenance` field to gate which skills can be
+/// rejected through the dedicated command.
 pub fn format_skills_list(skills: &[crate::types::SkillMeta]) -> String {
+    use crate::types::Provenance;
+
     if skills.is_empty() {
         return "No skills installed.".to_owned();
     }
 
     let mut output = String::from("Installed skills:\n\n");
     for skill in skills {
+        let badge = match skill.frontmatter.provenance.unwrap_or_default() {
+            Provenance::Agent => "[agent] ",
+            Provenance::User => "",
+        };
         let _ = writeln!(
             output,
-            "  /{} — {} [{}] (from {})",
-            skill.name, skill.frontmatter.description, skill.frontmatter.invocation, skill.source,
+            "  {}/{} — {} [{}] (from {})",
+            badge,
+            skill.name,
+            skill.frontmatter.description,
+            skill.frontmatter.invocation,
+            skill.source,
         );
     }
     output
@@ -251,7 +322,6 @@ impl std::fmt::Display for crate::types::InvocationPolicy {
 #[expect(
     clippy::expect_used,
     clippy::panic,
-    clippy::match_wildcard_for_single_variants,
     reason = "tests assert with expect/panic for clarity; the workspace policy denies them in production code"
 )]
 mod tests {
@@ -476,6 +546,10 @@ mod tests {
                 description: "A test skill".to_owned(),
                 invocation: InvocationPolicy::Auto,
                 allowed_tools: None,
+                version: None,
+                created_at: None,
+                updated_at: None,
+                provenance: None,
             },
             source: SkillSource::ProjectTsumugi,
             path: SkillPath::new("/fake/SKILL.md"),
@@ -486,5 +560,101 @@ mod tests {
         assert!(output.contains("A test skill"));
         assert!(output.contains("auto"));
         assert!(output.contains(".tsumugi/skills"));
+        // No agent badge on user-authored skills.
+        assert!(!output.contains("[agent]"));
+    }
+
+    #[test]
+    fn format_marks_agent_provenance() {
+        use crate::types::*;
+
+        let skills = vec![SkillMeta {
+            name: SkillName::new("auto-skill"),
+            frontmatter: SkillFrontmatter {
+                name: "auto-skill".to_owned(),
+                description: "Generated".to_owned(),
+                invocation: InvocationPolicy::Auto,
+                allowed_tools: None,
+                version: Some("0.1.0".to_owned()),
+                created_at: None,
+                updated_at: None,
+                provenance: Some(Provenance::Agent),
+            },
+            source: SkillSource::ProjectTsumugi,
+            path: SkillPath::new("/fake/SKILL.md"),
+        }];
+
+        let output = format_skills_list(&skills);
+        assert!(output.contains("[agent]"));
+        assert!(output.contains("/auto-skill"));
+    }
+
+    #[test]
+    fn parse_skill_capture() {
+        assert_eq!(
+            parse_slash_command("/skill capture").expect("ok"),
+            Some(SlashCommand::SkillCapture)
+        );
+        assert_eq!(
+            parse_slash_command("/skill CAPTURE").expect("ok"),
+            Some(SlashCommand::SkillCapture)
+        );
+        // /skill alone falls back to listing.
+        assert_eq!(
+            parse_slash_command("/skill").expect("ok"),
+            Some(SlashCommand::ListSkills)
+        );
+    }
+
+    #[test]
+    fn parse_skill_unknown_subcommand_errors() {
+        let err = parse_slash_command("/skill captuer").expect_err("unknown subcommand");
+        match err {
+            SlashParseError::UnknownSkillSubcommand(rest) => assert_eq!(rest, "captuer"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_skills_disable_auto() {
+        assert_eq!(
+            parse_slash_command("/skills disable-auto").expect("ok"),
+            Some(SlashCommand::SkillsDisableAuto)
+        );
+        assert_eq!(
+            parse_slash_command("/skills disable_auto").expect("ok"),
+            Some(SlashCommand::SkillsDisableAuto)
+        );
+    }
+
+    #[test]
+    fn parse_skills_reject() {
+        assert_eq!(
+            parse_slash_command("/skills reject deploy-rust").expect("ok"),
+            Some(SlashCommand::SkillReject {
+                name: SkillName::new("deploy-rust"),
+            })
+        );
+        // Missing name falls back to list.
+        assert_eq!(
+            parse_slash_command("/skills reject").expect("ok"),
+            Some(SlashCommand::ListSkills)
+        );
+    }
+
+    #[test]
+    fn parse_skills_unknown_subcommand_falls_back() {
+        assert_eq!(
+            parse_slash_command("/skills foo").expect("ok"),
+            Some(SlashCommand::ListSkills)
+        );
+    }
+
+    #[test]
+    fn parse_skills_bare() {
+        assert_eq!(
+            parse_slash_command("/skills").expect("ok"),
+            Some(SlashCommand::ListSkills)
+        );
     }
 }

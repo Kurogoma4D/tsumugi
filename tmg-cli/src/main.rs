@@ -19,7 +19,7 @@ mod pool_setup;
 mod run_commands;
 mod workflow_commands;
 
-use config::{HarnessConfig, SandboxConfigSection, SearchConfig, TsumugiConfig};
+use config::{HarnessConfig, SandboxConfigSection, SearchConfig, SkillsSection, TsumugiConfig};
 
 /// tsumugi - a local-LLM-powered coding agent
 #[derive(Parser, Debug)]
@@ -968,7 +968,7 @@ fn run_tui(
     harness_config: &HarnessConfig,
     sandbox_config: &SandboxConfigSection,
     workflow_config: &tmg_workflow::WorkflowConfig,
-    skills_config: &tmg_skills::SkillsConfig,
+    skills_section: &SkillsSection,
     memory_config: &config::MemoryConfig,
     search_config: &SearchConfig,
     subagent_pool: Option<&tmg_llm::PoolConfig>,
@@ -1346,6 +1346,36 @@ fn run_tui(
                 }
             }
         }
+        // Issue #54: register `skill_manage` so the LLM (and the
+        // autonomous skill_critic flow that reuses it via
+        // `SkillsRuntime::apply_verdict`) can mutate
+        // `.tsumugi/skills/`. Gated on `[skills.critic] enabled` so
+        // operators can opt out by flipping a single flag in
+        // `tsumugi.toml`.
+        //
+        // The shared `SkillsRuntime` owns the [`SignalCollector`] +
+        // [`SkillManageTool`] handle the per-turn observer (in the TUI
+        // event loop) and the slash-command dispatcher (`/skill
+        // capture`, `/skills disable-auto`, `/skills reject`) talk to.
+        // Constructed here so the runtime / recorder live for the
+        // lifetime of the TUI session and both sides see the same
+        // budget / collector state.
+        let (skills_runtime, skill_outcome_recorder): (
+            Option<Arc<tokio::sync::Mutex<tmg_skills::SkillsRuntime>>>,
+            Option<Arc<tmg_skills::TurnOutcomeRecorder>>,
+        ) = if skills_section.critic.enabled {
+            registry.register(tmg_skills::SkillManageTool);
+            let runtime = tmg_skills::SkillsRuntime::new(
+                project_root.clone(),
+                skills_section.critic.clone(),
+            );
+            (
+                Some(Arc::new(tokio::sync::Mutex::new(runtime))),
+                Some(Arc::new(tmg_skills::TurnOutcomeRecorder::new())),
+            )
+        } else {
+            (None, None)
+        };
         register_run_tools(&mut registry, Arc::clone(&runner)).await;
 
         // Workflow discovery + `run_workflow` / `workflow_status` tool
@@ -1558,7 +1588,12 @@ fn run_tui(
         // Failure is non-fatal: the TUI starts with an empty list and
         // `/skills` simply reports no skills installed.
         let skill_metas =
-            match tmg_skills::discover_skills_with_config(&project_root, skills_config).await {
+            match tmg_skills::discover_skills_with_config(
+                &project_root,
+                skills_section.discovery(),
+            )
+            .await
+            {
                 Ok(list) => list,
                 Err(e) => {
                     tracing::warn!(
@@ -1576,6 +1611,29 @@ fn run_tui(
             None
         };
         let search_index_for_tui = search_index.as_ref().map(Arc::clone);
+
+        // Issue #54: compute the startup banner text from any
+        // unacknowledged `provenance: agent` skills the previous
+        // session left behind. Best-effort; failure here just suppresses
+        // the banner.
+        let startup_banner = if skills_section.critic.enabled {
+            let acked = match tmg_skills::load_acknowledged(
+                project_root.join(".tsumugi").join("skills"),
+            )
+            .await
+            {
+                Ok(set) => set,
+                Err(e) => {
+                    tracing::debug!(error = %e, "load_acknowledged failed");
+                    std::collections::BTreeSet::new()
+                }
+            };
+            let pending = tmg_skills::pending_banner_names(&skill_metas, &acked);
+            tmg_skills::format_banner(&pending)
+        } else {
+            None
+        };
+
         let tui_result = tmg_tui::run(
             agent,
             model,
@@ -1593,6 +1651,9 @@ fn run_tui(
             skill_metas,
             memory_store_for_tui,
             search_index_for_tui,
+            startup_banner,
+            skills_runtime.clone(),
+            skill_outcome_recorder.clone(),
         )
         .await;
 
