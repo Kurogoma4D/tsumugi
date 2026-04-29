@@ -27,7 +27,10 @@ You are tsumugi, a helpful coding assistant running locally. \
 Answer concisely and accurately. You have access to tools for \
 reading, writing, and patching files, running shell commands, \
 listing directories, and searching with grep. Use them when \
-appropriate to answer the user's requests.";
+appropriate to answer the user's requests. Before starting on a \
+task, scan the [memory] index for topics related to the request \
+and call the `memory` tool's `read` action on any that look \
+relevant; record durable lessons via `add` / `update`.";
 
 /// Maximum number of consecutive tool-call rounds before the loop is
 /// forcibly terminated. This prevents infinite loops when the model
@@ -216,6 +219,33 @@ pub struct AgentLoop {
     /// gate (SPEC §9.10). The default is `None`, so non-harness
     /// callers (e.g. one-shot CLI mode) pay nothing.
     turn_observer: Option<TurnObserver>,
+
+    /// Optional memory index injected into the prompt (issue #52).
+    ///
+    /// Stored so that [`Self::clear_history`] can re-inject the same
+    /// payload without forcing the caller to thread it back in. Set
+    /// via [`Self::set_memory_index`]; `None` means the memory layer
+    /// is disabled or the index is empty.
+    memory_index: Option<String>,
+
+    /// Shared pending-swap slot consulted at the top of every
+    /// [`Self::turn`]. When the `memory` tool succeeds it pushes a
+    /// freshly-rendered index here; the next turn picks it up,
+    /// replaces [`Self::memory_index`], and pushes a refreshed
+    /// memory user message into history so the LLM sees the change.
+    /// Issue #4 of PR #76 review.
+    ///
+    /// `None` means no provider has been wired (e.g. one-shot mode
+    /// without a memory tool). Cloned via `Arc` so the producer side
+    /// (the tool callback) and the consumer (`Self::turn`) share the
+    /// same slot.
+    pending_memory_index: Option<Arc<std::sync::Mutex<Option<String>>>>,
+
+    /// Tracks whether [`Self::inject_memory_index_now`] has already
+    /// emitted a user-role message for the current `memory_index`.
+    /// Issue #16 of PR #76 review: previously a second call would
+    /// silently duplicate the memory block.
+    memory_index_injected: bool,
 }
 
 impl AgentLoop {
@@ -281,9 +311,14 @@ impl AgentLoop {
 
         let mut history = vec![Message::system(system_prompt)];
 
-        // Load prompt files and inject as initial messages.
+        // Load prompt files (and the memory index, if available)
+        // and inject as initial messages.
         let prompt_messages = prompt::load_prompt_files(project_root, cwd)?;
         history.extend(prompt_messages);
+        // The memory index is wired in lazily via `set_memory_index`;
+        // the initial constructor cannot read it without forcing every
+        // call site to provide a `MemoryStore`. The CLI startup path
+        // calls `set_memory_index` immediately after construction.
 
         let registry = Arc::new(registry);
         let token_counter = TokenCounter::new(client.clone());
@@ -304,7 +339,104 @@ impl AgentLoop {
             tool_calling_mode,
             sandbox,
             turn_observer: None,
+            memory_index: None,
+            pending_memory_index: None,
+            memory_index_injected: false,
         })
+    }
+
+    /// Install (or replace) the memory index injected into the system
+    /// prompt on every [`Self::clear_history`].
+    ///
+    /// Pass `None` to disable the injection. The caller is responsible
+    /// for refreshing this whenever the index changes (e.g. after a
+    /// `memory` tool write). To make the new value visible to the LLM
+    /// without re-reading prompt files, follow up with
+    /// [`Self::clear_history`] (which re-injects from
+    /// [`prompt::load_prompt_files_with_memory`]).
+    pub fn set_memory_index(&mut self, index: Option<String>) {
+        self.memory_index = index;
+        // Clear the injection flag so the new value can be (re-)pushed
+        // into history at the next opportunity.
+        self.memory_index_injected = false;
+    }
+
+    /// Install (or replace) the shared pending-swap slot consulted at
+    /// the top of every [`Self::turn`]. Producers — typically the
+    /// `memory` tool's refresh callback — push freshly-rendered index
+    /// snapshots here; the agent loop picks them up before sending the
+    /// next request to the LLM, so the model always sees the
+    /// post-mutation state of the project memory. Issue #4 of PR #76
+    /// review.
+    ///
+    /// Pass `None` to detach the slot. The slot is consulted with
+    /// [`std::sync::Mutex::lock`]; poisoning is treated as no-op.
+    pub fn set_pending_memory_index(
+        &mut self,
+        slot: Option<Arc<std::sync::Mutex<Option<String>>>>,
+    ) {
+        self.pending_memory_index = slot;
+    }
+
+    /// Borrow the shared pending-swap slot, if any.
+    #[must_use]
+    pub fn pending_memory_index(&self) -> Option<&Arc<std::sync::Mutex<Option<String>>>> {
+        self.pending_memory_index.as_ref()
+    }
+
+    /// Drain the shared pending-swap slot (if any) and apply the new
+    /// index. When a swap happens we replace [`Self::memory_index`]
+    /// AND push a fresh user-role memory block into history so the
+    /// LLM observes the post-mutation state on its next request.
+    ///
+    /// Returns `Some(new_index_payload)` when a swap occurred,
+    /// `None` otherwise. The returned payload is the same one pushed
+    /// into history, suitable for stream-event emission.
+    fn apply_pending_memory_index(&mut self) -> Option<String> {
+        let slot = self.pending_memory_index.as_ref()?;
+        let mut guard = slot.lock().ok()?;
+        let new_index = guard.take()?;
+        drop(guard);
+
+        let trimmed = new_index.trim();
+        if trimmed.is_empty() {
+            self.memory_index = None;
+            self.memory_index_injected = false;
+            return None;
+        }
+
+        self.memory_index = Some(new_index.clone());
+        let payload = format!("{}\n\n{trimmed}", prompt::MEMORY_PROMPT_HEADER);
+        self.history.push(Message::user(payload.clone()));
+        // Mark as injected so a subsequent `inject_memory_index_now()`
+        // call is a no-op until the next swap.
+        self.memory_index_injected = true;
+        Some(payload)
+    }
+
+    /// Inject the carried memory index as a user-role message at the
+    /// end of the current history. Idempotent: a second call without
+    /// an intervening [`Self::set_memory_index`] / pending-swap apply
+    /// is a no-op. Issue #16 of PR #76 review.
+    pub fn inject_memory_index_now(&mut self) {
+        if self.memory_index_injected {
+            return;
+        }
+        let Some(index) = self.memory_index.as_deref() else {
+            return;
+        };
+        if index.trim().is_empty() {
+            return;
+        }
+        let payload = format!("{}\n\n{index}", prompt::MEMORY_PROMPT_HEADER);
+        self.history.push(Message::user(payload));
+        self.memory_index_injected = true;
+    }
+
+    /// Borrow the active memory index (if any).
+    #[must_use]
+    pub fn memory_index(&self) -> Option<&str> {
+        self.memory_index.as_deref()
     }
 
     /// Replace the active [`SandboxContext`].
@@ -404,9 +536,14 @@ impl AgentLoop {
     pub fn clear_history(&mut self, project_root: &Path, cwd: &Path) -> Result<(), CoreError> {
         let system_prompt = Self::build_system_prompt(self.tool_calling_mode, &self.tool_defs);
         let mut history = vec![Message::system(system_prompt)];
-        let prompt_messages = prompt::load_prompt_files(project_root, cwd)?;
+        let prompt_messages =
+            prompt::load_prompt_files_with_memory(project_root, cwd, self.memory_index.as_deref())?;
         history.extend(prompt_messages);
         self.history = history;
+        // The fresh history already contains the memory block (via
+        // `load_prompt_files_with_memory`), so mark injected so that a
+        // follow-up `inject_memory_index_now()` is a no-op (issue #16).
+        self.memory_index_injected = self.memory_index.is_some();
         Ok(())
     }
 
@@ -487,6 +624,22 @@ impl AgentLoop {
         user_input: &str,
         sink: &mut impl StreamSink,
     ) -> Result<(), CoreError> {
+        // Drain any pending memory-index swap before the user message.
+        // The `memory` tool's refresh callback may have pushed a fresh
+        // snapshot into the shared slot since the last turn ended; we
+        // pick it up here so the LLM sees the post-mutation index on
+        // its next request. Issue #4 of PR #76 review. The sink hears
+        // about the swap via `on_warning` so the TUI Activity Pane
+        // can render a "memory updated" hint.
+        if let Some(payload) = self.apply_pending_memory_index() {
+            // Best-effort: a sink that errors here would abort the
+            // turn before it begins. Surfacing the message as a
+            // warning is enough to drive the TUI hint without making
+            // memory churn fatal.
+            let preview: String = payload.chars().take(80).collect();
+            let _ = sink.on_warning(&format!("memory updated: {preview}"));
+        }
+
         // Add user message to history.
         self.history.push(Message::user(user_input));
 

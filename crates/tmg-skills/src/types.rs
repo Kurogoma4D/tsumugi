@@ -258,4 +258,13 @@ pub enum SlashCommand {
     /// `/run abort` — flip the active run to `Failed { reason: "user
     /// aborted" }`.
     RunAbort,
+
+    // ---- /memory subcommands (issue #52) --------------------------------
+    /// `/memory` — show the merged memory index.
+    MemoryIndex,
+    /// `/memory show <name>` — show one entry's body.
+    MemoryShow {
+        /// Topic name.
+        name: String,
+    },
 }

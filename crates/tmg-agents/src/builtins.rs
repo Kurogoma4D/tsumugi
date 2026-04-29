@@ -57,6 +57,23 @@ pub trait RunToolProvider: Send + Sync {
     fn register_run_tool(&self, registry: &mut ToolRegistry, name: &str) -> bool;
 }
 
+/// Source of the agent-facing `memory` tool. Lives outside
+/// [`tmg_tools::default_registry`] because constructing the tool
+/// requires an `Arc<MemoryStore>` that the CLI holds, and `tmg-tools`
+/// must not depend on `tmg-memory` (which itself depends on
+/// `tmg-tools`).
+///
+/// When a [`MemoryToolProvider`] is installed on the
+/// [`SubagentManager`](crate::manager::SubagentManager), it registers
+/// the `memory` tool into every spawned subagent's registry — even
+/// when memory is not part of the agent's `allowed_tools` list — so
+/// subagents can read and curate the project memory just like the
+/// top-level agent. Issue #3 of PR #76 review.
+pub trait MemoryToolProvider: Send + Sync {
+    /// Register the `memory` tool into `registry`.
+    fn register_memory_tool(&self, registry: &mut ToolRegistry);
+}
+
 /// Create a [`ToolRegistry`] containing only the stateless tools allowed
 /// for the given agent type.
 ///
@@ -67,7 +84,7 @@ pub trait RunToolProvider: Send + Sync {
 #[must_use]
 pub fn registry_for_agent_type(agent_type: AgentType) -> ToolRegistry {
     let allowed: Vec<&str> = agent_type.allowed_tools().to_vec();
-    build_registry(&allowed, None)
+    build_registry(&allowed, None, None)
 }
 
 /// Create a [`ToolRegistry`] containing only the stateless tools allowed
@@ -79,7 +96,7 @@ pub fn registry_for_agent_type(agent_type: AgentType) -> ToolRegistry {
 #[must_use]
 pub fn registry_for_agent_kind(agent_kind: &AgentKind) -> ToolRegistry {
     let allowed = agent_kind.allowed_tool_names();
-    build_registry(&allowed, None)
+    build_registry(&allowed, None, None)
 }
 
 /// Create a [`ToolRegistry`] for the given agent kind, including
@@ -99,20 +116,41 @@ pub fn registry_for_agent_kind_with_run_provider(
     provider: &dyn RunToolProvider,
 ) -> ToolRegistry {
     let allowed = agent_kind.allowed_tool_names();
-    build_registry(&allowed, Some(provider))
+    build_registry(&allowed, Some(provider), None)
+}
+
+/// Like [`registry_for_agent_kind_with_run_provider`] but also
+/// registers the agent-facing `memory` tool (when `memory_provider` is
+/// `Some`). The memory tool is always installed regardless of the
+/// agent's `allowed_tools` list because the project memory is a
+/// shared, always-available context surface for every subagent (issue
+/// #3 of PR #76 review).
+#[must_use]
+pub fn registry_for_agent_kind_with_providers(
+    agent_kind: &AgentKind,
+    run_provider: Option<&dyn RunToolProvider>,
+    memory_provider: Option<&dyn MemoryToolProvider>,
+) -> ToolRegistry {
+    let allowed = agent_kind.allowed_tool_names();
+    build_registry(&allowed, run_provider, memory_provider)
 }
 
 /// Build a registry containing only the named tools, drawing first from
 /// the stateless default registry and then from the optional
-/// [`RunToolProvider`].
-fn build_registry(allowed: &[&str], provider: Option<&dyn RunToolProvider>) -> ToolRegistry {
+/// [`RunToolProvider`]. The `memory_provider`, when present, registers
+/// the `memory` tool unconditionally.
+fn build_registry(
+    allowed: &[&str],
+    run_provider: Option<&dyn RunToolProvider>,
+    memory_provider: Option<&dyn MemoryToolProvider>,
+) -> ToolRegistry {
     let full_registry = tmg_tools::default_registry();
     let mut filtered = ToolRegistry::new();
 
     for name in allowed {
         if full_registry.get(name).is_some() {
             register_stateless_tool_by_name(&mut filtered, name);
-        } else if let Some(provider) = provider {
+        } else if let Some(provider) = run_provider {
             // Unknown to the stateless default registry; ask the Run
             // provider. A `false` return is the silent-skip path
             // documented above.
@@ -121,6 +159,14 @@ fn build_registry(allowed: &[&str], provider: Option<&dyn RunToolProvider>) -> T
         // No provider AND not in default_registry: silently skip. The
         // subagent will simply not see the tool, which is the intended
         // behaviour for Run-less code paths.
+    }
+
+    // Memory tool is registered unconditionally when a provider is
+    // present so subagents can curate project memory the same way the
+    // top-level agent does. Skipped silently when no provider is
+    // installed (e.g. Run-less code paths or unit tests).
+    if let Some(mp) = memory_provider {
+        mp.register_memory_tool(&mut filtered);
     }
 
     filtered
@@ -349,6 +395,88 @@ allow = ["file_read", "grep_search"]
                 );
             }
         }
+    }
+
+    /// Regression test for issue #3 of PR #76 review: when a
+    /// [`MemoryToolProvider`] is installed, every subagent's registry
+    /// (built-in or custom, regardless of `allowed_tools`) sees the
+    /// `memory` tool. Without this guarantee, subagents that build
+    /// registries from `tmg_tools::default_registry()` would never be
+    /// able to call `memory`.
+    #[test]
+    fn memory_provider_registers_into_every_subagent_registry() {
+        struct TestMemoryProvider;
+        impl MemoryToolProvider for TestMemoryProvider {
+            fn register_memory_tool(&self, registry: &mut ToolRegistry) {
+                registry.register(MemoryStubTool);
+            }
+        }
+        struct MemoryStubTool;
+        impl tmg_tools::Tool for MemoryStubTool {
+            fn name(&self) -> &'static str {
+                "memory"
+            }
+            fn description(&self) -> &'static str {
+                "stub"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn execute<'a>(
+                &'a self,
+                _params: serde_json::Value,
+                _ctx: &'a tmg_sandbox::SandboxContext,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<tmg_tools::ToolResult, tmg_tools::ToolError>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(tmg_tools::ToolResult::success("ok")) })
+            }
+        }
+
+        let memory_provider: Arc<dyn MemoryToolProvider> = Arc::new(TestMemoryProvider);
+
+        // Every built-in agent kind must see `memory`.
+        for agent_type in [
+            AgentType::Explore,
+            AgentType::Worker,
+            AgentType::Plan,
+            AgentType::Initializer,
+            AgentType::Tester,
+            AgentType::Qa,
+            AgentType::Escalator,
+        ] {
+            let kind = AgentKind::Builtin(agent_type);
+            let registry =
+                registry_for_agent_kind_with_providers(&kind, None, Some(&*memory_provider));
+            assert!(
+                registry.get("memory").is_some(),
+                "{} subagent registry MUST contain memory when provider is installed",
+                agent_type.name(),
+            );
+        }
+
+        // Custom agents see it too.
+        let toml = r#"
+name = "minimal-custom"
+description = "Minimal"
+instructions = "Do things."
+
+[tools]
+allow = ["file_read"]
+"#;
+        let def = crate::custom::CustomAgentDef::from_toml(toml, "test.toml")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let kind = AgentKind::Custom(std::sync::Arc::new(def));
+        let registry = registry_for_agent_kind_with_providers(&kind, None, Some(&*memory_provider));
+        assert!(registry.get("memory").is_some());
+        // Without the provider, no memory tool.
+        let registry = registry_for_agent_kind_with_providers(&kind, None, None);
+        assert!(registry.get("memory").is_none());
     }
 
     /// The provider's `register_run_tool` is only called for names that

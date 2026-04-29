@@ -124,6 +124,7 @@ pub fn parse_slash_command(input: &str) -> SlashParseResult {
         "agents" => return Ok(Some(SlashCommand::ListAgents)),
         "workflows" => return Ok(Some(SlashCommand::ListWorkflows)),
         "run" => return parse_run_subcommand(args.as_deref()).map(Some),
+        "memory" => return Ok(Some(parse_memory_subcommand(args.as_deref()))),
         _ => {}
     }
 
@@ -189,6 +190,30 @@ fn parse_run_subcommand(args: Option<&str>) -> Result<SlashCommand, SlashParseEr
         "abort" => Ok(SlashCommand::RunAbort),
         other => Err(SlashParseError::UnknownRunSubcommand(other.to_owned())),
     }
+}
+
+/// Parse the body of a `/memory ...` invocation.
+///
+/// `/memory` (no body) → [`SlashCommand::MemoryIndex`].
+/// `/memory show <name>` → [`SlashCommand::MemoryShow`].
+/// Anything else falls back to `MemoryIndex` so the user always gets
+/// a useful response (the malformed shape is documented in the body
+/// the TUI prints).
+fn parse_memory_subcommand(args: Option<&str>) -> SlashCommand {
+    let body = args.unwrap_or("").trim();
+    if body.is_empty() {
+        return SlashCommand::MemoryIndex;
+    }
+    let (sub, rest) = match body.split_once(char::is_whitespace) {
+        Some((s, r)) => (s, r.trim()),
+        None => (body, ""),
+    };
+    if sub == "show" && !rest.is_empty() {
+        return SlashCommand::MemoryShow {
+            name: rest.to_owned(),
+        };
+    }
+    SlashCommand::MemoryIndex
 }
 
 /// Format a list of skills for display (e.g. in TUI).
@@ -400,6 +425,24 @@ mod tests {
             SlashParseError::UnknownRunSubcommand(rest) => assert_eq!(rest, "bogus"),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_memory_bare() {
+        assert_eq!(
+            parse_slash_command("/memory").expect("ok"),
+            Some(SlashCommand::MemoryIndex)
+        );
+    }
+
+    #[test]
+    fn parse_memory_show() {
+        assert_eq!(
+            parse_slash_command("/memory show topic_one").expect("ok"),
+            Some(SlashCommand::MemoryShow {
+                name: "topic_one".to_owned(),
+            })
+        );
     }
 
     #[test]
