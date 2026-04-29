@@ -100,6 +100,7 @@ pub async fn run(
     startup_banner: Option<String>,
     skills_runtime: Option<Arc<Mutex<SkillsRuntime>>>,
     skill_outcome_recorder: Option<Arc<TurnOutcomeRecorder>>,
+    trajectory_recorder: Option<Arc<tmg_trajectory::Recorder>>,
 ) -> Result<(), TuiError> {
     // Pre-warm the syntect bundle off the rendering thread. Loading
     // `SyntaxSet::load_defaults_newlines` + `ThemeSet::load_defaults`
@@ -190,6 +191,10 @@ pub async fn run(
 
     if let Some(recorder) = skill_outcome_recorder {
         app.set_skill_outcome_recorder(recorder);
+    }
+
+    if let Some(recorder) = trajectory_recorder {
+        app.set_trajectory_recorder(recorder);
     }
 
     // Issue #54: surface the auto-generated-skill banner at startup

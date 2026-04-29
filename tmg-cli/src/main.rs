@@ -17,6 +17,7 @@ mod init_command;
 mod memory_commands;
 mod pool_setup;
 mod run_commands;
+mod trajectory_commands;
 mod workflow_commands;
 
 use config::{HarnessConfig, SandboxConfigSection, SearchConfig, SkillsSection, TsumugiConfig};
@@ -116,6 +117,63 @@ enum Command {
         /// Sub-operation on the search index.
         #[command(subcommand)]
         op: SearchCommand,
+    },
+    /// Trajectory recorder management (`tmg trajectory <op>`). Issue #55.
+    ///
+    /// Operations: enable / disable the master switch, list trajectory
+    /// files on disk, export from existing `session_log` artifacts, and
+    /// bundle every trajectory into a `tar.zst` archive.
+    Trajectory {
+        /// Sub-operation on the trajectory store.
+        #[command(subcommand)]
+        op: TrajectoryCommand,
+    },
+}
+
+/// Operations under `tmg trajectory`. Issue #55.
+#[derive(Subcommand, Debug)]
+enum TrajectoryCommand {
+    /// Enable the recorder by writing `[trajectory] enabled = true`
+    /// to the project `tsumugi.toml`. Prints a consent warning that
+    /// the operator must acknowledge with `--yes` before the file is
+    /// written.
+    Enable {
+        /// Skip the consent prompt and write the enable flag directly.
+        /// Required for non-interactive (CI) use.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Disable the recorder by writing `[trajectory] enabled = false`
+    /// to the project `tsumugi.toml`. Existing trajectory files are
+    /// preserved.
+    Disable,
+    /// List trajectory files already on disk under each run dir.
+    List,
+    /// Reconstruct trajectories from existing `session_log/*.json`
+    /// (and, when present, the matching `event_log/*.jsonl`).
+    Export {
+        /// Specific run id to export. Mutually-suggestive with `--all`.
+        #[arg(long)]
+        run: Option<String>,
+        /// Override the output directory; otherwise the recorder's
+        /// configured `output_dir` under each run dir is used.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Export every run.
+        #[arg(long)]
+        all: bool,
+        /// Lower bound on `Run::created_at` (ISO8601 / RFC3339).
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// Pack every trajectory into a `tar.zst` archive.
+    Bundle {
+        /// Destination archive path (e.g. `tsumugi-traj.tar.zst`).
+        #[arg(long)]
+        out: PathBuf,
+        /// zstd compression level (1..=22; default `3`).
+        #[arg(long, default_value_t = 3)]
+        compression: i32,
     },
 }
 
@@ -326,6 +384,9 @@ fn main() -> anyhow::Result<()> {
             dispatch_memory_command(op, &config, cli.event_log.as_deref())
         }
         Some(Command::Search { op }) => dispatch_search_command(op, &config),
+        Some(Command::Trajectory { op }) => {
+            dispatch_trajectory_command(op, &config, cli.config.as_deref())
+        }
         None => {
             if let Some(prompt) = cli.prompt {
                 run_prompt(
@@ -338,6 +399,7 @@ fn main() -> anyhow::Result<()> {
                     &config.sandbox,
                     context_config,
                     config.llm.tool_calling,
+                    &config.trajectory,
                 )
             } else {
                 run_tui(
@@ -352,6 +414,7 @@ fn main() -> anyhow::Result<()> {
                     &config.skills,
                     &config.memory,
                     &config.search,
+                    &config.trajectory,
                     config.llm.subagent_pool.as_ref(),
                     None,
                 )
@@ -406,6 +469,28 @@ fn dispatch_memory_command(
     event_log: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     memory_commands::dispatch(op, config, event_log)
+}
+
+/// Dispatch one `tmg trajectory <op>` invocation. Issue #55.
+fn dispatch_trajectory_command(
+    op: TrajectoryCommand,
+    config: &TsumugiConfig,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    match op {
+        TrajectoryCommand::Enable { yes } => trajectory_commands::cmd_enable(config_path, yes),
+        TrajectoryCommand::Disable => trajectory_commands::cmd_disable(config_path),
+        TrajectoryCommand::List => trajectory_commands::cmd_list(config),
+        TrajectoryCommand::Export {
+            run,
+            out,
+            all,
+            since,
+        } => trajectory_commands::cmd_export(config, run, out.as_deref(), all, since),
+        TrajectoryCommand::Bundle { out, compression } => {
+            trajectory_commands::cmd_bundle(config, &out, compression)
+        }
+    }
 }
 
 /// Dispatch one `tmg search <op>` invocation. Issue #53.
@@ -582,6 +667,7 @@ fn dispatch_run_command(op: RunCommand, config: &TsumugiConfig) -> anyhow::Resul
                 &config.skills,
                 &config.memory,
                 &config.search,
+                &config.trajectory,
                 config.llm.subagent_pool.as_ref(),
                 resolved.as_ref(),
             )
@@ -637,6 +723,10 @@ fn dispatch_run_command(op: RunCommand, config: &TsumugiConfig) -> anyhow::Resul
     clippy::too_many_arguments,
     reason = "linear setup helper takes the merged config sections as discrete refs"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear startup wiring (config -> client -> stores -> agent loop -> sink); splitting obscures the launch sequence"
+)]
 fn run_prompt(
     endpoint: &str,
     model: &str,
@@ -647,6 +737,7 @@ fn run_prompt(
     sandbox_config: &SandboxConfigSection,
     context_config: tmg_core::ContextConfig,
     tool_calling_mode: tmg_llm::ToolCallingMode,
+    trajectory_config: &tmg_trajectory::TrajectoryConfig,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -767,27 +858,102 @@ fn run_prompt(
             }
         }
 
+        // Optional trajectory recorder for one-shot mode (issue #55).
+        // One-shot has no `RunRunner`, so we synthesise a trajectory
+        // file under `.tsumugi/trajectories/oneshot_<timestamp>.jsonl`
+        // when `[trajectory] enabled = true`. The recorder is opened
+        // before the turn so the meta record appears first.
+        let trajectory_recorder: Option<std::sync::Arc<tmg_trajectory::Recorder>> =
+            if trajectory_config.enabled {
+                match build_oneshot_recorder(&canonical_cwd, trajectory_config, model, prompt) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to open one-shot trajectory recorder");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
         // The agent's `turn` method takes `&mut impl StreamSink` which
         // is `Sized`, so we cannot use `Box<dyn StreamSink>` here.
-        // Branch on the event-log presence and call `turn` separately
-        // in each arm so the sink type is statically known.
-        if let Some(path) = event_log {
-            let log = tmg_core::EventLogWriter::new(path).context("opening event log file")?;
-            let mut sink = tmg_core::TeeStreamSink::new(StdoutSink::default(), log);
-            agent
-                .turn(prompt, &mut sink)
-                .await
-                .context("running one-shot agent turn")?;
-        } else {
-            let mut sink = StdoutSink::default();
-            agent
-                .turn(prompt, &mut sink)
-                .await
-                .context("running one-shot agent turn")?;
+        // Branch on (event-log, trajectory) presence and call `turn`
+        // in each arm so the sink type is statically known. The
+        // tee chain is `TrajectoryStreamSink<TeeStreamSink<StdoutSink>>`
+        // when both are present.
+        let stdout_sink = StdoutSink::default();
+        match (event_log, trajectory_recorder.as_ref()) {
+            (Some(path), traj) => {
+                let log = tmg_core::EventLogWriter::new(path).context("opening event log file")?;
+                let inner = tmg_core::TeeStreamSink::new(stdout_sink, log);
+                let mut sink = tmg_trajectory::TrajectoryStreamSink::new(inner, traj.cloned());
+                agent
+                    .turn(prompt, &mut sink)
+                    .await
+                    .context("running one-shot agent turn")?;
+            }
+            (None, traj) => {
+                let mut sink =
+                    tmg_trajectory::TrajectoryStreamSink::new(stdout_sink, traj.cloned());
+                agent
+                    .turn(prompt, &mut sink)
+                    .await
+                    .context("running one-shot agent turn")?;
+            }
+        }
+
+        // Close the trajectory with a verdict so the file shape is
+        // valid even for one-shot mode.
+        if let Some(rec) = trajectory_recorder.as_ref() {
+            if let Err(e) = rec.record_verdict("completed", Vec::new()) {
+                tracing::warn!(error = %e, "trajectory verdict (one-shot) failed");
+            }
+            if let Err(e) = rec.flush() {
+                tracing::warn!(error = %e, "trajectory flush (one-shot) failed");
+            }
         }
 
         Ok::<(), anyhow::Error>(())
     })
+}
+
+/// Build a synthetic per-run [`Recorder`] for one-shot mode.
+///
+/// One-shot has no harness session boundary, so we mint a synthetic
+/// `oneshot` "run" under `.tsumugi/trajectories/`. The path layout
+/// (`<cwd>/.tsumugi/trajectories/oneshot_<UTC>.jsonl`) keeps the
+/// per-run convention loose for now; a follow-up could promote
+/// one-shot mode to issue its own ad-hoc run id and reuse the full
+/// `.tsumugi/runs/<id>/trajectories/` layout.
+fn build_oneshot_recorder(
+    project_root: &std::path::Path,
+    config: &tmg_trajectory::TrajectoryConfig,
+    model: &str,
+    user_prompt: &str,
+) -> anyhow::Result<std::sync::Arc<tmg_trajectory::Recorder>> {
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let dir = project_root.join(".tsumugi").join("trajectories");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(format!("oneshot_{stamp}.jsonl"));
+    let recorder = tmg_trajectory::Recorder::create(&path, config.clone())
+        .context("creating one-shot trajectory recorder")?;
+    recorder
+        .record_meta(tmg_trajectory::MetaRecord {
+            run_id: format!("oneshot-{stamp}"),
+            session_num: 1,
+            model: model.to_owned(),
+            scope: "oneshot".to_owned(),
+            started_at: chrono::Utc::now(),
+            ended_at: None,
+            outcome: None,
+        })
+        .context("writing trajectory meta record")?;
+    // No system prompt is exposed at this layer; the AgentLoop owns
+    // it. We write a placeholder so the file shape is valid.
+    let _ = recorder.record_system("(one-shot mode; system prompt internal to AgentLoop)");
+    let _ = recorder.record_user(user_prompt);
+    Ok(std::sync::Arc::new(recorder))
 }
 
 /// One-shot stdout sink that mirrors [`StreamEvent`] output to the
@@ -971,6 +1137,7 @@ fn run_tui(
     skills_section: &SkillsSection,
     memory_config: &config::MemoryConfig,
     search_config: &SearchConfig,
+    trajectory_config: &tmg_trajectory::TrajectoryConfig,
     subagent_pool: Option<&tmg_llm::PoolConfig>,
     explicit_run_id: Option<&tmg_harness::RunId>,
 ) -> anyhow::Result<()> {
@@ -1142,6 +1309,48 @@ fn run_tui(
             .begin_session()
             .context("beginning harness session")?;
         let run_summary: RunSummary = runner.summary();
+
+        // Build the trajectory recorder for this session (issue #55).
+        // Best-effort: a misconfigured `redact_extra_patterns` regex
+        // surfaces as a warning and disables recording for this run
+        // rather than aborting startup.
+        let trajectory_recorder: Option<Arc<tmg_trajectory::Recorder>> = if trajectory_config.enabled
+        {
+            let active_run_dir = store.run_dir(runner.run_id());
+            let session_index = session_handle.index;
+            let traj_path = tmg_trajectory::trajectory_path(
+                &active_run_dir,
+                &trajectory_config.output_dir,
+                session_index,
+            );
+            match tmg_trajectory::Recorder::create(&traj_path, trajectory_config.clone()) {
+                Ok(rec) => {
+                    let arc = Arc::new(rec);
+                    let scope = match runner.scope() {
+                        tmg_harness::RunScope::AdHoc => "ad-hoc".to_owned(),
+                        tmg_harness::RunScope::Harnessed { .. } => "harnessed".to_owned(),
+                    };
+                    if let Err(e) = arc.record_meta(tmg_trajectory::MetaRecord {
+                        run_id: runner.run_id().as_str().to_owned(),
+                        session_num: session_index,
+                        model: model.to_owned(),
+                        scope,
+                        started_at: chrono::Utc::now(),
+                        ended_at: None,
+                        outcome: None,
+                    }) {
+                        tracing::warn!(error = %e, "trajectory meta record failed");
+                    }
+                    Some(arc)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to open trajectory recorder; continuing without recording");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Wrap the runner in Arc<Mutex<...>> so the Run-scoped tools and
         // the bootstrap path share one source of truth for the active
@@ -1654,6 +1863,7 @@ fn run_tui(
             startup_banner,
             skills_runtime.clone(),
             skill_outcome_recorder.clone(),
+            trajectory_recorder.clone(),
         )
         .await;
 
@@ -1687,10 +1897,36 @@ fn run_tui(
         };
         let end_result = {
             let mut guard = runner.lock().await;
-            guard.end_session(&session_handle, trigger)
+            guard.end_session(&session_handle, trigger.clone())
         };
         if let Err(e) = end_result {
             log_end_session_error(&e);
+        }
+
+        // Trajectory verdict (issue #55). The features-marked-passing
+        // list is read off the active session's snapshot (the
+        // `end_session` call above persists them to disk; we re-read
+        // here to avoid threading the value through the trigger).
+        if let Some(rec) = trajectory_recorder.as_ref() {
+            let outcome_label = tmg_trajectory::record_outcome_label(&trigger);
+            let features = {
+                let guard = runner.lock().await;
+                // Re-load the just-persisted session via the session
+                // log so we get the same `features_marked_passing`
+                // list end_session wrote.
+                let log = guard.session_log();
+                log.load(session_handle.index)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.features_marked_passing)
+                    .unwrap_or_default()
+            };
+            if let Err(e) = rec.record_verdict(&outcome_label, features) {
+                tracing::warn!(error = %e, "trajectory verdict record failed");
+            }
+            if let Err(e) = rec.flush() {
+                tracing::warn!(error = %e, "trajectory flush failed");
+            }
         }
 
         tui_result?;
@@ -2095,6 +2331,82 @@ mod tests {
                 assert_eq!(run_id.as_deref(), Some("abc12345"));
             }
             other => panic!("expected Run(Status), got {other:?}"),
+        }
+    }
+
+    /// Issue #55: `tmg trajectory enable --yes` parses with the
+    /// consent flag set.
+    #[test]
+    fn cli_trajectory_enable_parses() {
+        let cli = Cli::try_parse_from(["tmg", "trajectory", "enable", "--yes"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match cli.command {
+            Some(Command::Trajectory {
+                op: TrajectoryCommand::Enable { yes },
+            }) => {
+                assert!(yes);
+            }
+            other => panic!("expected Trajectory(Enable), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_trajectory_disable_parses() {
+        let cli = Cli::try_parse_from(["tmg", "trajectory", "disable"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match cli.command {
+            Some(Command::Trajectory {
+                op: TrajectoryCommand::Disable,
+            }) => {}
+            other => panic!("expected Trajectory(Disable), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_trajectory_export_parses_all_flags() {
+        let cli = Cli::try_parse_from([
+            "tmg",
+            "trajectory",
+            "export",
+            "--run",
+            "abc12345",
+            "--out",
+            "/tmp/out",
+            "--since",
+            "2026-04-01T00:00:00Z",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match cli.command {
+            Some(Command::Trajectory {
+                op:
+                    TrajectoryCommand::Export {
+                        run,
+                        out,
+                        all,
+                        since,
+                    },
+            }) => {
+                assert_eq!(run.as_deref(), Some("abc12345"));
+                assert_eq!(out.as_deref(), Some(std::path::Path::new("/tmp/out")));
+                assert!(!all);
+                assert_eq!(since.as_deref(), Some("2026-04-01T00:00:00Z"));
+            }
+            other => panic!("expected Trajectory(Export), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_trajectory_bundle_parses() {
+        let cli = Cli::try_parse_from(["tmg", "trajectory", "bundle", "--out", "x.tar.zst"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match cli.command {
+            Some(Command::Trajectory {
+                op: TrajectoryCommand::Bundle { out, compression },
+            }) => {
+                assert_eq!(out, std::path::PathBuf::from("x.tar.zst"));
+                assert_eq!(compression, 3);
+            }
+            other => panic!("expected Trajectory(Bundle), got {other:?}"),
         }
     }
 

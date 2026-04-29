@@ -658,6 +658,54 @@ impl PartialSearchConfig {
     }
 }
 
+/// Partial `[trajectory]` config — fields are `Option` so partial
+/// layers (global / project / env / CLI) compose without clobbering
+/// unset knobs. Issue #55.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PartialTrajectoryConfig {
+    pub enabled: Option<bool>,
+    pub output_dir: Option<String>,
+    pub include_thinking: Option<bool>,
+    pub include_tool_results: Option<tmg_trajectory::ToolResultMode>,
+    pub redact_extra_patterns: Option<Vec<String>>,
+}
+
+impl PartialTrajectoryConfig {
+    fn merge_from(&mut self, other: &Self) {
+        if other.enabled.is_some() {
+            self.enabled = other.enabled;
+        }
+        if other.output_dir.is_some() {
+            self.output_dir.clone_from(&other.output_dir);
+        }
+        if other.include_thinking.is_some() {
+            self.include_thinking = other.include_thinking;
+        }
+        if other.include_tool_results.is_some() {
+            self.include_tool_results = other.include_tool_results;
+        }
+        if other.redact_extra_patterns.is_some() {
+            self.redact_extra_patterns
+                .clone_from(&other.redact_extra_patterns);
+        }
+    }
+
+    fn into_final(self) -> tmg_trajectory::TrajectoryConfig {
+        let defaults = tmg_trajectory::TrajectoryConfig::default();
+        tmg_trajectory::TrajectoryConfig {
+            enabled: self.enabled.unwrap_or(defaults.enabled),
+            output_dir: self.output_dir.unwrap_or(defaults.output_dir),
+            include_thinking: self.include_thinking.unwrap_or(defaults.include_thinking),
+            include_tool_results: self
+                .include_tool_results
+                .unwrap_or(defaults.include_tool_results),
+            redact_extra_patterns: self
+                .redact_extra_patterns
+                .unwrap_or(defaults.redact_extra_patterns),
+        }
+    }
+}
+
 /// Partial top-level config used for deserialization and merging.
 ///
 /// Partial memory config used for deserialization / merging. Each
@@ -728,6 +776,8 @@ struct PartialTsumugiConfig {
     pub memory: PartialMemoryConfig,
     #[serde(default)]
     pub search: PartialSearchConfig,
+    #[serde(default)]
+    pub trajectory: PartialTrajectoryConfig,
 }
 
 impl PartialTsumugiConfig {
@@ -742,6 +792,7 @@ impl PartialTsumugiConfig {
         self.workflow.merge_from(&other.workflow);
         self.memory.merge_from(&other.memory);
         self.search.merge_from(&other.search);
+        self.trajectory.merge_from(&other.trajectory);
     }
 
     /// Apply environment variable overrides (`TMG_*` prefix).
@@ -1013,6 +1064,41 @@ impl PartialTsumugiConfig {
             }
             self.workflow.max_parallel_agents = Some(n);
         }
+        // [trajectory] env overrides (issue #55).
+        if let Some(v) = env_fn("TMG_TRAJECTORY_ENABLED") {
+            let parsed = parse_bool(&v).map_err(|()| ConfigError::InvalidValue {
+                field: "TMG_TRAJECTORY_ENABLED".to_owned(),
+                value: v,
+                reason: "must be one of: true, false, 1, 0".to_owned(),
+            })?;
+            self.trajectory.enabled = Some(parsed);
+        }
+        if let Some(v) = env_fn("TMG_TRAJECTORY_OUTPUT_DIR") {
+            self.trajectory.output_dir = Some(v);
+        }
+        if let Some(v) = env_fn("TMG_TRAJECTORY_INCLUDE_THINKING") {
+            let parsed = parse_bool(&v).map_err(|()| ConfigError::InvalidValue {
+                field: "TMG_TRAJECTORY_INCLUDE_THINKING".to_owned(),
+                value: v,
+                reason: "must be one of: true, false, 1, 0".to_owned(),
+            })?;
+            self.trajectory.include_thinking = Some(parsed);
+        }
+        if let Some(v) = env_fn("TMG_TRAJECTORY_INCLUDE_TOOL_RESULTS") {
+            let mode = match v.as_str() {
+                "full" => tmg_trajectory::ToolResultMode::Full,
+                "redacted" => tmg_trajectory::ToolResultMode::Redacted,
+                "summary_only" => tmg_trajectory::ToolResultMode::SummaryOnly,
+                _ => {
+                    return Err(ConfigError::InvalidValue {
+                        field: "TMG_TRAJECTORY_INCLUDE_TOOL_RESULTS".to_owned(),
+                        value: v,
+                        reason: "must be one of: full, redacted, summary_only".to_owned(),
+                    });
+                }
+            };
+            self.trajectory.include_tool_results = Some(mode);
+        }
         Ok(())
     }
 
@@ -1027,6 +1113,7 @@ impl PartialTsumugiConfig {
             workflow: self.workflow.into_final()?,
             memory: self.memory.into_final(),
             search: self.search.into_final(),
+            trajectory: self.trajectory.into_final(),
         })
     }
 }
@@ -1370,6 +1457,14 @@ pub struct TsumugiConfig {
     /// Cross-session search layer settings (issue #53).
     #[serde(default)]
     pub search: SearchConfig,
+
+    /// Trajectory recorder settings (issue #55).
+    ///
+    /// Defaults to `enabled = false` (opt-in). When the operator
+    /// flips the switch, the recorder writes per-session JSONL files
+    /// under each run dir.
+    #[serde(default)]
+    pub trajectory: tmg_trajectory::TrajectoryConfig,
 }
 
 /// `[memory]` section: project-scoped persistent memory configuration.

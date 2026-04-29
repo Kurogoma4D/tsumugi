@@ -11,6 +11,7 @@ use tmg_llm::Role;
 use tmg_memory::MemoryStore;
 use tmg_search::SearchIndex;
 use tmg_skills::{SkillMeta, SkillsRuntime, SlashCommand, TurnOutcomeRecorder};
+use tmg_trajectory::Recorder as TrajectoryRecorder;
 use tmg_workflow::{WorkflowMeta, WorkflowProgress};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -333,6 +334,12 @@ pub struct App {
     /// drive the autonomous skill pipeline. Carries the user message
     /// associated with the turn for downstream consumers.
     turn_finished_signal: Option<TurnFinishedSignal>,
+
+    /// Optional trajectory recorder (issue #55). When set, the per-turn
+    /// background task wraps its sink in a
+    /// [`tmg_trajectory::TrajectoryStreamSink`] so every assistant
+    /// turn is appended to the active session's JSONL file.
+    trajectory_recorder: Option<Arc<TrajectoryRecorder>>,
 }
 
 /// Signal emitted on the App once per completed turn — drives the
@@ -403,7 +410,22 @@ impl App {
             skill_outcome_recorder: None,
             skill_turn_index: 0,
             turn_finished_signal: None,
+            trajectory_recorder: None,
         }
+    }
+
+    /// Install a trajectory recorder (issue #55). The recorder is
+    /// shared with the per-turn background task via [`Arc`] so each
+    /// turn's sink chain can append assistant / `tool_result` records
+    /// without touching the TUI's main loop.
+    pub fn set_trajectory_recorder(&mut self, recorder: Arc<TrajectoryRecorder>) {
+        self.trajectory_recorder = Some(recorder);
+    }
+
+    /// Borrow the active trajectory recorder, if any.
+    #[must_use]
+    pub fn trajectory_recorder(&self) -> Option<&Arc<TrajectoryRecorder>> {
+        self.trajectory_recorder.as_ref()
     }
 
     /// Drain any pending turn-finished signal (issue #54). Returns
@@ -1321,6 +1343,10 @@ impl App {
     /// Panics if called while the agent is `None` (i.e., another turn
     /// is already running). This is guarded by `is_streaming()` checks
     /// in the event loop.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear sink-chain construction with branching for (event_log, runner, trajectory) presence; splitting fragments the spawn closure that needs to own all the state"
+    )]
     pub fn start_turn(&mut self, user_input: String, parent_cancel: &CancellationToken) {
         let Some(mut agent) = self.agent.take() else {
             // Should not happen: the event loop checks `is_streaming()`
@@ -1357,6 +1383,16 @@ impl App {
 
         let runner = self.runner.clone();
         let outcome_recorder = self.skill_outcome_recorder.clone();
+        let trajectory_recorder = self.trajectory_recorder.clone();
+        // Mint a `User` record for the trajectory before the turn fires
+        // so the JSONL captures the user input even though the
+        // `StreamSink` API only sees the assistant side. Best-effort:
+        // a failure here only loses the `user` line for this turn.
+        if let Some(rec) = trajectory_recorder.as_ref()
+            && let Err(e) = rec.record_user(&user_input)
+        {
+            tracing::warn!(error = %e, "trajectory user record failed");
+        }
 
         let join = tokio::spawn(async move {
             let channel_sink = ChannelStreamSink { tx: tx.clone() };
@@ -1364,15 +1400,9 @@ impl App {
             // sink (and optional event log) sit at the bottom, and
             // `HarnessStreamSink` wraps them so harness session-stat
             // updates fire on every event without changing the in-flight
-            // forwarding to the TUI.
-            //
-            // When the autonomous skill pipeline is active
-            // (`outcome_recorder` is `Some`), the harness sink also
-            // records per-call outcomes so the per-turn observer
-            // (driven by the run-finished branch in
-            // `App::drain_turn_messages`) can build a
-            // [`tmg_skills::TurnSummary`] with proper outcomes — issue
-            // #54.
+            // forwarding to the TUI. The trajectory recorder (issue
+            // #55) is the outermost layer so it sees every event in
+            // its post-tee form.
             let result = match (event_log_writer, runner) {
                 (Some(log), Some(runner)) => {
                     let tee = tmg_core::TeeStreamSink::new(channel_sink, log);
@@ -1380,22 +1410,35 @@ impl App {
                     if let Some(rec) = outcome_recorder.as_ref() {
                         wrapped = wrapped.with_skill_outcome_recorder(Arc::clone(rec));
                     }
-                    agent.turn(&user_input, &mut wrapped).await
+                    let mut traj = tmg_trajectory::TrajectoryStreamSink::new(
+                        wrapped,
+                        trajectory_recorder.clone(),
+                    );
+                    agent.turn(&user_input, &mut traj).await
                 }
                 (Some(log), None) => {
-                    let mut tee = tmg_core::TeeStreamSink::new(channel_sink, log);
-                    agent.turn(&user_input, &mut tee).await
+                    let tee = tmg_core::TeeStreamSink::new(channel_sink, log);
+                    let mut traj =
+                        tmg_trajectory::TrajectoryStreamSink::new(tee, trajectory_recorder.clone());
+                    agent.turn(&user_input, &mut traj).await
                 }
                 (None, Some(runner)) => {
                     let mut wrapped = HarnessStreamSink::new(channel_sink, runner);
                     if let Some(rec) = outcome_recorder.as_ref() {
                         wrapped = wrapped.with_skill_outcome_recorder(Arc::clone(rec));
                     }
-                    agent.turn(&user_input, &mut wrapped).await
+                    let mut traj = tmg_trajectory::TrajectoryStreamSink::new(
+                        wrapped,
+                        trajectory_recorder.clone(),
+                    );
+                    agent.turn(&user_input, &mut traj).await
                 }
                 (None, None) => {
-                    let mut sink = channel_sink;
-                    agent.turn(&user_input, &mut sink).await
+                    let mut traj = tmg_trajectory::TrajectoryStreamSink::new(
+                        channel_sink,
+                        trajectory_recorder.clone(),
+                    );
+                    agent.turn(&user_input, &mut traj).await
                 }
             };
 
