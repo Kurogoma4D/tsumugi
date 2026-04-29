@@ -97,6 +97,7 @@ pub async fn run(
     skills: Vec<SkillMeta>,
     memory_store: Option<Arc<MemoryStore>>,
     search_index: Option<Arc<SearchIndex>>,
+    startup_banner: Option<String>,
 ) -> Result<(), TuiError> {
     // Pre-warm the syntect bundle off the rendering thread. Loading
     // `SyntaxSet::load_defaults_newlines` + `ThemeSet::load_defaults`
@@ -179,6 +180,18 @@ pub async fn run(
 
     if let Some(idx) = search_index {
         app.set_search_index(idx);
+    }
+
+    // Issue #54: surface the auto-generated-skill banner at startup
+    // when the previous session left unacknowledged `provenance: agent`
+    // skills behind. The CLI computes the banner text via
+    // `tmg_skills::pending_banner_names` + `format_banner` and threads
+    // it in here.
+    if let Some(text) = startup_banner {
+        app.set_transient_banner(TransientBanner::with_ttl(
+            text,
+            std::time::Duration::from_secs(8),
+        ));
     }
 
     let result = event::run_event_loop(&mut terminal, &mut app, cancel).await;

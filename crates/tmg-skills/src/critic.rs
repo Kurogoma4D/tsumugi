@@ -68,6 +68,12 @@ pub struct SkillCriticConfig {
     /// to 1 per the issue's hard-limit guidance.
     #[serde(default = "default_max_per_session")]
     pub max_per_session: u32,
+
+    /// Optional override for the critic's system prompt. When `None`,
+    /// [`DEFAULT_SYSTEM_PROMPT`] is used. Allows operators to tune the
+    /// instructions without rebuilding tsumugi.
+    #[serde(default)]
+    pub system_prompt_override: Option<String>,
 }
 
 const fn default_true() -> bool {
@@ -85,17 +91,20 @@ impl Default for SkillCriticConfig {
             endpoint: String::new(),
             model: String::new(),
             max_per_session: default_max_per_session(),
+            system_prompt_override: None,
         }
     }
 }
 
 impl SkillCriticConfig {
     /// Return the system prompt the harness should feed into the
-    /// critic. Currently a const; configurable overrides are reserved
-    /// for a follow-up.
+    /// critic. Honours [`Self::system_prompt_override`] when set, else
+    /// falls back to [`DEFAULT_SYSTEM_PROMPT`].
     #[must_use]
-    pub fn system_prompt(&self) -> &'static str {
-        DEFAULT_SYSTEM_PROMPT
+    pub fn system_prompt(&self) -> &str {
+        self.system_prompt_override
+            .as_deref()
+            .unwrap_or(DEFAULT_SYSTEM_PROMPT)
     }
 }
 
@@ -179,10 +188,19 @@ pub fn parse_verdict(text: &str) -> Result<SkillCriticVerdict, CriticParseError>
         .map(str::to_owned);
 
     if create {
-        if name.is_none() || description.is_none() || draft.is_none() {
+        let n = name.as_deref().unwrap_or("");
+        let d = description.as_deref().unwrap_or("");
+        let dr = draft.as_deref().unwrap_or("");
+        if n.trim().is_empty() || d.trim().is_empty() || dr.trim().is_empty() {
             return Err(CriticParseError::Invalid(
-                "create=true requires non-null `name`, `description`, and `draft`".to_owned(),
+                "create=true requires non-empty `name`, `description`, and `draft`".to_owned(),
             ));
+        }
+        if !is_valid_skill_name(n) {
+            return Err(CriticParseError::Invalid(format!(
+                "invalid skill name {n:?}: must be non-empty, contain no path separators \
+                 (`/`, `\\`), not start with `.`, and not contain whitespace"
+            )));
         }
     } else if name.is_some() || description.is_some() || draft.is_some() {
         return Err(CriticParseError::Invalid(
@@ -199,8 +217,29 @@ pub fn parse_verdict(text: &str) -> Result<SkillCriticVerdict, CriticParseError>
     })
 }
 
+/// Skill-name validation that mirrors [`crate::manage::validate_name`].
+///
+/// Kept here (rather than re-using the manage helper) because
+/// [`parse_verdict`] returns a `CriticParseError` rather than
+/// `ToolError`, so we want a pure predicate we can fold into a
+/// structured error message.
+fn is_valid_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.starts_with('.')
+        && !name.chars().any(char::is_whitespace)
+}
+
 /// Strip a single optional ```` ``` ```` fence (with optional `json`
 /// hint) around the input.
+///
+/// To avoid corrupting JSON whose `draft` value contains an embedded
+/// fenced code block (e.g. a SKILL.md draft documenting a shell
+/// snippet), the fence is only stripped when the input both **starts
+/// with** ` ``` ` and **ends with** ` ``` `. If the trailing fence is
+/// not at the very end of the trimmed input, we leave the input alone
+/// and let the JSON parser handle it.
 fn strip_fence(input: &str) -> &str {
     let candidate = input.trim();
     let Some(rest) = candidate.strip_prefix("```") else {
@@ -208,8 +247,14 @@ fn strip_fence(input: &str) -> &str {
     };
     // Drop the optional language hint (e.g. `json\n...`).
     let after_hint = rest.split_once('\n').map_or(rest, |(_, body)| body);
-    if let Some(end) = after_hint.rfind("```") {
-        after_hint[..end].trim()
+    // Require the trailing fence to be at the very end of the trimmed
+    // input. `strip_suffix` guarantees there's nothing after the
+    // closing ```; this rules out a fenced block embedded in a JSON
+    // string body whose closing ``` would otherwise be treated as the
+    // outer fence.
+    let after_hint = after_hint.trim_end();
+    if let Some(body) = after_hint.strip_suffix("```") {
+        body.trim()
     } else {
         candidate
     }
@@ -309,5 +354,116 @@ max_per_session = 2
         let c: SkillCriticConfig = toml::from_str("").unwrap();
         assert!(c.enabled);
         assert_eq!(c.max_per_session, 1);
+    }
+
+    #[test]
+    fn parse_create_true_empty_name_rejected() {
+        let json = r#"{
+            "create": true,
+            "name": "",
+            "description": "x",
+            "draft": "y",
+            "reason": "go"
+        }"#;
+        let err = parse_verdict(json).unwrap_err();
+        assert!(matches!(err, CriticParseError::Invalid(_)));
+    }
+
+    #[test]
+    fn parse_create_true_empty_description_rejected() {
+        let json = r#"{
+            "create": true,
+            "name": "x",
+            "description": "   ",
+            "draft": "y",
+            "reason": "go"
+        }"#;
+        let err = parse_verdict(json).unwrap_err();
+        assert!(matches!(err, CriticParseError::Invalid(_)));
+    }
+
+    #[test]
+    fn parse_create_true_empty_draft_rejected() {
+        let json = r#"{
+            "create": true,
+            "name": "x",
+            "description": "y",
+            "draft": "",
+            "reason": "go"
+        }"#;
+        let err = parse_verdict(json).unwrap_err();
+        assert!(matches!(err, CriticParseError::Invalid(_)));
+    }
+
+    #[test]
+    fn parse_create_true_invalid_name_rejected() {
+        // Each entry is the JSON-encoded `name` value (without
+        // surrounding quotes) so we don't have to wrestle with double-
+        // escaping inside `format!`.
+        for bad_json_name in [
+            "foo/bar",
+            r"foo\\bar", // JSON `\\` => string contains `\`
+            ".hidden",
+            "spaced name",
+        ] {
+            let json = format!(
+                r#"{{ "create": true, "name": "{bad_json_name}", "description": "x", "draft": "y", "reason": "z" }}"#
+            );
+            let err = parse_verdict(&json).unwrap_err();
+            assert!(
+                matches!(err, CriticParseError::Invalid(_)),
+                "expected Invalid for {bad_json_name:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_with_fenced_draft_field_does_not_strip_inner_fence() {
+        // A verdict whose `draft` body contains an embedded fenced
+        // code block. The outer payload is plain JSON (no surrounding
+        // ```), so `strip_fence` must leave it alone — the previous
+        // implementation could be confused by the `\`\`\`` inside the
+        // draft string.
+        let json = "{\
+            \"create\": true,\
+            \"name\": \"deploy\",\
+            \"description\": \"d\",\
+            \"draft\": \"Run \\u0060\\u0060\\u0060bash\\nls\\n\\u0060\\u0060\\u0060 to inspect\",\
+            \"reason\": \"why\"\
+        }";
+        let v = parse_verdict(json).unwrap();
+        assert!(v.create);
+        assert!(v.draft.as_deref().unwrap().contains("```bash"));
+    }
+
+    #[test]
+    fn parse_with_outer_fence_strips_correctly() {
+        let fenced = "```json\n{ \"create\": false, \"reason\": \"meh\" }\n```";
+        let v = parse_verdict(fenced).unwrap();
+        assert!(!v.create);
+    }
+
+    #[test]
+    fn parse_with_unclosed_fence_left_alone() {
+        // Opening fence but no closing fence: don't strip — let the
+        // JSON parser surface the real error.
+        let bad = "```json\n{ \"create\": false, \"reason\": \"x\" }";
+        let err = parse_verdict(bad).unwrap_err();
+        assert!(matches!(err, CriticParseError::NotJson(_)));
+    }
+
+    #[test]
+    fn system_prompt_default_returns_constant() {
+        let cfg = SkillCriticConfig::default();
+        assert_eq!(cfg.system_prompt(), DEFAULT_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn system_prompt_override_used_when_set() {
+        let cfg = SkillCriticConfig {
+            system_prompt_override: Some("Custom prompt".to_owned()),
+            ..SkillCriticConfig::default()
+        };
+        assert_eq!(cfg.system_prompt(), "Custom prompt");
     }
 }

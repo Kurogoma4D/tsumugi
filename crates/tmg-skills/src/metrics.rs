@@ -30,11 +30,46 @@
 //! **explicitly out of scope** for this issue. The hints are produced
 //! and persisted; consuming them is a follow-up.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::error::SkillError;
+
+/// Per-skill-dir async mutex registry.
+///
+/// Two parallel `update_metrics` calls in the same process targeting the
+/// same skill could otherwise race the load → mutate → save sequence
+/// and clobber each other. We serialise per skill-dir using one
+/// [`AsyncMutex`] per resolved path. Cross-process synchronisation is
+/// best-effort (we still write atomically via tempfile + rename so
+/// readers never see a half-written file), but two `tmg` instances
+/// updating the same skill simultaneously can lose the read-modify-write
+/// race on the file's contents — operators running concurrent agents
+/// against the same skill should serialise out-of-band.
+fn metrics_locks() -> &'static std::sync::Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>> =
+        OnceLock::new();
+    LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Acquire (or create) the per-skill-dir guard.
+fn lock_for(skill_dir: &Path) -> Arc<AsyncMutex<()>> {
+    let key = skill_dir.to_path_buf();
+    let table = metrics_locks();
+    let mut guard = match table.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    Arc::clone(
+        guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+    )
+}
 
 /// The hidden filename used for per-skill metrics.
 pub const METRICS_FILENAME: &str = ".metrics.json";
@@ -117,12 +152,15 @@ pub async fn load_metrics(skill_dir: impl AsRef<Path>) -> Result<SkillMetrics, S
 /// Persist metrics for a skill.
 ///
 /// Writes the JSON document with a trailing newline so the file is
-/// well-behaved under POSIX text-file conventions.
+/// well-behaved under POSIX text-file conventions. The write is
+/// atomic-on-rename: the document is staged to `<path>.tmp` first, then
+/// renamed over the destination, so concurrent readers never observe a
+/// half-written file.
 ///
 /// # Errors
 ///
 /// Returns [`SkillError::Io`] when the parent directory does not exist
-/// or the write fails.
+/// or the write/rename fails.
 pub async fn save_metrics(
     skill_dir: impl AsRef<Path>,
     metrics: &SkillMetrics,
@@ -135,9 +173,20 @@ pub async fn save_metrics(
         )
     })?;
     serialized.push('\n');
-    tokio::fs::write(&path, serialized)
+
+    // Stage to <path>.tmp, then rename. `rename` is atomic on POSIX
+    // when source and destination live on the same filesystem; siblings
+    // of the target file always do.
+    let tmp_path = path.with_extension("json.tmp");
+    tokio::fs::write(&tmp_path, &serialized)
         .await
-        .map_err(|e| SkillError::io(format!("writing {}", path.display()), e))
+        .map_err(|e| SkillError::io(format!("writing {}", tmp_path.display()), e))?;
+    tokio::fs::rename(&tmp_path, &path).await.map_err(|e| {
+        SkillError::io(
+            format!("renaming {} -> {}", tmp_path.display(), path.display()),
+            e,
+        )
+    })
 }
 
 /// Convenience: load, run `f`, and save back atomically (per process).
@@ -147,6 +196,17 @@ pub async fn save_metrics(
 /// ```ignore
 /// update_metrics(&skill_dir, |m| m.record_success()).await?;
 /// ```
+///
+/// ## Concurrency semantics
+///
+/// Within the current process, two concurrent calls targeting the same
+/// `skill_dir` are serialised through a per-path async mutex so the
+/// load → mutate → save sequence is atomic. The save itself uses
+/// tempfile + rename so readers (and crashed writers) never observe a
+/// half-written `.metrics.json`. **Cross-process** synchronisation is
+/// best-effort: two `tmg` instances updating the same skill at the same
+/// instant can lose the read-modify-write race; operators running
+/// concurrent agents against the same skill should serialise out-of-band.
 ///
 /// # Errors
 ///
@@ -159,6 +219,8 @@ where
     F: FnOnce(&mut SkillMetrics),
 {
     let dir = skill_dir.as_ref();
+    let lock = lock_for(dir);
+    let _guard = lock.lock().await;
     let mut metrics = load_metrics(dir).await?;
     f(&mut metrics);
     save_metrics(dir, &metrics).await?;

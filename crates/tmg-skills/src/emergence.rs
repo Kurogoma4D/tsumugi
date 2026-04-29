@@ -175,11 +175,20 @@ impl SignalCollector {
     }
 
     /// Manually trigger a candidacy signal (driven by `/skill
-    /// capture`). The manual signal bypasses the per-session limit but
-    /// still respects the [`Self::auto_disabled`] gate (a user who
-    /// asked to halt auto-creation almost certainly didn't intend the
-    /// next `/skill capture` to override that decision; we treat them
-    /// as a single switch).
+    /// capture`). The manual signal bypasses the per-session budget
+    /// (`auto_remaining`) but the caller is expected to gate firing on
+    /// [`Self::auto_disabled`] separately when the user asked to halt
+    /// auto-creation entirely.
+    ///
+    /// ## Asymmetry note
+    ///
+    /// This method takes `&self` (no budget mutation) on purpose:
+    /// `record_auto_generated` is the sole place that decrements the
+    /// per-session budget, and only the autonomous path counts against
+    /// it. Manual captures are user-initiated and intentionally
+    /// unmetered — the asymmetry is documented rather than removed
+    /// because flipping to `&mut self` here would surprise callers that
+    /// already drive multiple manual captures per session.
     pub fn manual_capture(&self, turn_index: usize, tool_call_count: u32) -> SkillCandidacySignal {
         SkillCandidacySignal {
             kind: TriggerKind::Manual,
@@ -188,21 +197,40 @@ impl SignalCollector {
         }
     }
 
-    /// Record a turn and return any auto-fire signal it produced.
+    /// Record a turn and return any auto-fire signals it produced.
     ///
     /// The collector mutates internal streak state regardless of
     /// whether the auto-gate is open; we still want to *observe*
     /// patterns even when the user has disabled auto-creation, because
-    /// that data may feed future telemetry. The gate only governs
-    /// *firing* (`Some(_)` return).
-    pub fn record_turn(&mut self, turn: &TurnSummary) -> Option<SkillCandidacySignal> {
-        let mut signal: Option<SkillCandidacySignal> = None;
+    /// that data may feed future telemetry.
+    ///
+    /// ## Returned signals
+    ///
+    /// Both [`TriggerKind::ErrorRecovery`] and
+    /// [`TriggerKind::UserCorrection`] can fire on the same turn (a
+    /// recovery succeeded *and* the user wrote a feedback note). The
+    /// vector preserves both in the order `ErrorRecovery` →
+    /// `SuccessfulComplexTask` → `UserCorrection` so the caller may
+    /// decide to fire all of them (typical) or pick the highest-priority
+    /// (`UserCorrection` wins by convention) without losing the others
+    /// for telemetry.
+    ///
+    /// ## Auto gate
+    ///
+    /// Signals are returned even when [`Self::auto_creation_allowed`]
+    /// is `false` so callers (and telemetry consumers) can see "we
+    /// *would* have generated a skill". Honouring the gate is the
+    /// caller's job: the harness checks `auto_creation_allowed` (or
+    /// [`Self::auto_disabled`] for manual captures) before spawning
+    /// `skill_critic`.
+    pub fn record_turn(&mut self, turn: &TurnSummary) -> Vec<SkillCandidacySignal> {
+        let mut signals: Vec<SkillCandidacySignal> = Vec::new();
 
         // -- ErrorRecovery: detect a same-tool double failure followed
         //    by a successful different-tool call within this turn or
         //    on the next turn after the second failure.
         if let Some(s) = self.try_error_recovery(turn) {
-            signal = Some(s);
+            signals.push(s);
         }
 
         // -- Streak update for SuccessfulComplexTask.
@@ -220,12 +248,9 @@ impl SignalCollector {
             }
         }
 
-        if !turn.turn_errored
-            && self.consecutive_successes >= SUCCESSFUL_COMPLEX_THRESHOLD
-            && signal.is_none()
-        {
+        if !turn.turn_errored && self.consecutive_successes >= SUCCESSFUL_COMPLEX_THRESHOLD {
             let start = self.success_streak_start.unwrap_or(turn.turn_index);
-            signal = Some(SkillCandidacySignal {
+            signals.push(SkillCandidacySignal {
                 kind: TriggerKind::SuccessfulComplexTask,
                 turn_range: start..(turn.turn_index + 1),
                 tool_call_count: self.success_streak_tool_calls,
@@ -237,28 +262,35 @@ impl SignalCollector {
             self.success_streak_tool_calls = 0;
         }
 
-        // -- UserCorrection: dominate other signals when present.
+        // -- UserCorrection: queued alongside ErrorRecovery rather
+        //    than dropping the prior signal silently.
         if turn.feedback_memory_written {
-            signal = Some(SkillCandidacySignal {
+            signals.push(SkillCandidacySignal {
                 kind: TriggerKind::UserCorrection,
                 turn_range: turn.turn_index..(turn.turn_index + 1),
                 tool_call_count: u32::try_from(turn.tool_calls.len()).unwrap_or(u32::MAX),
             });
         }
 
-        // Gate the actual fire on the auto-creation budget. We still
-        // return the signal shape so callers can introspect the
-        // collector's view (e.g. the TUI surfacing "we *would* have
-        // generated a skill but auto is disabled").
-        if let Some(sig) = &signal {
-            if !self.auto_creation_allowed() {
-                // Suppress: leave the streak counters reset; do not
-                // emit.
-                return None;
-            }
-            return Some(sig.clone());
-        }
-        None
+        signals
+    }
+
+    /// Pick the highest-priority signal from a list returned by
+    /// [`Self::record_turn`].
+    ///
+    /// Order: `UserCorrection` > `ErrorRecovery` > `SuccessfulComplexTask`.
+    /// This is the canonical "fire one critic per turn" projection.
+    #[must_use]
+    pub fn highest_priority(signals: &[SkillCandidacySignal]) -> Option<&SkillCandidacySignal> {
+        signals
+            .iter()
+            .find(|s| matches!(s.kind, TriggerKind::UserCorrection))
+            .or_else(|| {
+                signals
+                    .iter()
+                    .find(|s| matches!(s.kind, TriggerKind::ErrorRecovery))
+            })
+            .or_else(|| signals.first())
     }
 
     /// [`TriggerKind::ErrorRecovery`] state machine: look for two
@@ -344,7 +376,8 @@ mod tests {
             ],
             false,
         );
-        let signal = c.record_turn(&t).expect("signal expected");
+        let signals = c.record_turn(&t);
+        let signal = signals.first().expect("signal expected");
         assert_eq!(signal.kind, TriggerKind::SuccessfulComplexTask);
         assert_eq!(signal.tool_call_count, 5);
     }
@@ -353,21 +386,49 @@ mod tests {
     fn error_recovery_fires_after_double_failure_then_success() {
         let mut c = SignalCollector::new(1);
         // Turn 0: the same tool fails twice.
-        let signal = c.record_turn(&turn(
+        let signals = c.record_turn(&turn(
             0,
             &[("shell_exec", false), ("shell_exec", false)],
             true,
         ));
-        assert!(signal.is_none());
+        assert!(signals.is_empty());
         // Turn 1: a different tool succeeds. Recovery fires.
-        let signal = c.record_turn(&turn(1, &[("file_read", true)], false));
-        let s = signal.expect("recovery signal");
+        let signals = c.record_turn(&turn(1, &[("file_read", true)], false));
+        let s = signals.first().expect("recovery signal");
         assert_eq!(s.kind, TriggerKind::ErrorRecovery);
         assert!(s.turn_range.start == 0 && s.turn_range.end == 2);
     }
 
     #[test]
-    fn user_correction_takes_precedence() {
+    fn user_correction_and_error_recovery_both_fire() {
+        let mut c = SignalCollector::new(1);
+        // Prime the recovery state machine: same tool fails twice on
+        // turn 0.
+        let _ = c.record_turn(&turn(
+            0,
+            &[("shell_exec", false), ("shell_exec", false)],
+            true,
+        ));
+        // Turn 1: a different tool succeeds AND the user writes a
+        // feedback memory entry. Both signals must surface; neither is
+        // dropped.
+        let mut t = turn(1, &[("file_read", true)], false);
+        t.feedback_memory_written = true;
+        let signals = c.record_turn(&t);
+        assert_eq!(signals.len(), 2, "expected both signals: {signals:?}");
+        assert!(signals.iter().any(|s| s.kind == TriggerKind::ErrorRecovery));
+        assert!(
+            signals
+                .iter()
+                .any(|s| s.kind == TriggerKind::UserCorrection)
+        );
+        // `highest_priority` projects them down to UserCorrection.
+        let chosen = SignalCollector::highest_priority(&signals).expect("priority");
+        assert_eq!(chosen.kind, TriggerKind::UserCorrection);
+    }
+
+    #[test]
+    fn user_correction_takes_precedence_via_highest_priority() {
         let mut c = SignalCollector::new(1);
         let t = TurnSummary {
             turn_index: 3,
@@ -378,8 +439,9 @@ mod tests {
             feedback_memory_written: true,
             turn_errored: false,
         };
-        let signal = c.record_turn(&t).expect("signal");
-        assert_eq!(signal.kind, TriggerKind::UserCorrection);
+        let signals = c.record_turn(&t);
+        let chosen = SignalCollector::highest_priority(&signals).expect("priority");
+        assert_eq!(chosen.kind, TriggerKind::UserCorrection);
     }
 
     #[test]
@@ -392,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_disabled_suppresses_signals() {
+    fn auto_disabled_still_returns_signals_for_telemetry() {
         let mut c = SignalCollector::new(1);
         c.disable_auto();
         let t = TurnSummary {
@@ -404,25 +466,32 @@ mod tests {
             feedback_memory_written: true,
             turn_errored: false,
         };
-        assert!(c.record_turn(&t).is_none());
+        // The collector returns the signal so telemetry consumers can
+        // see it; the harness still gates firing on
+        // `auto_creation_allowed`.
+        let signals = c.record_turn(&t);
+        assert_eq!(signals.len(), 1);
+        assert!(!c.auto_creation_allowed());
     }
 
     #[test]
-    fn per_session_budget_caps_auto_creation() {
+    fn per_session_budget_does_not_drop_signals() {
         let mut c = SignalCollector::new(1);
         assert!(c.auto_creation_allowed());
         c.record_auto_generated();
         assert!(!c.auto_creation_allowed());
 
-        // Even a clear UserCorrection signal is suppressed once the
-        // budget is exhausted.
+        // The budget is exhausted, but the signal is still emitted; it
+        // is the caller's job to honour `auto_creation_allowed`.
         let t = TurnSummary {
             turn_index: 0,
             tool_calls: vec![],
             feedback_memory_written: true,
             turn_errored: false,
         };
-        assert!(c.record_turn(&t).is_none());
+        let signals = c.record_turn(&t);
+        assert_eq!(signals.len(), 1);
+        assert!(!c.auto_creation_allowed());
     }
 
     #[test]
@@ -442,6 +511,6 @@ mod tests {
             ],
             true,
         );
-        assert!(c.record_turn(&t).is_none());
+        assert!(c.record_turn(&t).is_empty());
     }
 }

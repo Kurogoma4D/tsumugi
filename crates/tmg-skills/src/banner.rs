@@ -100,7 +100,7 @@ pub fn format_banner(names: &[String]) -> Option<String> {
     let plural = if count == 1 { "skill" } else { "skills" };
     let quoted: Vec<String> = names.iter().map(|n| format!("\"{n}\"")).collect();
     Some(format!(
-        "{count} new {plural} auto-generated this session: {}",
+        "\u{26a1} {count} new {plural} auto-generated this session: {}",
         quoted.join(", ")
     ))
 }
@@ -146,6 +146,7 @@ mod tests {
     #[test]
     fn format_banner_singular() {
         let s = format_banner(&["deploy-rust".to_owned()]).unwrap();
+        assert!(s.starts_with('\u{26a1}'), "missing prefix in {s:?}");
         assert!(s.contains("1 new skill"));
         assert!(s.contains("\"deploy-rust\""));
     }
@@ -153,6 +154,7 @@ mod tests {
     #[test]
     fn format_banner_plural() {
         let s = format_banner(&["a".to_owned(), "b".to_owned()]).unwrap();
+        assert!(s.starts_with('\u{26a1}'), "missing prefix in {s:?}");
         assert!(s.contains("2 new skills"));
         assert!(s.contains("\"a\""));
         assert!(s.contains("\"b\""));

@@ -140,7 +140,19 @@ impl Action {
 }
 
 impl SkillManageTool {
-    async fn execute_inner(
+    /// Run the tool's inner logic outside the [`Tool`] dispatch path.
+    ///
+    /// Public so the harness's autonomous skill creation flow
+    /// (`SkillsRuntime::apply_verdict`) can invoke `skill_manage`
+    /// directly with a `provenance: agent` create payload — the LLM
+    /// itself does not need this tool in its registry to be able to
+    /// land an auto-generated skill.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces every variant of [`ToolError`] the regular
+    /// [`Tool::execute`] path can produce.
+    pub async fn execute_inner(
         &self,
         params: serde_json::Value,
         ctx: &SandboxContext,
@@ -283,8 +295,16 @@ impl SkillManageTool {
         let existing = read_existing_skill(&skill_md).await?;
         let (mut frontmatter, _body) = split_skill_md(&existing, &skill_md)?;
 
-        // Optional metadata refresh on edit.
+        // Optional metadata refresh on edit. An empty `description` is
+        // rejected (consistent with `create`, where `description` is
+        // required and non-empty); callers who want to clear the field
+        // must use `patch` to delete the line explicitly.
         if let Some(desc) = optional_str(params, "description") {
+            if desc.trim().is_empty() {
+                return Err(ToolError::invalid_params(
+                    "description must not be empty; omit the field to keep the existing value",
+                ));
+            }
             frontmatter.description = desc.to_owned();
         }
         if let Ok(invocation) = parse_invocation(params) {
@@ -553,8 +573,7 @@ fn bump_version(current: Option<&str>) -> String {
     }
     let major: u32 = parts[0].parse().unwrap_or(0);
     let minor: u32 = parts[1].parse().unwrap_or(0);
-    let patch: u32 = parts[2].parse().unwrap_or(0);
-    let _ = patch; // silence unused; patch is preserved at 0 on minor bump.
+    // patch component is intentionally reset to 0 on a minor bump.
     format!("{major}.{}.0", minor + 1)
 }
 
@@ -606,12 +625,28 @@ pub async fn regenerate_index(skills_root: &Path) -> Result<(), ToolError> {
             continue;
         }
         let skill_md = path.join("SKILL.md");
-        let Ok(content) = tokio::fs::read_to_string(&skill_md).await else {
-            continue;
+        let content = match tokio::fs::read_to_string(&skill_md).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    path = %skill_md.display(),
+                    error = %e,
+                    "skipping skill in INDEX regeneration: SKILL.md unreadable"
+                );
+                continue;
+            }
         };
         let display = skill_md.display().to_string();
-        let Ok((frontmatter, _body)) = parse_skill_md(&content, &display) else {
-            continue;
+        let (frontmatter, _body) = match parse_skill_md(&content, &display) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::warn!(
+                    path = %skill_md.display(),
+                    error = %e,
+                    "skipping skill in INDEX regeneration: SKILL.md frontmatter parse failed"
+                );
+                continue;
+            }
         };
         let dir_name = path
             .file_name()

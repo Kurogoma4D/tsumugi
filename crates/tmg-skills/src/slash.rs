@@ -28,6 +28,9 @@ pub enum SlashParseError {
     UnknownRunSubcommand(String),
     /// `/run start` requires a workflow id.
     MissingWorkflowId,
+    /// `/skill <body>` body did not match any recognised subcommand.
+    /// The carried string is the offending subcommand name.
+    UnknownSkillSubcommand(String),
 }
 
 impl std::fmt::Display for SlashParseError {
@@ -54,6 +57,9 @@ impl std::fmt::Display for SlashParseError {
                     f,
                     "/run start requires a workflow id (e.g. /run start build)"
                 )
+            }
+            Self::UnknownSkillSubcommand(rest) => {
+                write!(f, "unknown /skill subcommand: {rest:?}; expected `capture`",)
             }
         }
     }
@@ -118,7 +124,7 @@ pub fn parse_slash_command(input: &str) -> SlashParseResult {
     // a typed command.
     match command {
         "skills" => return Ok(Some(parse_skills_subcommand(args.as_deref()))),
-        "skill" => return Ok(Some(parse_skill_subcommand(args.as_deref()))),
+        "skill" => return parse_skill_subcommand(args.as_deref()).map(Some),
         "clear" => return Ok(Some(SlashCommand::Clear)),
         "compact" => return Ok(Some(SlashCommand::Compact)),
         "exit" | "quit" => return Ok(Some(SlashCommand::Exit)),
@@ -225,15 +231,24 @@ fn parse_skills_subcommand(args: Option<&str>) -> SlashCommand {
 
 /// Parse the body of a `/skill ...` invocation.
 ///
+/// `/skill` (no body) → [`SlashCommand::ListSkills`].
 /// `/skill capture` → [`SlashCommand::SkillCapture`].
-/// Anything else falls back to [`SlashCommand::ListSkills`] so the user
-/// sees the available skills.
-fn parse_skill_subcommand(args: Option<&str>) -> SlashCommand {
+/// Anything else returns [`SlashParseError::UnknownSkillSubcommand`]
+/// so typos like `/skill captuer` surface as an explicit error rather
+/// than silently falling back to listing.
+fn parse_skill_subcommand(args: Option<&str>) -> Result<SlashCommand, SlashParseError> {
     let body = args.unwrap_or("").trim();
-    if body.eq_ignore_ascii_case("capture") {
-        return SlashCommand::SkillCapture;
+    if body.is_empty() {
+        return Ok(SlashCommand::ListSkills);
     }
-    SlashCommand::ListSkills
+    let (sub, _rest) = match body.split_once(char::is_whitespace) {
+        Some((s, r)) => (s, r.trim()),
+        None => (body, ""),
+    };
+    if sub.eq_ignore_ascii_case("capture") {
+        return Ok(SlashCommand::SkillCapture);
+    }
+    Err(SlashParseError::UnknownSkillSubcommand(sub.to_owned()))
 }
 
 /// Parse the body of a `/memory ...` invocation.
@@ -307,7 +322,6 @@ impl std::fmt::Display for crate::types::InvocationPolicy {
 #[expect(
     clippy::expect_used,
     clippy::panic,
-    clippy::match_wildcard_for_single_variants,
     reason = "tests assert with expect/panic for clarity; the workspace policy denies them in production code"
 )]
 mod tests {
@@ -590,6 +604,15 @@ mod tests {
             parse_slash_command("/skill").expect("ok"),
             Some(SlashCommand::ListSkills)
         );
+    }
+
+    #[test]
+    fn parse_skill_unknown_subcommand_errors() {
+        let err = parse_slash_command("/skill captuer").expect_err("unknown subcommand");
+        match err {
+            SlashParseError::UnknownSkillSubcommand(rest) => assert_eq!(rest, "captuer"),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]

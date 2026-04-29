@@ -366,6 +366,7 @@ impl App {
 
     /// Take the pending `/skill capture` request, if any. Returns
     /// `true` exactly once per dispatch.
+    #[must_use = "the consumed capture request must be acted on or it is lost"]
     pub fn take_skill_capture_request(&mut self) -> bool {
         std::mem::replace(&mut self.skill_capture_requested, false)
     }
@@ -373,6 +374,7 @@ impl App {
     /// Drain pending `/skills reject <name>` requests. The harness is
     /// expected to remove each skill directory and write a feedback
     /// memory entry.
+    #[must_use = "the drained rejection list must be processed or the user request is lost"]
     pub fn drain_skill_rejection_requests(&mut self) -> Vec<String> {
         std::mem::take(&mut self.skill_rejection_requests)
     }

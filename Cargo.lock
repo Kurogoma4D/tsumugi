@@ -2221,6 +2221,7 @@ dependencies = [
  "tmg-tools",
  "tokio",
  "toml",
+ "tracing",
 ]
 
 [[package]]

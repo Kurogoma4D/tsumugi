@@ -17,11 +17,16 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "sync"] }
 dirs = { workspace = true }
 chrono = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs"] }
 tempfile = { workspace = true }
 proptest = { workspace = true }
+# Integration test (`tests/critic_pipeline.rs`) exercises
+# `SkillManageTool` through the canonical `tmg_tools::ToolRegistry`
+# dispatch path.
+tmg-tools = { workspace = true }
 
 [lints]
 workspace = true
