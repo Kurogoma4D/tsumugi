@@ -13,6 +13,7 @@ tmg-harness = { workspace = true }
 tmg-memory = { workspace = true }
 tmg-search = { workspace = true }
 tmg-skills = { workspace = true }
+tmg-trajectory = { workspace = true }
 tmg-workflow = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
