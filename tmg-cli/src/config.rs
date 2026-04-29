@@ -550,6 +550,40 @@ fn parse_humantime_duration(field: &str, value: &str) -> Result<std::time::Durat
         })
 }
 
+/// Partial `[search]` config — fields are `Option` so a partial layer
+/// can override one knob without resetting the others. Issue #53.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PartialSearchConfig {
+    pub enabled: Option<bool>,
+    pub db_path: Option<PathBuf>,
+    pub ingest_on_session_end: Option<bool>,
+}
+
+impl PartialSearchConfig {
+    fn merge_from(&mut self, other: &Self) {
+        if other.enabled.is_some() {
+            self.enabled = other.enabled;
+        }
+        if other.db_path.is_some() {
+            self.db_path.clone_from(&other.db_path);
+        }
+        if other.ingest_on_session_end.is_some() {
+            self.ingest_on_session_end = other.ingest_on_session_end;
+        }
+    }
+
+    fn into_final(self) -> SearchConfig {
+        let defaults = SearchConfig::default();
+        SearchConfig {
+            enabled: self.enabled.unwrap_or(defaults.enabled),
+            db_path: self.db_path.unwrap_or(defaults.db_path),
+            ingest_on_session_end: self
+                .ingest_on_session_end
+                .unwrap_or(defaults.ingest_on_session_end),
+        }
+    }
+}
+
 /// Partial top-level config used for deserialization and merging.
 ///
 /// Partial memory config used for deserialization / merging. Each
@@ -618,6 +652,8 @@ struct PartialTsumugiConfig {
     pub workflow: PartialWorkflowConfig,
     #[serde(default)]
     pub memory: PartialMemoryConfig,
+    #[serde(default)]
+    pub search: PartialSearchConfig,
 }
 
 impl PartialTsumugiConfig {
@@ -631,6 +667,7 @@ impl PartialTsumugiConfig {
         self.harness.merge_from(&other.harness);
         self.workflow.merge_from(&other.workflow);
         self.memory.merge_from(&other.memory);
+        self.search.merge_from(&other.search);
     }
 
     /// Apply environment variable overrides (`TMG_*` prefix).
@@ -915,6 +952,7 @@ impl PartialTsumugiConfig {
             harness: self.harness.into_final()?,
             workflow: self.workflow.into_final()?,
             memory: self.memory.into_final(),
+            search: self.search.into_final(),
         })
     }
 }
@@ -1254,6 +1292,10 @@ pub struct TsumugiConfig {
     /// Memory layer settings (issue #52).
     #[serde(default)]
     pub memory: MemoryConfig,
+
+    /// Cross-session search layer settings (issue #53).
+    #[serde(default)]
+    pub search: SearchConfig,
 }
 
 /// `[memory]` section: project-scoped persistent memory configuration.
@@ -1351,6 +1393,65 @@ impl MemoryConfig {
             index_max_lines: self.index_max_lines,
             entry_max_chars: self.entry_max_chars,
             total_files_limit: self.total_files_limit,
+        }
+    }
+}
+
+/// `[search]` section: cross-session search index configuration.
+///
+/// Issue #53. The search layer indexes session summaries (and turn
+/// transcripts once #55 lands) into a `SQLite` + FTS5 store at
+/// `db_path`. The hook that ingests sessions on the session-end path
+/// is gated by `ingest_on_session_end`; the master switch `enabled`
+/// gates both the hook and the `session_search` tool registration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchConfig {
+    /// Master switch — `false` keeps the tool unregistered and skips
+    /// session-end ingestion entirely.
+    #[serde(default = "default_search_enabled")]
+    pub enabled: bool,
+    /// `SQLite` database path, relative to the project root or absolute.
+    /// Defaults to `.tsumugi/state.db`.
+    #[serde(default = "default_search_db_path")]
+    pub db_path: PathBuf,
+    /// Fire the search-index ingest hook on every session-end
+    /// `SessionLog::save`. When `false`, the only path that populates
+    /// the DB is the `tmg search rebuild` CLI command (or startup
+    /// rebuild scan).
+    #[serde(default = "default_search_ingest_on_session_end")]
+    pub ingest_on_session_end: bool,
+}
+
+const fn default_search_enabled() -> bool {
+    true
+}
+
+fn default_search_db_path() -> PathBuf {
+    PathBuf::from(".tsumugi/state.db")
+}
+
+const fn default_search_ingest_on_session_end() -> bool {
+    true
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_search_enabled(),
+            db_path: default_search_db_path(),
+            ingest_on_session_end: default_search_ingest_on_session_end(),
+        }
+    }
+}
+
+impl SearchConfig {
+    /// Resolve `db_path` against `project_root` for relative paths.
+    #[must_use]
+    pub fn resolve_db_path(&self, project_root: &Path) -> PathBuf {
+        if self.db_path.is_absolute() {
+            self.db_path.clone()
+        } else {
+            project_root.join(&self.db_path)
         }
     }
 }

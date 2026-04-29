@@ -54,7 +54,7 @@ pub use run::{Run, RunId, RunScope, RunStatus, RunSummary};
 pub use runner::{
     DEFAULT_BOOTSTRAP_MAX_TOKENS, DEFAULT_CONTEXT_FORCE_ROTATE_THRESHOLD,
     DEFAULT_SESSION_LOG_COMPRESS_AFTER, DEFAULT_SESSION_TIMEOUT, RunProgressEvent,
-    RunProgressReceiver, RunRunner,
+    RunProgressReceiver, RunRunner, SessionEndHook,
 };
 pub use session::{Session, SessionEndTrigger, SessionHandle};
 pub use sink::HarnessStreamSink;

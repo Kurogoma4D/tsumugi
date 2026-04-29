@@ -31,6 +31,7 @@ tmg-harness = { workspace = true }
 tmg-llm = { workspace = true }
 tmg-memory = { workspace = true }
 tmg-sandbox = { workspace = true }
+tmg-search = { workspace = true }
 tmg-skills = { workspace = true }
 tmg-tools = { workspace = true }
 tmg-tui = { workspace = true }

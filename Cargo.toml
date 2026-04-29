@@ -4,6 +4,7 @@ members = [
     "crates/tmg-core",
     "crates/tmg-llm",
     "crates/tmg-memory",
+    "crates/tmg-search",
     "crates/tmg-tools",
     "crates/tmg-skills",
     "crates/tmg-agents",
@@ -61,6 +62,11 @@ rand = "0.9"
 # Regex
 regex = "1"
 
+# SQLite (FTS5 search index in tmg-search)
+# `bundled` ships sqlite3 with the crate so we don't depend on a system
+# library; the bundled build enables FTS5 by default. See issue #53.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # Tree-sitter (signature extraction in tmg-tools)
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
@@ -94,6 +100,7 @@ libc = "0.2"
 tmg-core = { path = "crates/tmg-core" }
 tmg-llm = { path = "crates/tmg-llm" }
 tmg-memory = { path = "crates/tmg-memory" }
+tmg-search = { path = "crates/tmg-search" }
 tmg-tools = { path = "crates/tmg-tools" }
 tmg-skills = { path = "crates/tmg-skills" }
 tmg-agents = { path = "crates/tmg-agents" }

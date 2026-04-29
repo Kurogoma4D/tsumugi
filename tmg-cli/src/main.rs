@@ -19,7 +19,7 @@ mod pool_setup;
 mod run_commands;
 mod workflow_commands;
 
-use config::{HarnessConfig, SandboxConfigSection, TsumugiConfig};
+use config::{HarnessConfig, SandboxConfigSection, SearchConfig, TsumugiConfig};
 
 /// tsumugi - a local-LLM-powered coding agent
 #[derive(Parser, Debug)]
@@ -111,6 +111,36 @@ enum Command {
         #[command(subcommand)]
         op: MemoryCommand,
     },
+    /// Cross-session full-text search over indexed session logs (issue #53).
+    Search {
+        /// Sub-operation on the search index.
+        #[command(subcommand)]
+        op: SearchCommand,
+    },
+}
+
+/// Operations under `tmg search`. Issue #53.
+#[derive(Subcommand, Debug)]
+enum SearchCommand {
+    /// Run an FTS5 query against the indexed session log.
+    Query {
+        /// FTS5 MATCH expression.
+        query: String,
+        /// Maximum number of hits to return (clamped to 1..=200).
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Restrict the search to one of `summary` / `turns` / `all`.
+        #[arg(long, default_value = "all")]
+        scope: String,
+        /// Optional ISO8601 / RFC3339 lower bound on `started_at`.
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// Re-ingest every `session_NNN.json` under the project's runs
+    /// directory that is not yet present in the index.
+    Rebuild,
+    /// Print DB statistics (size, session / turn counts).
+    Stats,
 }
 
 /// Operations under `tmg memory`. Issue #52.
@@ -295,6 +325,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Memory { op }) => {
             dispatch_memory_command(op, &config, cli.event_log.as_deref())
         }
+        Some(Command::Search { op }) => dispatch_search_command(op, &config),
         None => {
             if let Some(prompt) = cli.prompt {
                 run_prompt(
@@ -303,6 +334,7 @@ fn main() -> anyhow::Result<()> {
                     &prompt,
                     cli.event_log.as_deref(),
                     &config.memory,
+                    &config.search,
                     &config.sandbox,
                     context_config,
                     config.llm.tool_calling,
@@ -319,6 +351,7 @@ fn main() -> anyhow::Result<()> {
                     &config.workflow,
                     &config.skills,
                     &config.memory,
+                    &config.search,
                     config.llm.subagent_pool.as_ref(),
                     None,
                 )
@@ -373,6 +406,102 @@ fn dispatch_memory_command(
     event_log: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     memory_commands::dispatch(op, config, event_log)
+}
+
+/// Dispatch one `tmg search <op>` invocation. Issue #53.
+fn dispatch_search_command(op: SearchCommand, config: &TsumugiConfig) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir().context("reading current working directory")?;
+    let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+    if !config.search.enabled {
+        anyhow::bail!("[search] is disabled in tsumugi.toml; enable it before running tmg search");
+    }
+    let db_path = config.search.resolve_db_path(&canonical_cwd);
+    let index = tmg_search::SearchIndex::open(&db_path)
+        .with_context(|| format!("opening search index at {}", db_path.display()))?;
+
+    match op {
+        SearchCommand::Query {
+            query,
+            limit,
+            scope,
+            since,
+        } => search_commands_query(&index, &query, limit, &scope, since.as_deref()),
+        SearchCommand::Rebuild => search_commands_rebuild(&index, config, &canonical_cwd),
+        SearchCommand::Stats => search_commands_stats(&index),
+    }
+}
+
+#[expect(
+    clippy::print_stdout,
+    reason = "stdout is the contract for `tmg search` CLI output"
+)]
+fn search_commands_query(
+    index: &tmg_search::SearchIndex,
+    query: &str,
+    limit: usize,
+    scope: &str,
+    since: Option<&str>,
+) -> anyhow::Result<()> {
+    let scope = tmg_search::SearchScope::parse(scope);
+    let since_dt = match since {
+        Some(s) => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .with_context(|| format!("parsing --since {s:?}"))?
+                .with_timezone(&chrono::Utc),
+        ),
+        None => None,
+    };
+    let hits = index
+        .query(query, limit, scope, since_dt)
+        .context("running search query")?;
+    if hits.is_empty() {
+        println!("(no matches for query {query:?})");
+        return Ok(());
+    }
+    for hit in hits {
+        println!(
+            "[{:.3}] {}#{}  {}\n  summary: {}\n  snippet: {}\n",
+            hit.score, hit.run_id, hit.session_num, hit.started_at, hit.summary, hit.snippet,
+        );
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::print_stdout,
+    reason = "stdout is the contract for `tmg search` CLI output"
+)]
+fn search_commands_rebuild(
+    index: &tmg_search::SearchIndex,
+    config: &TsumugiConfig,
+    cwd: &std::path::Path,
+) -> anyhow::Result<()> {
+    let runs_dir = if config.harness.runs_dir.is_absolute() {
+        config.harness.runs_dir.clone()
+    } else {
+        cwd.join(&config.harness.runs_dir)
+    };
+    let count = index
+        .rebuild_from_disk(&runs_dir)
+        .context("rebuilding search index from disk")?;
+    println!(
+        "ingested {count} new session(s) from {}",
+        runs_dir.display()
+    );
+    Ok(())
+}
+
+#[expect(
+    clippy::print_stdout,
+    reason = "stdout is the contract for `tmg search` CLI output"
+)]
+fn search_commands_stats(index: &tmg_search::SearchIndex) -> anyhow::Result<()> {
+    let stats = index.stats().context("reading search index stats")?;
+    println!("db_path:  {}", stats.db_path.display());
+    println!("size:     {} bytes", stats.size_bytes);
+    println!("sessions: {}", stats.sessions);
+    println!("turns:    {}", stats.turns);
+    Ok(())
 }
 
 // `load_memory_index_for_prompt` was the bespoke helper used by the
@@ -452,6 +581,7 @@ fn dispatch_run_command(op: RunCommand, config: &TsumugiConfig) -> anyhow::Resul
                 &config.workflow,
                 &config.skills,
                 &config.memory,
+                &config.search,
                 config.llm.subagent_pool.as_ref(),
                 resolved.as_ref(),
             )
@@ -513,6 +643,7 @@ fn run_prompt(
     prompt: &str,
     event_log: Option<&std::path::Path>,
     memory_config: &config::MemoryConfig,
+    search_config: &SearchConfig,
     sandbox_config: &SandboxConfigSection,
     context_config: tmg_core::ContextConfig,
     tool_calling_mode: tmg_llm::ToolCallingMode,
@@ -545,6 +676,31 @@ fn run_prompt(
             sandbox_config.to_sandbox_config(&canonical_cwd),
         ));
 
+        // Issue #53: open the cross-session search index for read-only
+        // use in one-shot mode. The DB is **never** written to from
+        // here — one-shot mode does not construct a `RunRunner`, so no
+        // session-end hook is registered and `ingest_session` is never
+        // called. The agent gets a search tool over whatever the TUI /
+        // workflow paths previously indexed.
+        let search_index_for_oneshot: Option<Arc<tmg_search::SearchIndex>> = if search_config
+            .enabled
+        {
+            let db_path = search_config.resolve_db_path(&canonical_cwd);
+            match tmg_search::SearchIndex::open(&db_path) {
+                Ok(idx) => Some(Arc::new(idx)),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %db_path.display(),
+                        error = %e,
+                        "failed to open search index for one-shot prompt; tool returns soft errors"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Build the tool registry: built-ins + (optionally) the memory
         // tool. No subagent registration in one-shot mode because
         // there's no Run/Workflow/Subagent context here; the goal is
@@ -553,6 +709,18 @@ fn run_prompt(
         let mut registry = tmg_tools::default_registry();
         if memory_config.enabled {
             registry.register(tmg_memory::MemoryTool::new(Arc::clone(&memory_store)));
+        }
+        // Issue #53: register the cross-session search tool in
+        // one-shot mode so the agent can still query historical
+        // sessions even though no new sessions are being ingested
+        // (one-shot mode never constructs a RunRunner). Index opening
+        // is best-effort — a failure surfaces as a soft tool error.
+        if search_config.enabled
+            && let Some(idx) = search_index_for_oneshot.as_ref()
+        {
+            registry.register(tmg_search::SessionSearchTool::new(Arc::clone(idx)));
+        } else if search_config.enabled {
+            registry.register(tmg_search::SessionSearchTool::disabled());
         }
 
         let mut agent = tmg_core::AgentLoop::with_context_config(
@@ -802,6 +970,7 @@ fn run_tui(
     workflow_config: &tmg_workflow::WorkflowConfig,
     skills_config: &tmg_skills::SkillsConfig,
     memory_config: &config::MemoryConfig,
+    search_config: &SearchConfig,
     subagent_pool: Option<&tmg_llm::PoolConfig>,
     explicit_run_id: Option<&tmg_harness::RunId>,
 ) -> anyhow::Result<()> {
@@ -916,6 +1085,58 @@ fn run_tui(
                 );
             }
         });
+
+        // Cross-session search index (issue #53). Initialise the SQLite
+        // + FTS5 store under `<project>/.tsumugi/state.db`, run the
+        // startup rebuild scan so any session_log files written before
+        // the search feature was wired are picked up, then install a
+        // session-end hook on the runner so live sessions stream into
+        // the index. Failures in any of these steps degrade gracefully
+        // — the index becomes `None`, the tool reports a soft error,
+        // and the rest of the agent flow continues normally.
+        let search_index: Option<Arc<tmg_search::SearchIndex>> = if search_config.enabled {
+            let db_path = search_config.resolve_db_path(&canonical_cwd);
+            match tmg_search::SearchIndex::open(&db_path) {
+                Ok(idx) => {
+                    let runs_dir_for_rebuild = store.runs_dir().to_path_buf();
+                    if let Err(e) = idx.rebuild_from_disk(&runs_dir_for_rebuild) {
+                        tracing::warn!(
+                            error = %e,
+                            "search index rebuild_from_disk failed; continuing with whatever was indexed"
+                        );
+                    }
+                    Some(Arc::new(idx))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %db_path.display(),
+                        error = %e,
+                        "failed to open search index; session_search tool will return soft errors"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if search_config.enabled
+            && search_config.ingest_on_session_end
+            && let Some(index) = search_index.as_ref()
+        {
+            let index_for_hook = Arc::clone(index);
+            let hook: tmg_harness::SessionEndHook =
+                Arc::new(move |run_id: &str, session: &tmg_harness::Session| {
+                    if let Err(e) = index_for_hook.ingest_session(run_id, session) {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            session = session.index,
+                            error = %e,
+                            "search index ingest failed at session end"
+                        );
+                    }
+                });
+            runner.set_session_end_hook(Some(hook));
+        }
 
         let session_handle = runner
             .begin_session()
@@ -1111,6 +1332,20 @@ fn run_tui(
             Arc::clone(&subagent_manager),
             custom_agent_defs.clone(),
         ));
+        // Issue #53: register the cross-session FTS5 search tool when
+        // enabled. When the index couldn't be opened we still register
+        // a `disabled` tool so the LLM gets a soft error rather than a
+        // missing-tool dispatch failure.
+        if search_config.enabled {
+            match search_index.as_ref() {
+                Some(idx) => {
+                    registry.register(tmg_search::SessionSearchTool::new(Arc::clone(idx)));
+                }
+                None => {
+                    registry.register(tmg_search::SessionSearchTool::disabled());
+                }
+            }
+        }
         register_run_tools(&mut registry, Arc::clone(&runner)).await;
 
         // Workflow discovery + `run_workflow` / `workflow_status` tool
@@ -1340,6 +1575,7 @@ fn run_tui(
         } else {
             None
         };
+        let search_index_for_tui = search_index.as_ref().map(Arc::clone);
         let tui_result = tmg_tui::run(
             agent,
             model,
@@ -1356,6 +1592,7 @@ fn run_tui(
             workflow_metas.clone(),
             skill_metas,
             memory_store_for_tui,
+            search_index_for_tui,
         )
         .await;
 

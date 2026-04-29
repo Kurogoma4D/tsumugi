@@ -33,6 +33,7 @@ use tmg_agents::{CustomAgentDef, SubagentManager};
 use tmg_core::AgentLoop;
 use tmg_harness::{RunProgressReceiver, RunRunner, RunSummary};
 use tmg_memory::MemoryStore;
+use tmg_search::SearchIndex;
 use tmg_skills::SkillMeta;
 use tmg_workflow::{WorkflowMeta, WorkflowProgress};
 use tokio::sync::{Mutex, mpsc};
@@ -95,6 +96,7 @@ pub async fn run(
     workflows: Vec<WorkflowMeta>,
     skills: Vec<SkillMeta>,
     memory_store: Option<Arc<MemoryStore>>,
+    search_index: Option<Arc<SearchIndex>>,
 ) -> Result<(), TuiError> {
     // Pre-warm the syntect bundle off the rendering thread. Loading
     // `SyntaxSet::load_defaults_newlines` + `ThemeSet::load_defaults`
@@ -173,6 +175,10 @@ pub async fn run(
 
     if let Some(store) = memory_store {
         app.set_memory_store(store);
+    }
+
+    if let Some(idx) = search_index {
+        app.set_search_index(idx);
     }
 
     let result = event::run_event_loop(&mut terminal, &mut app, cancel).await;

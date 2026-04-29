@@ -125,6 +125,11 @@ pub fn parse_slash_command(input: &str) -> SlashParseResult {
         "workflows" => return Ok(Some(SlashCommand::ListWorkflows)),
         "run" => return parse_run_subcommand(args.as_deref()).map(Some),
         "memory" => return Ok(Some(parse_memory_subcommand(args.as_deref()))),
+        "search" => {
+            return Ok(Some(SlashCommand::Search {
+                query: args.unwrap_or_default(),
+            }));
+        }
         _ => {}
     }
 
