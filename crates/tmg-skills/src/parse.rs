@@ -129,7 +129,33 @@ This is the body.
         assert_eq!(fm.description, "A test skill");
         assert_eq!(fm.invocation, InvocationPolicy::Auto);
         assert!(fm.allowed_tools.is_none());
+        // Optional fields added in #54 are absent on legacy SKILL.md
+        // files (this is the agentskills.io compat case).
+        assert!(fm.version.is_none());
+        assert!(fm.created_at.is_none());
+        assert!(fm.updated_at.is_none());
+        assert!(fm.provenance.is_none());
         assert_eq!(body, "This is the body.\n");
+    }
+
+    #[test]
+    fn parse_frontmatter_with_provenance() {
+        // Auto-generated skills from `skill_critic` carry a `provenance:
+        // agent` tag plus version/timestamps. Confirm the parser
+        // accepts the extended shape.
+        let content = "\
+---
+name: deploy-rust
+description: Publish a Rust crate to crates.io
+version: \"1.0.0\"
+provenance: agent
+---
+
+Steps...
+";
+        let (fm, _) = parse_skill_md(content, "test.md").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(fm.version.as_deref(), Some("1.0.0"));
+        assert_eq!(fm.provenance, Some(crate::types::Provenance::Agent));
     }
 
     #[test]
@@ -189,6 +215,10 @@ Review the code carefully.
             description: "Tests roundtrip".to_owned(),
             invocation: InvocationPolicy::ExplicitOnly,
             allowed_tools: Some(vec!["file_read".to_owned()]),
+            version: None,
+            created_at: None,
+            updated_at: None,
+            provenance: None,
         };
 
         let yaml = serialize_frontmatter(&original).unwrap_or_else(|e| panic!("{e}"));
@@ -213,6 +243,10 @@ Review the code carefully.
             description: "Tests formatting".to_owned(),
             invocation: InvocationPolicy::Auto,
             allowed_tools: None,
+            version: None,
+            created_at: None,
+            updated_at: None,
+            provenance: None,
         };
         let body = "Do the thing.\n";
 
@@ -263,6 +297,10 @@ Review the code carefully.
                         description,
                         invocation,
                         allowed_tools,
+                        version: None,
+                        created_at: None,
+                        updated_at: None,
+                        provenance: None,
                     }
                 })
         }

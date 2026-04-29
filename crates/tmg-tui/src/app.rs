@@ -286,6 +286,22 @@ pub struct App {
     /// on the registry so the TUI display path and the LLM tool see the
     /// same on-disk state.
     search_index: Option<Arc<SearchIndex>>,
+
+    /// Whether `/skills disable-auto` was issued during this session
+    /// (issue #54). The harness inspects this flag through
+    /// [`Self::skill_auto_disabled`] before invoking `skill_critic`.
+    skill_auto_disabled: bool,
+
+    /// Set when `/skill capture` is requested. The harness flips it
+    /// back to `false` once the manual signal is consumed. Tracked
+    /// here so the request survives a brief gap between dispatch and
+    /// the next agent-loop turn.
+    skill_capture_requested: bool,
+
+    /// Names of skills awaiting rejection via `/skills reject <name>`
+    /// (issue #54). Drained by the harness, which deletes each skill
+    /// directory and writes a feedback memory entry.
+    skill_rejection_requests: Vec<String>,
 }
 
 impl App {
@@ -332,7 +348,33 @@ impl App {
             pending_slash: None,
             memory_store: None,
             search_index: None,
+            skill_auto_disabled: false,
+            skill_capture_requested: false,
+            skill_rejection_requests: Vec::new(),
         }
+    }
+
+    /// Whether `/skills disable-auto` was issued during this session.
+    ///
+    /// The harness consults this flag before spawning `skill_critic`;
+    /// when `true`, autonomous skill creation is suppressed for the
+    /// remainder of the session.
+    #[must_use]
+    pub fn skill_auto_disabled(&self) -> bool {
+        self.skill_auto_disabled
+    }
+
+    /// Take the pending `/skill capture` request, if any. Returns
+    /// `true` exactly once per dispatch.
+    pub fn take_skill_capture_request(&mut self) -> bool {
+        std::mem::replace(&mut self.skill_capture_requested, false)
+    }
+
+    /// Drain pending `/skills reject <name>` requests. The harness is
+    /// expected to remove each skill directory and write a feedback
+    /// memory entry.
+    pub fn drain_skill_rejection_requests(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.skill_rejection_requests)
     }
 
     /// Install the shared memory store so the `/memory` slash commands
@@ -856,6 +898,41 @@ impl App {
             }
             SlashCommand::Search { query } => {
                 self.show_search_results(&query);
+            }
+            // Skill capture / reject / disable-auto (issue #54). The
+            // actual signal-collector and skill_critic spawn happen on
+            // the harness side; the TUI just records the user intent
+            // here as a system chat entry so the next agent turn can
+            // observe it. When the harness wiring lands the body of
+            // these branches will dispatch to the SignalCollector.
+            SlashCommand::SkillCapture => {
+                self.skill_capture_requested = true;
+                self.chat_entries.push(ChatEntry {
+                    role: Role::System,
+                    text: "Skill capture requested for the current turn range. The next \
+                           agent loop will run the skill_critic over the recent activity."
+                        .to_owned(),
+                });
+            }
+            SlashCommand::SkillsDisableAuto => {
+                self.skill_auto_disabled = true;
+                self.chat_entries.push(ChatEntry {
+                    role: Role::System,
+                    text: "Autonomous skill creation is disabled for this session. Use \
+                           /skill capture to opt back in for a single turn."
+                        .to_owned(),
+                });
+            }
+            SlashCommand::SkillReject { name } => {
+                self.skill_rejection_requests.push(name.as_str().to_owned());
+                self.chat_entries.push(ChatEntry {
+                    role: Role::System,
+                    text: format!(
+                        "Queued rejection for skill {:?}; the harness will delete the \
+                         skill directory and record the reason in feedback memory.",
+                        name.as_str()
+                    ),
+                });
             }
             // The /run family and /<skill> need async work (harness
             // mutex, workflow tools). Defer to the event loop.

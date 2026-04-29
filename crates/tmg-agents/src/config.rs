@@ -85,6 +85,19 @@ pub enum AgentType {
     /// the cost of the gating decision stays small relative to the run
     /// itself; see [`crate::escalator`] for the verdict parser.
     Escalator,
+
+    /// Autonomous skill-creation judge (issue #54).
+    ///
+    /// Read-only critic that, given a candidate turn range plus its
+    /// tool-call summary, decides whether the recently completed
+    /// procedure should be saved as a reusable Skill. Returns a
+    /// strict JSON verdict consumed by
+    /// [`tmg_skills::critic::parse_verdict`].
+    ///
+    /// Allowed tools: `file_read`, `list_dir`. Like
+    /// [`AgentType::Escalator`], it is designed to run on a lightweight
+    /// endpoint (`[skills.critic]` in `tsumugi.toml`).
+    SkillCritic,
 }
 
 impl AgentType {
@@ -97,6 +110,7 @@ impl AgentType {
         Self::Tester,
         Self::Qa,
         Self::Escalator,
+        Self::SkillCritic,
     ];
 
     /// Return the tool names allowed for this agent type.
@@ -132,7 +146,7 @@ impl AgentType {
                 "feature_list_mark_passing",
                 "file_read",
             ],
-            Self::Escalator => &["file_read", "list_dir"],
+            Self::Escalator | Self::SkillCritic => &["file_read", "list_dir"],
         }
     }
 
@@ -166,7 +180,9 @@ impl AgentType {
     #[must_use]
     pub fn sandbox_mode(&self) -> SandboxMode {
         match self {
-            Self::Explore | Self::Plan | Self::Qa | Self::Escalator => SandboxMode::ReadOnly,
+            Self::Explore | Self::Plan | Self::Qa | Self::Escalator | Self::SkillCritic => {
+                SandboxMode::ReadOnly
+            }
             Self::Worker | Self::Initializer | Self::Tester => SandboxMode::WorkspaceWrite,
         }
     }
@@ -283,6 +299,40 @@ impl AgentType {
                    no comments, no extra fields. The harness rejects any \
                    response that does not parse as exactly this schema."
             }
+            Self::SkillCritic => {
+                "You are the skill_critic subagent (issue #54). Decide whether \
+                 the recently completed procedure should be saved as a reusable \
+                 Skill under .tsumugi/skills/. You have read-only access to the \
+                 workspace via `file_read` and `list_dir`; do not attempt any \
+                 other action. \
+                 \
+                 CREATE if: \
+                 - The procedure is non-trivial (involves judgment, error \
+                   handling, or multi-tool orchestration). \
+                 - It is likely to be repeated in this codebase (build / deploy \
+                   / migration / review patterns). \
+                 - It isn't already covered by an existing skill or memory entry. \
+                 \
+                 DO NOT CREATE if: \
+                 - It was a one-off bug fix. \
+                 - It's already in MEMORY.md or an existing skill. \
+                 - The user expressed no preference for repeating this approach. \
+                 \
+                 You MUST output a single JSON object and nothing else: \
+                 \
+                 { \"create\": <bool>, \"name\": <string>?, \"description\": \
+                 <string>?, \"draft\": <string>?, \"reason\": <string> } \
+                 \
+                 Rules: \
+                 - `create` is REQUIRED. \
+                 - `reason` is REQUIRED, one or two sentences, no newlines. \
+                 - When `create` is true, `name`, `description`, and `draft` \
+                   are REQUIRED. `name` must be kebab-case (no slashes, no \
+                   dots). `draft` is the full SKILL.md body to save. \
+                 - When `create` is false, OMIT `name`, `description`, and \
+                   `draft` entirely (do not send null). \
+                 - Output JSON only. No prose, no code fences, no extra fields."
+            }
         }
     }
 
@@ -302,6 +352,9 @@ impl AgentType {
             Self::Escalator => {
                 "Scope-escalation evaluator (read-only; emits strict JSON verdict for harnessing)"
             }
+            Self::SkillCritic => {
+                "Autonomous skill-creation judge (read-only; emits strict JSON verdict for skill capture)"
+            }
         }
     }
 
@@ -315,6 +368,7 @@ impl AgentType {
             Self::Tester => "tester",
             Self::Qa => "qa",
             Self::Escalator => "escalator",
+            Self::SkillCritic => "skill_critic",
         }
     }
 
@@ -348,7 +402,12 @@ impl AgentType {
             | Self::Initializer
             | Self::Tester
             | Self::Qa => true,
-            Self::Escalator => false,
+            // Escalator and SkillCritic are harness-owned: the runtime
+            // invokes them in response to escalation / emergence
+            // signals. Allowing the LLM to spawn them via `spawn_agent`
+            // would let it bypass the per-session limits and gating
+            // policy.
+            Self::Escalator | Self::SkillCritic => false,
         }
     }
 }
@@ -488,11 +547,29 @@ mod tests {
 
     #[test]
     fn all_types_covered() {
-        assert_eq!(AgentType::ALL.len(), 7);
+        assert_eq!(AgentType::ALL.len(), 8);
         assert!(AgentType::ALL.contains(&AgentType::Initializer));
         assert!(AgentType::ALL.contains(&AgentType::Tester));
         assert!(AgentType::ALL.contains(&AgentType::Qa));
         assert!(AgentType::ALL.contains(&AgentType::Escalator));
+        assert!(AgentType::ALL.contains(&AgentType::SkillCritic));
+    }
+
+    #[test]
+    fn skill_critic_spec() {
+        let tools = AgentType::SkillCritic.allowed_tools();
+        assert_eq!(tools, &["file_read", "list_dir"]);
+        assert_eq!(AgentType::SkillCritic.sandbox_mode(), SandboxMode::ReadOnly);
+        // Harness-owned, must not be reachable from `spawn_agent`.
+        assert!(!AgentType::SkillCritic.is_user_spawnable());
+        let prompt = AgentType::SkillCritic.system_prompt();
+        assert!(prompt.contains("create"));
+        assert!(prompt.contains("JSON"));
+        assert!(prompt.contains("draft"));
+        assert_eq!(
+            AgentType::from_name("skill_critic"),
+            Some(AgentType::SkillCritic)
+        );
     }
 
     #[test]
