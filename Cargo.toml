@@ -4,6 +4,7 @@ members = [
     "crates/tmg-core",
     "crates/tmg-llm",
     "crates/tmg-memory",
+    "crates/tmg-search",
     "crates/tmg-tools",
     "crates/tmg-skills",
     "crates/tmg-agents",
@@ -94,6 +95,7 @@ libc = "0.2"
 tmg-core = { path = "crates/tmg-core" }
 tmg-llm = { path = "crates/tmg-llm" }
 tmg-memory = { path = "crates/tmg-memory" }
+tmg-search = { path = "crates/tmg-search" }
 tmg-tools = { path = "crates/tmg-tools" }
 tmg-skills = { path = "crates/tmg-skills" }
 tmg-agents = { path = "crates/tmg-agents" }

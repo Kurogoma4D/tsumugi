@@ -92,6 +92,21 @@ pub enum RunProgressEvent {
 /// type directly.
 pub type RunProgressReceiver = mpsc::Receiver<RunProgressEvent>;
 
+/// Callback fired after a session has been finalised and persisted to
+/// disk via [`SessionLog::save`].
+///
+/// The hook receives the run id (string form) and a borrowed
+/// reference to the just-saved [`Session`] so external subsystems
+/// (e.g. the search index in `tmg-search`) can ingest the session
+/// without re-reading the JSON file. Hooks are invoked synchronously
+/// as the very last step of [`RunRunner::end_session`] /
+/// [`RunRunner::end_session_with_rotation`]; failures are logged via
+/// `tracing::warn!` and swallowed so a broken hook never aborts the
+/// session-end flow.
+///
+/// Issue #53.
+pub type SessionEndHook = Arc<dyn Fn(&str, &Session) + Send + Sync>;
+
 /// Default wall-clock budget for one harnessed session.
 ///
 /// Mirrors the CLI's `[harness] default_session_timeout` default
@@ -169,7 +184,11 @@ impl Drop for EscalationGuard<'_> {
 /// no inter-process locking around session begin/end; running multiple
 /// `tmg` processes against the same `runs_dir` can race on
 /// `session_count` updates. A locking layer is tracked as a follow-up.
-#[derive(Debug)]
+///
+/// Manually implements [`std::fmt::Debug`] because `session_end_hook`
+/// holds a boxed `Fn` closure that does not implement `Debug`. The
+/// hand-rolled formatter elides the closure but otherwise mirrors the
+/// auto-derived output.
 pub struct RunRunner {
     run: Run,
     store: Arc<RunStore>,
@@ -263,6 +282,14 @@ pub struct RunRunner {
     /// allocate the channel — the event publication path is a no-op.
     progress_tx: Option<mpsc::Sender<RunProgressEvent>>,
 
+    /// Optional callback fired after every successful session-end
+    /// `SessionLog::save`. Issue #53 — the search index registers a
+    /// hook here so the cross-session FTS5 store stays incremental.
+    ///
+    /// `None` when no consumer subscribed; hook installation is
+    /// idempotent and the most recently-installed hook wins.
+    session_end_hook: Option<SessionEndHook>,
+
     /// Concurrency gate for [`Self::escalate_to_harnessed`].
     ///
     /// Set to `true` while a promotion is in progress (or after the
@@ -280,6 +307,36 @@ pub struct RunRunner {
     /// successful upgrade has flipped `run.scope` to
     /// [`RunScope::Harnessed`].
     escalation_in_progress: AtomicBool,
+}
+
+impl std::fmt::Debug for RunRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunRunner")
+            .field("run", &self.run)
+            .field("store", &self.store)
+            .field("progress", &self.progress)
+            .field("session_log", &self.session_log)
+            .field("features", &self.features)
+            .field("init_script", &self.init_script)
+            .field("active_session", &self.active_session)
+            .field("bootstrap_max_tokens", &self.bootstrap_max_tokens)
+            .field("default_session_timeout", &self.default_session_timeout)
+            .field(
+                "context_force_rotate_threshold",
+                &self.context_force_rotate_threshold,
+            )
+            .field(
+                "session_log_compress_after",
+                &self.session_log_compress_after,
+            )
+            .field("timeout_watchdog", &self.timeout_watchdog)
+            .field("timeout_config", &self.timeout_config)
+            .field("session_state", &self.session_state)
+            .field("progress_tx", &self.progress_tx)
+            .field("session_end_hook", &self.session_end_hook.is_some())
+            .field("escalation_in_progress", &self.escalation_in_progress)
+            .finish()
+    }
 }
 
 impl RunRunner {
@@ -308,7 +365,47 @@ impl RunRunner {
             timeout_config: None,
             session_state,
             progress_tx: None,
+            session_end_hook: None,
             escalation_in_progress: AtomicBool::new(false),
+        }
+    }
+
+    /// Register a callback that fires after every successful
+    /// session-end `SessionLog::save`. The hook receives the run id
+    /// and a reference to the just-saved [`Session`].
+    ///
+    /// At most one hook is installed at a time; calling this method
+    /// replaces any previously-installed hook. Pass `None` to clear.
+    /// Issue #53.
+    pub fn set_session_end_hook(&mut self, hook: Option<SessionEndHook>) {
+        self.session_end_hook = hook;
+    }
+
+    /// Whether a session-end hook is currently registered.
+    #[must_use]
+    pub fn has_session_end_hook(&self) -> bool {
+        self.session_end_hook.is_some()
+    }
+
+    /// Run the session-end hook if installed. Failures are swallowed
+    /// (log via `tracing::warn!`) so a broken hook cannot abort the
+    /// rotation flow.
+    fn fire_session_end_hook(&self, session: &Session) {
+        let Some(hook) = self.session_end_hook.as_ref() else {
+            return;
+        };
+        // The hook is `Fn(&str, &Session)` — no fallible return.
+        // Wrap in `catch_unwind` so a panicking hook is contained.
+        let run_id = self.run.id.as_str();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hook(run_id, session);
+        }));
+        if result.is_err() {
+            tracing::warn!(
+                run_id = %run_id,
+                session = session.index,
+                "session_end_hook panicked; suppressing to keep rotation flow alive"
+            );
         }
     }
 
@@ -600,6 +697,12 @@ impl RunRunner {
         if let Some(mut session) = self.active_session.take() {
             session.end(trigger);
             self.session_log.save(&session)?;
+            // Issue #53: notify the search index (or any other
+            // subscriber) that a session was just persisted. Fired
+            // BEFORE we re-save `run.toml` so a fast-following
+            // process restart finds both the on-disk session JSON
+            // and the indexed row.
+            self.fire_session_end_hook(&session);
             // Cancel the timeout watchdog only when we actually
             // closed the active session. On an early-return path
             // (no active session, or `SessionMismatch` rejected
@@ -732,6 +835,11 @@ impl RunRunner {
             // compaction-turn machinery is plumbed through.
             session.end(trigger);
             self.session_log.save(&session)?;
+            // Issue #53: fire the search-index ingest hook before we
+            // hand control over to the rotation step so the freshly
+            // closed session is queryable as soon as
+            // `SessionEnded` is observed.
+            self.fire_session_end_hook(&session);
             // The `Session::end_trigger` is now `Some(trigger)`; clone
             // it back out for the published event.
             session
@@ -1212,6 +1320,82 @@ mod tests {
             .unwrap_or_else(|| panic!("session 1 should exist"));
         assert_eq!(session.end_trigger, Some(SessionEndTrigger::Completed));
         assert!(session.ended_at.is_some());
+    }
+
+    /// Issue #53: a registered session-end hook fires once per
+    /// `end_session` with the persisted [`Session`] and the run id.
+    #[test]
+    fn end_session_fires_session_end_hook() {
+        use std::sync::Mutex;
+        let (_tmp, mut runner) = make_runner();
+        let observed: Arc<Mutex<Vec<(String, u32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_hook = Arc::clone(&observed);
+        let hook: SessionEndHook = Arc::new(move |run_id: &str, session: &Session| {
+            observed_for_hook
+                .lock()
+                .unwrap_or_else(|e| panic!("{e}"))
+                .push((run_id.to_owned(), session.index));
+        });
+        runner.set_session_end_hook(Some(hook));
+        assert!(runner.has_session_end_hook());
+
+        let handle = runner.begin_session().unwrap_or_else(|e| panic!("{e}"));
+        runner
+            .end_session(&handle, SessionEndTrigger::Completed)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let observed = observed.lock().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            observed.len(),
+            1,
+            "expected one hook fire, got {observed:?}"
+        );
+        assert_eq!(observed[0].1, 1);
+    }
+
+    /// Issue #53: clearing the session-end hook with `None`
+    /// disables the callback for subsequent `end_session` calls.
+    #[test]
+    fn cleared_session_end_hook_does_not_fire() {
+        use std::sync::Mutex;
+        let (_tmp, mut runner) = make_runner();
+        let observed: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let observed_for_hook = Arc::clone(&observed);
+        runner.set_session_end_hook(Some(Arc::new(move |_run_id, _session| {
+            *observed_for_hook.lock().unwrap_or_else(|e| panic!("{e}")) += 1;
+        })));
+        runner.set_session_end_hook(None);
+        assert!(!runner.has_session_end_hook());
+
+        let handle = runner.begin_session().unwrap_or_else(|e| panic!("{e}"));
+        runner
+            .end_session(&handle, SessionEndTrigger::Completed)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        assert_eq!(*observed.lock().unwrap_or_else(|e| panic!("{e}")), 0);
+    }
+
+    /// Issue #53: a panicking session-end hook is contained and does
+    /// not abort the rotation flow.
+    #[test]
+    fn panicking_session_end_hook_is_contained() {
+        let (_tmp, mut runner) = make_runner();
+        let hook: SessionEndHook = Arc::new(|_run_id, _session| {
+            panic!("intentional panic in hook");
+        });
+        runner.set_session_end_hook(Some(hook));
+
+        let handle = runner.begin_session().unwrap_or_else(|e| panic!("{e}"));
+        // The end_session call must NOT propagate the hook panic.
+        runner
+            .end_session(&handle, SessionEndTrigger::Completed)
+            .unwrap_or_else(|e| panic!("{e}"));
+        // Session was still persisted.
+        let entries = runner
+            .session_log()
+            .list()
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(entries.len(), 1);
     }
 
     #[test]

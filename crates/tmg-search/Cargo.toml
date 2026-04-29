@@ -1,0 +1,28 @@
+[package]
+name = "tmg-search"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tmg-harness = { workspace = true }
+tmg-sandbox = { workspace = true }
+tmg-tools = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+# `bundled` ships sqlite3 with the crate so we don't depend on a system
+# library; the bundled build enables FTS5 by default, which is the core
+# of the cross-session index. See issue #53.
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

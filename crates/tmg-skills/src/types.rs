@@ -267,4 +267,13 @@ pub enum SlashCommand {
         /// Topic name.
         name: String,
     },
+
+    // ---- /search (issue #53) --------------------------------------------
+    /// `/search <query>` — full-text search the cross-session index.
+    /// Result is rendered into the Activity Pane as a system message.
+    Search {
+        /// FTS5 MATCH expression. Empty when the user typed `/search`
+        /// with no body — surfaced as a usage hint by the dispatcher.
+        query: String,
+    },
 }

@@ -9,6 +9,7 @@ use tmg_core::{AgentLoop, CoreError, StreamSink, format_context_usage};
 use tmg_harness::{HarnessStreamSink, RunProgressEvent, RunRunner, RunSummary};
 use tmg_llm::Role;
 use tmg_memory::MemoryStore;
+use tmg_search::SearchIndex;
 use tmg_skills::{SkillMeta, SlashCommand};
 use tmg_workflow::{WorkflowMeta, WorkflowProgress};
 use tokio::sync::Mutex;
@@ -279,6 +280,12 @@ pub struct App {
     /// the registry so the TUI display path and the LLM's tool calls
     /// see exactly the same on-disk state.
     memory_store: Option<Arc<MemoryStore>>,
+
+    /// Optional cross-session search index for the `/search` slash
+    /// command (issue #53). Shared with [`tmg_search::SessionSearchTool`]
+    /// on the registry so the TUI display path and the LLM tool see the
+    /// same on-disk state.
+    search_index: Option<Arc<SearchIndex>>,
 }
 
 impl App {
@@ -324,6 +331,7 @@ impl App {
             skills: Vec::new(),
             pending_slash: None,
             memory_store: None,
+            search_index: None,
         }
     }
 
@@ -332,6 +340,12 @@ impl App {
     /// LLM. When unset (or `None`), `/memory` reports memory disabled.
     pub fn set_memory_store(&mut self, store: Arc<MemoryStore>) {
         self.memory_store = Some(store);
+    }
+
+    /// Install the shared search index so `/search <query>` can render
+    /// results inline. When unset, `/search` reports search disabled.
+    pub fn set_search_index(&mut self, index: Arc<SearchIndex>) {
+        self.search_index = Some(index);
     }
 
     /// Dequeue any pending async slash command so the event loop can
@@ -840,6 +854,9 @@ impl App {
             SlashCommand::MemoryShow { name } => {
                 self.show_memory_entry(&name);
             }
+            SlashCommand::Search { query } => {
+                self.show_search_results(&query);
+            }
             // The /run family and /<skill> need async work (harness
             // mutex, workflow tools). Defer to the event loop.
             other @ (SlashCommand::RunStart { .. }
@@ -997,6 +1014,54 @@ impl App {
             }
             Err(e) => {
                 self.error_message = Some(format!("memory: {e}"));
+            }
+        }
+    }
+
+    /// Render search results from the cross-session index in the chat
+    /// pane. Issue #53 — `/search <query>` slash command.
+    fn show_search_results(&mut self, query: &str) {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            self.chat_entries.push(ChatEntry {
+                role: Role::System,
+                text: "Usage: /search <FTS5 query>".to_owned(),
+            });
+            return;
+        }
+        let Some(index) = self.search_index.as_ref() else {
+            self.error_message =
+                Some("search is disabled; enable [search] in tsumugi.toml".to_owned());
+            return;
+        };
+        match index.query(trimmed, 10, tmg_search::SearchScope::All, None) {
+            Ok(hits) if hits.is_empty() => {
+                self.chat_entries.push(ChatEntry {
+                    role: Role::System,
+                    text: format!("(no matches for {trimmed:?})"),
+                });
+            }
+            Ok(hits) => {
+                let mut text = format!("Search results for {trimmed:?}:\n\n");
+                for hit in &hits {
+                    let _ = writeln!(
+                        text,
+                        "[{:.3}] {}#{}  {}\n  summary: {}\n  snippet: {}\n",
+                        hit.score,
+                        hit.run_id,
+                        hit.session_num,
+                        hit.started_at,
+                        hit.summary,
+                        hit.snippet,
+                    );
+                }
+                self.chat_entries.push(ChatEntry {
+                    role: Role::System,
+                    text,
+                });
+            }
+            Err(e) => {
+                self.error_message = Some(format!("search: {e}"));
             }
         }
     }
