@@ -1352,9 +1352,30 @@ fn run_tui(
         // `.tsumugi/skills/`. Gated on `[skills.critic] enabled` so
         // operators can opt out by flipping a single flag in
         // `tsumugi.toml`.
-        if skills_section.critic.enabled {
+        //
+        // The shared `SkillsRuntime` owns the [`SignalCollector`] +
+        // [`SkillManageTool`] handle the per-turn observer (in the TUI
+        // event loop) and the slash-command dispatcher (`/skill
+        // capture`, `/skills disable-auto`, `/skills reject`) talk to.
+        // Constructed here so the runtime / recorder live for the
+        // lifetime of the TUI session and both sides see the same
+        // budget / collector state.
+        let (skills_runtime, skill_outcome_recorder): (
+            Option<Arc<tokio::sync::Mutex<tmg_skills::SkillsRuntime>>>,
+            Option<Arc<tmg_skills::TurnOutcomeRecorder>>,
+        ) = if skills_section.critic.enabled {
             registry.register(tmg_skills::SkillManageTool);
-        }
+            let runtime = tmg_skills::SkillsRuntime::new(
+                project_root.clone(),
+                skills_section.critic.clone(),
+            );
+            (
+                Some(Arc::new(tokio::sync::Mutex::new(runtime))),
+                Some(Arc::new(tmg_skills::TurnOutcomeRecorder::new())),
+            )
+        } else {
+            (None, None)
+        };
         register_run_tools(&mut registry, Arc::clone(&runner)).await;
 
         // Workflow discovery + `run_workflow` / `workflow_status` tool
@@ -1631,6 +1652,8 @@ fn run_tui(
             memory_store_for_tui,
             search_index_for_tui,
             startup_banner,
+            skills_runtime.clone(),
+            skill_outcome_recorder.clone(),
         )
         .await;
 

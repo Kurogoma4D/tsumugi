@@ -2129,6 +2129,7 @@ dependencies = [
  "tmg-agents",
  "tmg-core",
  "tmg-sandbox",
+ "tmg-skills",
  "tmg-tools",
  "tokio",
  "toml",
@@ -2264,6 +2265,7 @@ dependencies = [
  "tmg-workflow",
  "tokio",
  "tokio-util",
+ "tracing",
  "unicode-width 0.2.0",
 ]
 

@@ -52,7 +52,7 @@ pub use loader::{format_skill_for_tool_result, format_skill_metadata, load_skill
 pub use manage::{SkillManageTool, regenerate_index};
 pub use metrics::{METRICS_FILENAME, SkillMetrics, load_metrics, save_metrics, update_metrics};
 pub use parse::parse_skill_md;
-pub use runtime::{SkillsRuntime, UseSkillOutcome};
+pub use runtime::{SkillsRuntime, TurnOutcomeRecorder, UseSkillOutcome};
 pub use slash::{SlashParseError, SlashParseResult, format_skills_list, parse_slash_command};
 pub use tool::UseSkillTool;
 pub use types::{

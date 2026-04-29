@@ -29,7 +29,7 @@
 //! intentionally does not own the LLM client.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tmg_sandbox::SandboxContext;
 use tmg_tools::error::ToolError;
@@ -41,6 +41,147 @@ use crate::emergence::{SignalCollector, SkillCandidacySignal, ToolCallOutcome, T
 use crate::error::SkillError;
 use crate::manage::SkillManageTool;
 use crate::metrics::{SkillMetrics, update_metrics};
+
+/// Per-turn buffer of tool-call outcomes used by the harness wire-up
+/// to bridge [`tmg_core::TurnSummary`] (which only carries an aggregate
+/// count) into [`crate::emergence::TurnSummary`] (which needs per-call
+/// success flags).
+///
+/// The harness's [`tmg_harness::HarnessStreamSink`] populates this
+/// recorder via [`Self::record_call`] on every `on_tool_result`. The
+/// per-turn observer then calls [`Self::take_for_turn`] at turn end to
+/// produce a fully populated [`TurnSummary`] which it feeds into
+/// [`SkillsRuntime::record_turn`].
+///
+/// All methods are non-blocking: state lives behind a `std::sync::Mutex`
+/// because the producer side runs inside the synchronous `StreamSink`
+/// callbacks (no `await`), and the consumer is called from an async
+/// context where a brief mutex wait is acceptable. Lock poisoning is
+/// recovered from by the `unwrap_or_else(PoisonError::into_inner)`
+/// pattern; the buffer is per-turn and self-correcting.
+#[derive(Debug, Default)]
+pub struct TurnOutcomeRecorder {
+    inner: Mutex<TurnOutcomeBuffer>,
+}
+
+#[derive(Debug, Default)]
+struct TurnOutcomeBuffer {
+    tool_calls: Vec<ToolCallOutcome>,
+    feedback_memory_written: bool,
+    turn_errored: bool,
+    /// Names of skills that the agent invoked via `use_skill` during
+    /// this turn. The per-turn observer surfaces these so the
+    /// runtime can record per-skill use metrics; populated by
+    /// [`TurnOutcomeRecorder::record_use_skill`].
+    use_skill_invocations: Vec<String>,
+}
+
+impl TurnOutcomeRecorder {
+    /// Construct an empty recorder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one tool result. Called from the harness sink on every
+    /// `on_tool_result` so the per-turn outcome list mirrors what the
+    /// LLM actually saw.
+    pub fn record_call(&self, tool: &str, success: bool) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.tool_calls.push(ToolCallOutcome {
+            tool: tool.to_owned(),
+            success,
+        });
+        if !success {
+            guard.turn_errored = true;
+        }
+    }
+
+    /// Mark the current turn as having written a new feedback memory
+    /// entry. Drives the [`crate::emergence::TriggerKind::UserCorrection`]
+    /// signal.
+    pub fn mark_feedback_memory_written(&self) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.feedback_memory_written = true;
+    }
+
+    /// Record that the agent invoked `use_skill` with the given skill
+    /// name during the current turn. Populated by the harness sink
+    /// when it sees `name == "use_skill"`. The per-turn observer
+    /// drains this list at turn-end and calls
+    /// [`SkillsRuntime::record_use_skill_outcome`] for each entry.
+    pub fn record_use_skill(&self, skill_name: &str) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.use_skill_invocations.push(skill_name.to_owned());
+    }
+
+    /// Drain the list of `use_skill` invocations recorded during this
+    /// turn, returning the skill names. Resets the inner buffer entry
+    /// so the next turn starts clean.
+    #[must_use]
+    pub fn take_use_skill_invocations(&self) -> Vec<String> {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut guard.use_skill_invocations)
+    }
+
+    /// Force the `turn_errored` flag on regardless of per-call results.
+    /// Used when a top-level loop error short-circuits before any tool
+    /// is dispatched.
+    pub fn mark_turn_errored(&self) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.turn_errored = true;
+    }
+
+    /// Drain the buffer and produce a [`TurnSummary`] for the given
+    /// turn index. Resets the inner state so the next turn starts
+    /// clean. Returns `None` when no calls were recorded **and** no
+    /// flags were flipped — the harness uses this to skip an empty
+    /// observer pass without paying for a `record_turn` call.
+    #[must_use]
+    pub fn take_for_turn(&self, turn_index: usize) -> Option<TurnSummary> {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.tool_calls.is_empty() && !guard.feedback_memory_written && !guard.turn_errored {
+            return None;
+        }
+        let buffer = std::mem::take(&mut *guard);
+        Some(TurnSummary {
+            turn_index,
+            tool_calls: buffer.tool_calls,
+            feedback_memory_written: buffer.feedback_memory_written,
+            turn_errored: buffer.turn_errored,
+        })
+    }
+
+    /// Clear the buffer without producing a summary. Useful when the
+    /// harness wants to discard a turn's outcomes (e.g. a cancelled
+    /// turn whose partial state should not influence the next signal
+    /// evaluation).
+    pub fn reset(&self) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = TurnOutcomeBuffer::default();
+    }
+}
 
 /// Outcome the runtime cares about for [`SkillsRuntime::record_use_skill_outcome`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +205,11 @@ pub struct SkillsRuntime {
     /// Pre-built [`SkillManageTool`] (so the runtime can invoke it
     /// without going through a registry).
     manage_tool: Arc<SkillManageTool>,
+    /// Pending manual-capture flag set by `/skill capture`. Drained on
+    /// the next [`Self::record_turn`] call, which fabricates a
+    /// `TriggerKind::Manual` signal that bypasses the per-session
+    /// budget.
+    manual_capture_pending: bool,
 }
 
 impl SkillsRuntime {
@@ -76,6 +222,7 @@ impl SkillsRuntime {
             critic_config,
             collector: SignalCollector::new(max),
             manage_tool: Arc::new(SkillManageTool),
+            manual_capture_pending: false,
         }
     }
 
@@ -113,8 +260,37 @@ impl SkillsRuntime {
 
     /// Forward `record_turn` to the collector. Returns the list of
     /// signals produced.
+    ///
+    /// When [`Self::trigger_manual_capture`] has been called since the
+    /// last invocation, this method also synthesises a
+    /// [`TriggerKind::Manual`](crate::emergence::TriggerKind::Manual)
+    /// signal for the supplied turn (using the turn's tool-call count
+    /// as the signal's count) and clears the manual flag. The manual
+    /// signal bypasses the per-session budget so the runtime fires the
+    /// critic even when [`Self::auto_creation_allowed`] is `false`.
     pub fn record_turn(&mut self, turn: &TurnSummary) -> Vec<SkillCandidacySignal> {
-        self.collector.record_turn(turn)
+        let mut signals = self.collector.record_turn(turn);
+        if self.manual_capture_pending {
+            self.manual_capture_pending = false;
+            let count = u32::try_from(turn.tool_calls.len()).unwrap_or(u32::MAX);
+            signals.push(self.collector.manual_capture(turn.turn_index, count));
+        }
+        signals
+    }
+
+    /// Set the "manual capture pending" flag so the next
+    /// [`Self::record_turn`] returns a manual signal regardless of the
+    /// auto-budget. Driven by `/skill capture` from the TUI.
+    pub fn trigger_manual_capture(&mut self) {
+        self.manual_capture_pending = true;
+    }
+
+    /// Whether a manual capture request is currently pending (i.e.
+    /// `/skill capture` was issued but not yet drained by the next
+    /// `record_turn`).
+    #[must_use]
+    pub fn manual_capture_pending(&self) -> bool {
+        self.manual_capture_pending
     }
 
     /// Pick the highest-priority signal — `UserCorrection` >

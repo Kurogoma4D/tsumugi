@@ -6,11 +6,16 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use ratatui::DefaultTerminal;
-use tmg_skills::SlashCommand;
+use tmg_agents::{AgentKind, AgentType, SubagentConfig};
+use tmg_memory::MemoryType;
+use tmg_skills::{
+    SkillCandidacySignal, SkillsRuntime, SlashCommand, TriggerKind,
+    TurnSummary as SkillTurnSummary, parse_verdict,
+};
 use tmg_workflow::{HumanResponse, HumanResponseKind};
 use tokio_util::sync::CancellationToken;
 
-use crate::app::{App, SubmitDecision};
+use crate::app::{App, SubmitDecision, TurnFinishedSignal};
 use crate::error::TuiError;
 use crate::human_prompt::{HumanPrompt, option_kind};
 
@@ -60,6 +65,23 @@ pub async fn run_event_loop(
         // previous turn-message behaviour and additionally pumps the
         // run-progress and workflow-progress streams.
         app.drain_app_events();
+
+        // Issue #54: forward `/skill capture` / `/skills disable-auto`
+        // flags into the SkillsRuntime BEFORE the after-turn pipeline
+        // fires so the runtime sees them on the same evaluation pass.
+        app.forward_skill_flags_to_runtime().await;
+
+        // Issue #54: drive the autonomous-skill-pipeline once per
+        // completed turn. The signal is set by `drain_turn_messages`
+        // when a `Done`/`Error` (non-cancellation) message arrives.
+        if let Some(signal) = app.take_turn_finished() {
+            run_skill_after_turn(app, &signal).await;
+        }
+
+        // Issue #54: drain `/skills reject` requests outside the
+        // after-turn hook so the user can reject a skill at any tick
+        // (the rejection path is independent of signal evaluation).
+        process_skill_rejections(app).await;
 
         // Expire the scope-upgrade banner once its TTL has lapsed.
         let _ = app.expire_banner_if_due();
@@ -654,4 +676,354 @@ async fn run_abort(app: &mut App) {
             app.set_error(format!("/run abort failed: {e}"));
         }
     }
+}
+
+// =====================================================================
+// Issue #54: autonomous-skill-creation pipeline driver.
+//
+// The flow:
+//
+// 1. `drain_turn_messages` produces a [`TurnFinishedSignal`] every time
+//    the agent loop's `turn` finishes (Done or Error, but not
+//    cancellation).
+// 2. The event loop's main tick calls `run_skill_after_turn`, which:
+//    a. Drains the per-turn outcome buffer ([`TurnOutcomeRecorder`])
+//       and converts it to a [`SkillTurnSummary`].
+//    b. Calls `SkillsRuntime::record_turn` to evaluate the
+//       [`tmg_skills::SignalCollector`] triggers.
+//    c. If a signal fires AND the runtime is allowed to auto-create,
+//       spawns `AgentType::SkillCritic` via the [`SubagentManager`],
+//       awaits the JSON verdict, parses it, and applies it via
+//       `SkillsRuntime::apply_verdict` — which itself invokes
+//       `SkillManageTool::execute_inner` to write the SKILL.md.
+//    d. Logs every step via `tracing::info!` / `tracing::warn!`.
+// =====================================================================
+
+/// Cap on how long the `skill_critic` subagent gets to produce a verdict
+/// before we abandon the round. Local LLMs producing JSON for a ~1k
+/// token prompt should resolve in well under 30 s; anything longer is
+/// almost certainly a stuck/failed model.
+const SKILL_CRITIC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Drive the autonomous-skill-creation pipeline for one just-completed
+/// turn. Best-effort: every failure path logs and returns without
+/// affecting the live TUI.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear after-turn pipeline; splitting into helpers obscures the step ordering"
+)]
+async fn run_skill_after_turn(app: &mut App, signal: &TurnFinishedSignal) {
+    let Some(runtime_arc) = app.skills_runtime().cloned() else {
+        return;
+    };
+    let Some(recorder) = app.skill_outcome_recorder().cloned() else {
+        return;
+    };
+
+    // Drain the per-turn `use_skill` invocations and record each one's
+    // outcome. We use the turn-level errored flag as a coarse
+    // success/failure proxy: every `use_skill` invocation in a turn
+    // that ended cleanly is counted as a success, while invocations
+    // in an errored turn are counted as failures (with the error
+    // message as the improvement hint). This is the simplest correct
+    // approximation — per-call success would require pairing tool
+    // calls with subsequent assistant responses, which is out of
+    // scope for the per-turn observer.
+    let invoked_skills = recorder.take_use_skill_invocations();
+    if !invoked_skills.is_empty() {
+        let outcome = if signal.errored {
+            tmg_skills::UseSkillOutcome::Failure("follow-up turn ended in error".to_owned())
+        } else {
+            tmg_skills::UseSkillOutcome::Success
+        };
+        for skill_name in invoked_skills {
+            let runtime_guard = runtime_arc.lock().await;
+            match runtime_guard
+                .record_use_skill_outcome(&skill_name, outcome.clone())
+                .await
+            {
+                Ok(metrics) => {
+                    tracing::info!(
+                        skill = %skill_name,
+                        success_count = metrics.success_count,
+                        failure_count = metrics.failure_count,
+                        "use_skill outcome recorded",
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        skill = %skill_name,
+                        "record_use_skill_outcome failed (skill may not yet exist on disk)",
+                    );
+                }
+            }
+        }
+    }
+
+    // Build the skills `TurnSummary` from the outcome buffer. If the
+    // buffer is empty AND the turn did not error, there's nothing
+    // meaningful to record — skip the round-trip.
+    let mut summary = recorder
+        .take_for_turn(signal.turn_index)
+        .unwrap_or_else(|| SkillTurnSummary {
+            turn_index: signal.turn_index,
+            tool_calls: Vec::new(),
+            feedback_memory_written: false,
+            turn_errored: signal.errored,
+        });
+    if signal.errored {
+        summary.turn_errored = true;
+    }
+
+    // Feed the summary into the SignalCollector and pick the highest-
+    // priority signal. The runtime carries the manual-capture flag
+    // forwarded from `forward_skill_flags_to_runtime`, so a manual
+    // signal also surfaces here.
+    let signals = {
+        let mut guard = runtime_arc.lock().await;
+        guard.record_turn(&summary)
+    };
+    if signals.is_empty() {
+        return;
+    }
+    let Some(chosen) = SkillsRuntime::highest_priority(&signals).cloned() else {
+        return;
+    };
+    tracing::info!(
+        kind = ?chosen.kind,
+        turn_range = ?chosen.turn_range,
+        tool_call_count = chosen.tool_call_count,
+        "skill emergence trigger fired",
+    );
+
+    // Manual signals bypass the per-session budget; auto signals
+    // require both `auto_creation_allowed` AND that the user did not
+    // issue `/skills disable-auto` for the current session.
+    let allow_auto = {
+        let guard = runtime_arc.lock().await;
+        guard.auto_creation_allowed()
+    };
+    let is_manual = chosen.kind == TriggerKind::Manual;
+    if !is_manual && !allow_auto {
+        tracing::info!(
+            "skill_critic skipped: auto-creation not allowed (budget consumed or disabled)",
+        );
+        return;
+    }
+
+    // Spawn skill_critic and await its verdict.
+    let Some(manager) = app.subagent_manager().cloned() else {
+        tracing::warn!("skill_critic skipped: SubagentManager not installed in TUI");
+        return;
+    };
+
+    let critic_input = format_critic_input(&signal.user_message, &summary, &chosen);
+    let raw = match spawn_skill_critic(&manager, critic_input).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "skill_critic spawn or wait failed");
+            return;
+        }
+    };
+
+    let verdict = match parse_verdict(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, raw = %raw, "skill_critic verdict failed to parse");
+            return;
+        }
+    };
+
+    if !verdict.create {
+        tracing::info!(reason = %verdict.reason, "skill_critic declined to create");
+        app.push_system_message(format!(
+            "skill_critic skipped: {} (reason: {})",
+            verdict.name.as_deref().unwrap_or("unnamed"),
+            verdict.reason,
+        ));
+        return;
+    }
+
+    // Apply the verdict. Borrow the SubagentManager's parent sandbox
+    // so the SkillManageTool runs under the same restrictions as the
+    // top-level agent.
+    let sandbox_arc = {
+        let guard = manager.lock().await;
+        guard.parent_sandbox().clone()
+    };
+    let result = {
+        let mut guard = runtime_arc.lock().await;
+        guard.apply_verdict(&verdict, &sandbox_arc).await
+    };
+    match result {
+        Ok(Some(path)) => {
+            tracing::info!(
+                path = %path.display(),
+                name = %verdict.name.as_deref().unwrap_or("unnamed"),
+                "skill_critic verdict applied: skill created",
+            );
+            app.push_system_message(format!(
+                "skill_critic created skill {:?} at {}",
+                verdict.name.as_deref().unwrap_or("unnamed"),
+                path.display(),
+            ));
+        }
+        Ok(None) => {
+            // Should not happen: we guarded on `verdict.create` above.
+            tracing::debug!("apply_verdict returned None despite create=true");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "skill_critic apply_verdict failed");
+            app.set_error(format!("skill_critic apply failed: {e}"));
+        }
+    }
+}
+
+/// Process pending `/skills reject <name>` requests:
+///   1. delete the skill directory via [`SkillsRuntime::apply_rejection`]
+///   2. write a `feedback`-kind memory note describing the rejection.
+async fn process_skill_rejections(app: &mut App) {
+    let names = app.drain_skill_rejection_requests();
+    if names.is_empty() {
+        return;
+    }
+    let Some(runtime_arc) = app.skills_runtime().cloned() else {
+        // No runtime — nothing to do but warn.
+        for name in &names {
+            app.set_error(format!(
+                "cannot reject skill {name:?}: SkillsRuntime not installed",
+            ));
+        }
+        return;
+    };
+    // Sandbox: borrow from the SubagentManager when available.
+    let sandbox_arc = if let Some(manager) = app.subagent_manager().cloned() {
+        let guard = manager.lock().await;
+        Some(guard.parent_sandbox().clone())
+    } else {
+        None
+    };
+
+    for name in names {
+        // Step 1: delete the skill directory.
+        if let Some(sandbox) = sandbox_arc.as_ref() {
+            let runtime_guard = runtime_arc.lock().await;
+            match runtime_guard.apply_rejection(&name, sandbox).await {
+                Ok(()) => {
+                    tracing::info!(skill = %name, "rejected skill: directory removed");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, skill = %name, "skill rejection failed");
+                }
+            }
+        }
+
+        // Step 2: write a feedback memory note. Best-effort; failures
+        // are logged but do not block the rejection.
+        if let Some(memory) = app.memory_store().cloned() {
+            let entry_name = format!("skill-reject-{name}");
+            let description = format!("user rejected auto-generated skill {name:?}");
+            let body = format!(
+                "The autonomous skill_critic created a skill named `{name}` \
+                 and the user rejected it via `/skills reject`. Avoid \
+                 re-creating skills with this name without explicit user \
+                 consent.\n",
+            );
+            match tokio::task::spawn_blocking(move || {
+                memory.add(&entry_name, MemoryType::Feedback, &description, &body)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {
+                    tracing::info!(skill = %name, "wrote feedback memory note for rejection");
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        skill = %name,
+                        "failed to write feedback memory note for rejection",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        skill = %name,
+                        "feedback memory spawn_blocking task panicked",
+                    );
+                }
+            }
+        }
+
+        app.push_system_message(format!("Skill {name:?} rejected and removed."));
+    }
+}
+
+/// Build the input string the `skill_critic` subagent sees.
+///
+/// The shape follows the `DEFAULT_SYSTEM_PROMPT` schema: a free-form
+/// recap of what just happened. The critic's job is to decide
+/// `create` / `skip`; it doesn't need a JSON envelope on the input
+/// side.
+fn format_critic_input(
+    user_message: &str,
+    summary: &SkillTurnSummary,
+    signal: &SkillCandidacySignal,
+) -> String {
+    let tool_recap: Vec<String> = summary
+        .tool_calls
+        .iter()
+        .map(|c| {
+            format!(
+                "  - {} ({})",
+                c.tool,
+                if c.success { "success" } else { "failed" }
+            )
+        })
+        .collect();
+    let trigger_label = match signal.kind {
+        TriggerKind::SuccessfulComplexTask => "successful_complex_task",
+        TriggerKind::ErrorRecovery => "error_recovery",
+        TriggerKind::UserCorrection => "user_correction",
+        TriggerKind::Manual => "manual_capture",
+    };
+    format!(
+        "Trigger: {trigger_label}\nUser request: {user_message}\nTool calls observed:\n{tool_log}\n\
+         Decide whether this procedure should be saved as a Skill.\n\
+         Respond with the JSON verdict described in the system prompt.",
+        user_message = user_message,
+        tool_log = if tool_recap.is_empty() {
+            "  (none)".to_owned()
+        } else {
+            tool_recap.join("\n")
+        },
+    )
+}
+
+/// Spawn `AgentType::SkillCritic` via the [`SubagentManager`] and wait
+/// for its verdict (with a timeout). Returns the raw output string.
+async fn spawn_skill_critic(
+    manager: &std::sync::Arc<tokio::sync::Mutex<tmg_agents::SubagentManager>>,
+    task: String,
+) -> Result<String, String> {
+    let config = SubagentConfig {
+        agent_kind: AgentKind::Builtin(AgentType::SkillCritic),
+        task,
+        background: false,
+    };
+    let (id, rx) = {
+        let mut guard = manager.lock().await;
+        guard
+            .spawn_with_notify(config)
+            .await
+            .map_err(|e| format!("spawn skill_critic: {e}"))?
+    };
+    tracing::info!(?id, "spawned skill_critic");
+    // We hold no locks while awaiting — the manager's JoinSet drives
+    // the subagent in the background.
+    let recv = tokio::time::timeout(SKILL_CRITIC_TIMEOUT, rx)
+        .await
+        .map_err(|_| format!("skill_critic timed out after {SKILL_CRITIC_TIMEOUT:?}"))?
+        .map_err(|e| format!("skill_critic channel: {e}"))?;
+    recv.map_err(|e| format!("skill_critic returned error: {e}"))
 }

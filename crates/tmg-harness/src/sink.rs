@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use tmg_core::{CoreError, StreamSink};
+use tmg_skills::TurnOutcomeRecorder;
 use tokio::sync::Mutex;
 
 use crate::runner::RunRunner;
@@ -33,12 +34,34 @@ const FILE_MODIFYING_TOOLS: &[&str] = &["file_write", "file_patch"];
 pub struct HarnessStreamSink<S> {
     inner: S,
     runner: Arc<Mutex<RunRunner>>,
+    /// Optional per-turn outcome recorder used by the autonomous skill
+    /// pipeline (issue #54). When present, every `on_tool_result`
+    /// pushes a [`tmg_skills::ToolCallOutcome`] into the recorder so
+    /// the per-turn observer can build a
+    /// [`tmg_skills::TurnSummary`] with per-call outcomes (rather
+    /// than the aggregate count [`tmg_core::TurnSummary`] carries).
+    /// `None` is the default, so non-skills callers pay nothing.
+    skill_outcome_recorder: Option<Arc<TurnOutcomeRecorder>>,
 }
 
 impl<S> HarnessStreamSink<S> {
     /// Construct a new harness sink wrapping `inner`.
     pub fn new(inner: S, runner: Arc<Mutex<RunRunner>>) -> Self {
-        Self { inner, runner }
+        Self {
+            inner,
+            runner,
+            skill_outcome_recorder: None,
+        }
+    }
+
+    /// Install the [`TurnOutcomeRecorder`] used by the autonomous skill
+    /// pipeline (issue #54). The recorder is called from
+    /// `on_tool_result` with the tool name and a `success` flag derived
+    /// from `is_error`.
+    #[must_use]
+    pub fn with_skill_outcome_recorder(mut self, recorder: Arc<TurnOutcomeRecorder>) -> Self {
+        self.skill_outcome_recorder = Some(recorder);
+        self
     }
 
     /// Apply `update` to the active session if the runner lock can be
@@ -84,6 +107,19 @@ impl<S: StreamSink> StreamSink for HarnessStreamSink<S> {
         self.with_active_session(|s| {
             s.tool_calls_count = s.tool_calls_count.saturating_add(1);
         });
+        // Issue #54: capture `use_skill` invocations so the per-turn
+        // observer can drive [`SkillsRuntime::record_use_skill_outcome`]
+        // with the actual skill name. We record here (on the call,
+        // before the result) so a failed `use_skill` lookup still
+        // counts as an attempt — the post-turn observer downgrades it
+        // to a Failure outcome based on `turn_errored`.
+        if let Some(recorder) = self.skill_outcome_recorder.as_ref() {
+            if name == "use_skill" {
+                if let Some(skill_name) = extract_skill_name(arguments) {
+                    recorder.record_use_skill(&skill_name);
+                }
+            }
+        }
         self.inner.on_tool_call(call_id, name, arguments)
     }
 
@@ -94,6 +130,23 @@ impl<S: StreamSink> StreamSink for HarnessStreamSink<S> {
         output: &str,
         is_error: bool,
     ) -> Result<(), CoreError> {
+        // Issue #54: record per-call outcome for the skill emergence
+        // signals. We do this BEFORE the file-modification accounting
+        // so a panic in `extract_modified_path` (theoretically
+        // unreachable) cannot drop the outcome.
+        if let Some(recorder) = self.skill_outcome_recorder.as_ref() {
+            recorder.record_call(name, !is_error);
+            // The `memory add` tool is the cue for the
+            // `UserCorrection` trigger. We treat *any* successful
+            // `memory` tool call as feedback memory written; the more
+            // precise "only feedback-kind add" check would require
+            // peeking inside the JSON, which is fragile. For the
+            // signal collector this conservative over-trigger is
+            // preferable to an under-trigger.
+            if !is_error && name == "memory" {
+                recorder.mark_feedback_memory_written();
+            }
+        }
         if !is_error && FILE_MODIFYING_TOOLS.contains(&name) {
             // Try to extract the actual modified path. Tools may emit
             // either structured JSON (`{"path": "..."}` /
@@ -123,6 +176,22 @@ impl<S: StreamSink> StreamSink for HarnessStreamSink<S> {
 
     fn on_warning(&mut self, message: &str) -> Result<(), CoreError> {
         self.inner.on_warning(message)
+    }
+}
+
+/// Pull `skill_name` out of a `use_skill` tool-call's JSON arguments.
+///
+/// Returns `None` when the arguments are not valid JSON, the
+/// `skill_name` field is missing or non-string, or the value is empty.
+/// The caller treats `None` as "not a recoverable `use_skill` call" and
+/// drops the use-skill metric for that round.
+fn extract_skill_name(arguments: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let raw = value.get("skill_name")?.as_str()?.trim();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_owned())
     }
 }
 
