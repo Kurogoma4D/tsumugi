@@ -125,6 +125,22 @@ impl TurnBuffer {
     }
 }
 
+/// Lock the per-turn buffer, recovering from poison.
+///
+/// A poisoned mutex means a previous holder panicked while owning the
+/// buffer. The buffer itself is plain [`String`] / [`Vec`] state with
+/// no broken invariants we know about, so dropping events on the
+/// floor is the wrong default — that would cause the trajectory to
+/// silently miss tokens / tool calls. Instead we surface a warning
+/// and recover the inner state with [`std::sync::PoisonError::into_inner`]
+/// so the sink keeps observing the conversation.
+fn lock_turn_buffer(m: &Mutex<TurnBuffer>) -> std::sync::MutexGuard<'_, TurnBuffer> {
+    m.lock().unwrap_or_else(|poison| {
+        tracing::warn!("trajectory turn buffer mutex poisoned; recovering");
+        poison.into_inner()
+    })
+}
+
 impl<S> TrajectoryStreamSink<S> {
     /// Create a tee that forwards every event to `inner` and (when
     /// `recorder` is `Some`) writes a corresponding trajectory record.
@@ -179,20 +195,25 @@ impl<S> TrajectoryStreamSink<S> {
     }
 }
 
+// NOTE: any new method added to `tmg_core::StreamSink` MUST be
+// implemented (and forwarded) here as well — otherwise the trajectory
+// recorder will silently miss the new event kind and the on-disk
+// JSONL becomes incomplete relative to the live conversation. The
+// `on_*` methods below cover every event the agent loop currently
+// emits; adding a new kind is a deliberate change to both `tmg-core`
+// and this impl.
 impl<S: StreamSink> StreamSink for TrajectoryStreamSink<S> {
     fn on_thinking(&mut self, token: &str) -> Result<(), CoreError> {
-        if self.recorder.is_some()
-            && let Ok(mut g) = self.buf.lock()
-        {
+        if self.recorder.is_some() {
+            let mut g = lock_turn_buffer(&self.buf);
             g.thinking.push_str(token);
         }
         self.inner.on_thinking(token)
     }
 
     fn on_token(&mut self, token: &str) -> Result<(), CoreError> {
-        if self.recorder.is_some()
-            && let Ok(mut g) = self.buf.lock()
-        {
+        if self.recorder.is_some() {
+            let mut g = lock_turn_buffer(&self.buf);
             g.content.push_str(token);
         }
         self.inner.on_token(token)
@@ -203,10 +224,7 @@ impl<S: StreamSink> StreamSink for TrajectoryStreamSink<S> {
         // forward `on_done` so any state the inner sink mutates does
         // not race with our recorder.
         if self.recorder.is_some() {
-            let taken = match self.buf.lock() {
-                Ok(mut g) => g.take(),
-                Err(p) => p.into_inner().take(),
-            };
+            let taken = lock_turn_buffer(&self.buf).take();
             self.record_assistant(&taken);
         }
         self.inner.on_done()
@@ -218,9 +236,8 @@ impl<S: StreamSink> StreamSink for TrajectoryStreamSink<S> {
         name: &str,
         arguments: &str,
     ) -> Result<(), CoreError> {
-        if self.recorder.is_some()
-            && let Ok(mut g) = self.buf.lock()
-        {
+        if self.recorder.is_some() {
+            let mut g = lock_turn_buffer(&self.buf);
             // Try to parse the arguments as JSON; if the model emitted
             // something malformed, keep the raw string so the record
             // still carries the literal payload for offline triage.

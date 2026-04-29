@@ -32,7 +32,7 @@
 //! recorder is `None`.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -64,7 +64,11 @@ pub fn trajectory_path(run_dir: &Path, output_dir: &str, session_index: u32) -> 
 ///
 /// Construction opens the file in append mode; the directory is
 /// created on demand. Appending a record acquires the internal
-/// mutex, serialises the record, writes it as one line, and flushes.
+/// mutex, serialises the record, writes it as one line, and flushes
+/// the file directly — every record is followed by a `flush()` call
+/// so a process kill does not lose the tail. We deliberately use the
+/// bare [`File`] (no [`std::io::BufWriter`]): per-line flushing makes
+/// any buffer pointless and keeps the writer one syscall per record.
 /// Errors are surfaced via the public methods so callers can decide
 /// whether to abort or warn-and-continue (the typical agent-loop
 /// path warns).
@@ -75,7 +79,11 @@ pub struct Recorder {
 }
 
 struct RecorderState {
-    writer: BufWriter<File>,
+    /// Raw file handle. We do not wrap in [`std::io::BufWriter`]
+    /// because [`Recorder::write_line`] flushes after every record
+    /// (durability matters more than throughput for trajectory
+    /// recording), so a buffer would never amortise.
+    writer: File,
     path: PathBuf,
 }
 
@@ -119,7 +127,7 @@ impl Recorder {
             .map_err(|e| TrajectoryError::io(path_ref, e))?;
         Ok(Self {
             inner: Mutex::new(RecorderState {
-                writer: BufWriter::new(file),
+                writer: file,
                 path: path_ref.to_path_buf(),
             }),
             config,
@@ -286,9 +294,10 @@ impl Recorder {
         }))
     }
 
-    /// Flush the buffered writer. Useful for tests; production
-    /// integrators don't need to call this — the buffered writer
-    /// flushes after every line, and the file is closed on drop.
+    /// Flush the underlying file. Useful for tests; production
+    /// integrators don't need to call this — [`Self::write_line`]
+    /// already flushes after every record, and the file is closed on
+    /// drop.
     ///
     /// # Errors
     /// Returns [`TrajectoryError::Io`] on flush failure.

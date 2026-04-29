@@ -956,6 +956,59 @@ fn build_oneshot_recorder(
     Ok(std::sync::Arc::new(recorder))
 }
 
+/// Build a per-session [`tmg_trajectory::Recorder`] for the TUI / harnessed
+/// session path.
+///
+/// On success, this opens the JSONL file at `traj_path` and writes:
+///
+/// 1. a `meta` record with the supplied identifiers and the current UTC time
+///    as `started_at`;
+/// 2. a `system` record with a TUI-mode placeholder string. The actual
+///    system prompt is owned by `AgentLoop` and is not exposed at this
+///    layer; the placeholder makes the file shape consistent with the
+///    one-shot recorder built by [`build_oneshot_recorder`].
+///
+/// Failures are best-effort: an I/O / config error surfaces as a
+/// `tracing::warn!` and the function returns `None` so the caller proceeds
+/// without trajectory recording rather than aborting the run.
+fn build_session_recorder(
+    traj_path: &std::path::Path,
+    config: &tmg_trajectory::TrajectoryConfig,
+    run_id: &str,
+    session_index: u32,
+    model: &str,
+    scope: &str,
+) -> Option<std::sync::Arc<tmg_trajectory::Recorder>> {
+    match tmg_trajectory::Recorder::create(traj_path, config.clone()) {
+        Ok(rec) => {
+            let arc = std::sync::Arc::new(rec);
+            if let Err(e) = arc.record_meta(tmg_trajectory::MetaRecord {
+                run_id: run_id.to_owned(),
+                session_num: session_index,
+                model: model.to_owned(),
+                scope: scope.to_owned(),
+                started_at: chrono::Utc::now(),
+                ended_at: None,
+                outcome: None,
+            }) {
+                tracing::warn!(error = %e, "trajectory meta record failed");
+            }
+            // Match the one-shot path: write a placeholder `system`
+            // record so the trajectory file shape is consistent across
+            // both modes. The actual system prompt is owned by
+            // `AgentLoop` and is not exposed at this layer.
+            if let Err(e) = arc.record_system("(TUI mode; system prompt internal to AgentLoop)") {
+                tracing::warn!(error = %e, "trajectory system record failed");
+            }
+            Some(arc)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to open trajectory recorder; continuing without recording");
+            None
+        }
+    }
+}
+
 /// One-shot stdout sink that mirrors [`StreamEvent`] output to the
 /// terminal. Tool calls and warnings are surfaced as bracketed lines
 /// so the user can see what the agent is doing without the TUI.
@@ -1311,40 +1364,43 @@ fn run_tui(
         let run_summary: RunSummary = runner.summary();
 
         // Build the trajectory recorder for this session (issue #55).
-        // Best-effort: a misconfigured `redact_extra_patterns` regex
-        // surfaces as a warning and disables recording for this run
-        // rather than aborting startup.
+        // Best-effort: a misconfigured `redact_extra_patterns` regex,
+        // or an `output_dir` that escapes the project root, surfaces
+        // as a warning and disables recording for this run rather than
+        // aborting startup. The escape check is a software-level guard
+        // because Landlock only fires on Linux — macOS / other
+        // platforms rely on this check.
         let trajectory_recorder: Option<Arc<tmg_trajectory::Recorder>> = if trajectory_config.enabled
         {
             let active_run_dir = store.run_dir(runner.run_id());
             let session_index = session_handle.index;
-            let traj_path = tmg_trajectory::trajectory_path(
-                &active_run_dir,
-                &trajectory_config.output_dir,
-                session_index,
-            );
-            match tmg_trajectory::Recorder::create(&traj_path, trajectory_config.clone()) {
-                Ok(rec) => {
-                    let arc = Arc::new(rec);
+            match trajectory_config
+                .resolve_output_dir_within(&canonical_cwd, &active_run_dir)
+            {
+                Ok(_) => {
+                    let traj_path = tmg_trajectory::trajectory_path(
+                        &active_run_dir,
+                        &trajectory_config.output_dir,
+                        session_index,
+                    );
                     let scope = match runner.scope() {
                         tmg_harness::RunScope::AdHoc => "ad-hoc".to_owned(),
                         tmg_harness::RunScope::Harnessed { .. } => "harnessed".to_owned(),
                     };
-                    if let Err(e) = arc.record_meta(tmg_trajectory::MetaRecord {
-                        run_id: runner.run_id().as_str().to_owned(),
-                        session_num: session_index,
-                        model: model.to_owned(),
-                        scope,
-                        started_at: chrono::Utc::now(),
-                        ended_at: None,
-                        outcome: None,
-                    }) {
-                        tracing::warn!(error = %e, "trajectory meta record failed");
-                    }
-                    Some(arc)
+                    build_session_recorder(
+                        &traj_path,
+                        trajectory_config,
+                        runner.run_id().as_str(),
+                        session_index,
+                        model,
+                        &scope,
+                    )
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "failed to open trajectory recorder; continuing without recording");
+                    tracing::warn!(
+                        error = %e,
+                        "trajectory output_dir escapes project root; recording disabled for this run",
+                    );
                     None
                 }
             }
@@ -2352,8 +2408,8 @@ mod tests {
 
     #[test]
     fn cli_trajectory_disable_parses() {
-        let cli = Cli::try_parse_from(["tmg", "trajectory", "disable"])
-            .unwrap_or_else(|e| panic!("{e}"));
+        let cli =
+            Cli::try_parse_from(["tmg", "trajectory", "disable"]).unwrap_or_else(|e| panic!("{e}"));
         match cli.command {
             Some(Command::Trajectory {
                 op: TrajectoryCommand::Disable,
@@ -2668,5 +2724,52 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap_or_else(|e| panic!("{e}"));
         let result = compute_diff_lines(&workspace).await;
         assert_eq!(result, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Trajectory recorder builders (issue #55 PR #79 review)
+    // ---------------------------------------------------------------
+
+    /// Both the one-shot and the TUI / session paths must produce a
+    /// `system` record so the on-disk JSONL shape is consistent across
+    /// modes. Regression for PR #79 review #2 — the TUI path used to
+    /// only write `meta`.
+    #[test]
+    fn both_modes_write_system_record() {
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let project_root = tmp.path().to_path_buf();
+        let cfg = tmg_trajectory::TrajectoryConfig {
+            enabled: true,
+            ..tmg_trajectory::TrajectoryConfig::default()
+        };
+
+        // One-shot.
+        let oneshot = build_oneshot_recorder(&project_root, &cfg, "test-model", "hello world")
+            .unwrap_or_else(|e| panic!("{e}"));
+        oneshot.flush().unwrap_or_else(|e| panic!("{e}"));
+        let oneshot_path = oneshot.path();
+        let oneshot_body = std::fs::read_to_string(&oneshot_path).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            oneshot_body.contains(r#""type":"system""#),
+            "one-shot trajectory missing system record: {oneshot_body}"
+        );
+
+        // TUI / session-mode.
+        let traj_path = project_root.join("tui_session.jsonl");
+        let Some(session) =
+            build_session_recorder(&traj_path, &cfg, "run-abc123", 1, "test-model", "ad-hoc")
+        else {
+            panic!("session recorder build returned None");
+        };
+        session.flush().unwrap_or_else(|e| panic!("{e}"));
+        let session_body = std::fs::read_to_string(&traj_path).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            session_body.contains(r#""type":"system""#),
+            "session-mode trajectory missing system record: {session_body}"
+        );
+        assert!(
+            session_body.contains(r#""type":"meta""#),
+            "session-mode trajectory missing meta record: {session_body}"
+        );
     }
 }

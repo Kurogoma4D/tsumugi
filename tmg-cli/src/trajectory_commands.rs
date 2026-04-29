@@ -19,6 +19,7 @@ use anyhow::{Context as _, anyhow};
 use chrono::{DateTime, Utc};
 use tmg_harness::RunStore;
 use tmg_trajectory::ExportFilter;
+use toml_edit::{DocumentMut, Item as TomlItem, Table as TomlTable, value as toml_value};
 
 use crate::config::TsumugiConfig;
 
@@ -89,40 +90,41 @@ pub fn cmd_disable(config_path: Option<&Path>) -> anyhow::Result<()> {
 
 /// Locate (and create if missing) the project `tsumugi.toml`, then
 /// rewrite the `[trajectory]` block to set `enabled` to the supplied
-/// value. The rest of the file is preserved verbatim — we use
-/// `toml_edit` semantics by deserialising into `toml::Value`,
-/// patching, and re-serialising. Comments are not preserved (a TODO
-/// for `toml_edit`); the project config is small enough that this is
-/// acceptable for the first cut.
+/// value.
+///
+/// The rest of the file is preserved **verbatim**, including comments,
+/// blank lines, and key ordering, because we drive the edit through
+/// [`toml_edit::DocumentMut`] (the same crate `cargo` uses to edit
+/// `Cargo.toml`). Only the single `enabled` key under `[trajectory]`
+/// is mutated; if the section or the key are missing they are
+/// created with the cleanest formatting `toml_edit` can produce.
 fn set_trajectory_enabled(config_path: Option<&Path>, value: bool) -> anyhow::Result<()> {
     let path = config_path.map_or_else(default_project_config_path, Path::to_path_buf);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let mut value_table: toml::Value = if path.exists() {
+    let mut doc: DocumentMut = if path.exists() {
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
+        raw.parse::<DocumentMut>()
+            .with_context(|| format!("parsing {}", path.display()))?
     } else {
-        toml::Value::Table(toml::value::Table::new())
+        DocumentMut::new()
     };
-    let toml::Value::Table(table) = &mut value_table else {
-        return Err(anyhow!(
-            "expected a TOML table at {}; refusing to overwrite a non-table top level",
-            path.display(),
-        ));
-    };
-    let traj_entry = table
-        .entry("trajectory".to_owned())
-        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-    let toml::Value::Table(traj_table) = traj_entry else {
+
+    // Get-or-create the `[trajectory]` table, refusing to clobber a
+    // non-table value at that key.
+    let traj_item = doc
+        .entry("trajectory")
+        .or_insert_with(|| TomlItem::Table(TomlTable::new()));
+    let Some(traj_table) = traj_item.as_table_mut() else {
         return Err(anyhow!("[trajectory] in {} is not a table", path.display()));
     };
-    traj_table.insert("enabled".to_owned(), toml::Value::Boolean(value));
-    let serialized =
-        toml::to_string_pretty(&value_table).context("serialising updated tsumugi.toml")?;
-    std::fs::write(&path, serialized).with_context(|| format!("writing {}", path.display()))?;
+    traj_table["enabled"] = toml_value(value);
+
+    std::fs::write(&path, doc.to_string())
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -272,5 +274,58 @@ mod tests {
         );
         assert!(body.contains("[trajectory]"), "{body}");
         assert!(body.contains("enabled = true"), "{body}");
+    }
+
+    /// Comments and key ordering in the user's `tsumugi.toml` survive
+    /// the `enable` / `disable` round-trip. Regression for PR #79
+    /// review #3 — the previous `toml::Value` based implementation
+    /// dropped every `#` comment and re-formatted the file.
+    #[test]
+    fn enable_preserves_comments() {
+        let tmp = TempDir::new().unwrap_or_else(|e| panic!("{e}"));
+        let cfg = tmp.path().join("tsumugi.toml");
+        let original = "\
+# tsumugi project configuration
+# Edit this file to override the defaults.
+
+[llm]
+# Endpoint must point at an OpenAI-compatible server.
+endpoint = \"http://localhost:8080\"
+model = \"foo\" # default local model
+
+[trajectory]
+# Master switch for trajectory recording (issue #55).
+enabled = false
+include_thinking = true # keep reasoning blocks for SFT
+";
+        std::fs::write(&cfg, original).unwrap_or_else(|e| panic!("{e}"));
+        set_trajectory_enabled(Some(&cfg), true).unwrap_or_else(|e| panic!("{e}"));
+        let body = std::fs::read_to_string(&cfg).unwrap_or_else(|e| panic!("{e}"));
+        // Top-level comments survive.
+        assert!(
+            body.contains("# tsumugi project configuration"),
+            "lost top-level comment: {body}"
+        );
+        assert!(
+            body.contains("# Edit this file to override the defaults."),
+            "{body}"
+        );
+        // Section-internal comments survive.
+        assert!(
+            body.contains("# Endpoint must point at an OpenAI-compatible server."),
+            "{body}"
+        );
+        assert!(
+            body.contains("# Master switch for trajectory recording (issue #55)."),
+            "{body}"
+        );
+        // Trailing inline comments survive.
+        assert!(body.contains("# default local model"), "{body}");
+        assert!(body.contains("# keep reasoning blocks for SFT"), "{body}");
+        // The `enabled` flag flipped.
+        assert!(body.contains("enabled = true"), "{body}");
+        // Non-touched keys preserved.
+        assert!(body.contains("include_thinking = true"), "{body}");
+        assert!(body.contains("model = \"foo\""), "{body}");
     }
 }

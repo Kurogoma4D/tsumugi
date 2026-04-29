@@ -177,12 +177,7 @@ fn export_one_run(
         if !session.summary.is_empty() {
             recorder.record_user(&session.summary)?;
         }
-        if event_log_path.as_ref().is_some_and(|p| p.exists()) {
-            #[expect(
-                clippy::unwrap_used,
-                reason = "is_some_and() above guarantees Some; ergonomic borrow"
-            )]
-            let path = event_log_path.as_ref().unwrap();
+        if let Some(path) = event_log_path.as_ref().filter(|p| p.exists()) {
             replay_event_log(path, &recorder)?;
         } else {
             had_fallback = true;
@@ -258,6 +253,22 @@ enum EventEnvelopeKind {
     Other,
 }
 
+/// Replay an `--event-log` JSONL file into trajectory records.
+///
+/// # Tool-call / tool-result pairing
+///
+/// The event log does not carry call ids, so this function synthesises
+/// sequential `export_call_N` ids and matches `tool_result` events to
+/// the oldest pending `tool_call` of the same name (FIFO by tool
+/// name). This works well in practice but is **not** guaranteed to
+/// match the live recorder's ids — concurrent calls of the same tool
+/// can be paired in a different order from the live agent loop.
+///
+/// When the event log is truncated (e.g. the process was killed
+/// mid-turn), some `tool_call` events will have no matching
+/// `tool_result`. This function emits a `tracing::warn!` at the end
+/// of replay listing how many calls remained unmatched so callers can
+/// detect the truncation case in their logs.
 fn replay_event_log(path: &Path, recorder: &Recorder) -> Result<(), TrajectoryError> {
     let raw = std::fs::read_to_string(path).map_err(|e| TrajectoryError::io(path, e))?;
     let mut current_thinking = String::new();
@@ -343,6 +354,17 @@ fn replay_event_log(path: &Path, recorder: &Recorder) -> Result<(), TrajectoryEr
             Some(current_thinking.as_str())
         };
         recorder.record_assistant(&current_text, thinking, &current_calls)?;
+    }
+    // Surface truncation / orphaned-call situations so callers can
+    // tell the difference between a clean replay and one where the
+    // event log was cut short. The `export_call_N` ids in
+    // `pending_calls` will never appear in any `tool_result` record
+    // produced by this run.
+    if !pending_calls.is_empty() {
+        tracing::warn!(
+            remaining = pending_calls.len(),
+            "event log truncated; tool_calls without matching tool_results",
+        );
     }
     Ok(())
 }
@@ -435,14 +457,6 @@ pub fn open_recorder_for_session(
 ) -> Result<Recorder, TrajectoryError> {
     let path = trajectory_path(run_dir, &config.output_dir, session_index);
     Recorder::create(path, config)
-}
-
-/// Render a trivially-formatted `Verdict` outcome string from a
-/// session-end trigger. Public so callers (e.g. the CLI session-end
-/// path) emit identical labels.
-#[must_use]
-pub fn record_outcome_label_pub(trigger: &tmg_harness::SessionEndTrigger) -> String {
-    super::record_outcome_label(trigger)
 }
 
 /// Push a [`TrajectoryRecord`] into a recorder by variant. Lets
