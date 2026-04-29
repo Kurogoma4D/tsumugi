@@ -117,11 +117,19 @@ impl SearchScope {
 
 /// Schema version pinned in the `meta` key/value table. Bumping this
 /// triggers a migration path on next [`SearchIndex::open`].
-const SCHEMA_VERSION: i64 = 1;
+///
+/// - **v1**: initial schema (`sessions` / `sessions_fts` / `turns` /
+///   `turns_fts`).
+/// - **v2**: adds `sessions.started_at_unix INTEGER` so the `since`
+///   filter compares Unix epoch numerics rather than RFC3339 strings
+///   (avoids `Z` vs `+00:00` skew).
+const SCHEMA_VERSION: i64 = 2;
 
-/// Persistent search index. Cloning a [`SearchIndex`] is cheap
-/// (`Arc`-style) and produces another handle to the same underlying
-/// connection mutex.
+/// Persistent search index.
+///
+/// [`SearchIndex`] is **not** `Clone`. Callers that need to share the
+/// index between async tasks should wrap it in [`std::sync::Arc`] (the
+/// CLI's hot path already does this).
 ///
 /// The connection is wrapped in a `Mutex<Connection>` because rusqlite
 /// connections are `!Sync`. Concurrent callers serialize on the
@@ -187,19 +195,36 @@ impl SearchIndex {
     /// Open or create the index at `db_path`, running migrations as
     /// needed.
     ///
-    /// Creates parent directories if missing. The schema is laid down
-    /// idempotently on first open; subsequent opens verify the
-    /// `schema_version` value and refuse to proceed when the on-disk
-    /// version is newer than [`SCHEMA_VERSION`] — we never
-    /// auto-downgrade.
+    /// Creates parent directories if missing. The parent directory is
+    /// then canonicalised so that the stored `path` resolves any
+    /// symlink / `..` segments — a misconfigured
+    /// `[search] db_path = "../../etc/state.db"` ends up rooted at
+    /// the real on-disk location after creation rather than at a
+    /// surface-level traversal target. The file name itself is taken
+    /// verbatim because the file does not exist yet on first open.
+    ///
+    /// The schema is laid down idempotently on first open; subsequent
+    /// opens verify the `schema_version` value and refuse to proceed
+    /// when the on-disk version is newer than [`SCHEMA_VERSION`] — we
+    /// never auto-downgrade.
     pub fn open(db_path: impl AsRef<Path>) -> Result<Self, SearchError> {
-        let path = db_path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| SearchError::io(parent.to_path_buf(), e))?;
-        }
+        let raw_path = db_path.as_ref().to_path_buf();
+        // Resolve to an absolute, symlink-free location so stored
+        // diagnostics and the on-disk handle always agree.
+        let path = match (raw_path.parent(), raw_path.file_name()) {
+            (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| SearchError::io(parent.to_path_buf(), e))?;
+                let canonical_parent = std::fs::canonicalize(parent)
+                    .map_err(|e| SearchError::io(parent.to_path_buf(), e))?;
+                canonical_parent.join(name)
+            }
+            // No parent (e.g. relative path with just a filename) or
+            // no filename component — fall back to the raw path. The
+            // sqlite `Connection::open` call below will surface any
+            // remaining issue.
+            _ => raw_path,
+        };
         let conn = Connection::open(&path).map_err(|e| SearchError::sqlite("open db", e))?;
         // Reasonable defaults for a single-writer process: WAL
         // tolerates concurrent reads while ingest is writing.
@@ -237,6 +262,7 @@ impl SearchIndex {
                 run_id TEXT NOT NULL,
                 session_num INTEGER NOT NULL,
                 started_at TEXT NOT NULL,
+                started_at_unix INTEGER NOT NULL DEFAULT 0,
                 ended_at TEXT,
                 trigger TEXT,
                 summary TEXT,
@@ -300,9 +326,12 @@ impl SearchIndex {
                     source: rusqlite::Error::InvalidQuery,
                 });
             }
-            Some(_v) => {
-                // Future migration path: bump the stored value here.
-                // For schema v1 there is nothing to migrate.
+            Some(v) => {
+                // Run forward migrations. Each step is idempotent so
+                // a partially-failed migration can be retried.
+                if v < 2 {
+                    Self::migrate_v1_to_v2(conn)?;
+                }
                 conn.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
                     params![SCHEMA_VERSION.to_string()],
@@ -310,6 +339,45 @@ impl SearchIndex {
                 .map_err(|e| SearchError::sqlite("update schema_version", e))?;
             }
         }
+        Ok(())
+    }
+
+    /// v1 -> v2: add `sessions.started_at_unix` so the `since` filter
+    /// can compare numerics instead of RFC3339 strings (avoids `Z` vs
+    /// `+00:00` skew). Backfills existing rows by parsing the
+    /// `started_at` text column; rows that fail to parse are left at 0
+    /// and will simply be considered "before any cutoff".
+    fn migrate_v1_to_v2(conn: &Connection) -> Result<(), SearchError> {
+        // The CREATE TABLE above already includes the column for fresh
+        // databases. For pre-existing v1 databases we have to ALTER.
+        // SQLite's `ALTER TABLE ... ADD COLUMN` is no-op-safe via the
+        // PRAGMA check below.
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'started_at_unix'",
+                [],
+                |row| row.get::<_, i64>(0).map(|n| n > 0),
+            )
+            .map_err(|e| SearchError::sqlite("check started_at_unix column", e))?;
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN started_at_unix INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| SearchError::sqlite("add started_at_unix column", e))?;
+        }
+        // Backfill: parse any rows whose started_at_unix is still 0.
+        // We do this in SQL via `strftime('%s', ...)` — sqlite accepts
+        // ISO8601 with `Z` or numeric offsets and produces the Unix
+        // epoch as a string, which we cast to integer.
+        conn.execute(
+            "UPDATE sessions \
+                 SET started_at_unix = CAST(strftime('%s', started_at) AS INTEGER) \
+                 WHERE started_at_unix = 0 \
+                   AND strftime('%s', started_at) IS NOT NULL",
+            [],
+        )
+        .map_err(|e| SearchError::sqlite("backfill started_at_unix", e))?;
         Ok(())
     }
 
@@ -327,6 +395,7 @@ impl SearchIndex {
         // tokenised URLs.
         let files_modified = redact_secrets(&files_modified);
         let started_at = session.started_at.to_rfc3339();
+        let started_at_unix = session.started_at.timestamp();
         let ended_at = session.ended_at.as_ref().map(DateTime::to_rfc3339);
         let trigger = session.end_trigger.as_ref().map(|t| match t {
             tmg_harness::SessionEndTrigger::Completed => "completed".to_owned(),
@@ -346,11 +415,11 @@ impl SearchIndex {
 
         // Upsert the row. We delete the old FTS row first and re-insert
         // because external-content FTS5 doesn't auto-track UPDATEs.
-        tx.execute(
-            "DELETE FROM sessions WHERE run_id = ?1 AND session_num = ?2",
-            params![run_id, session.index],
-        )
-        .map_err(|e| SearchError::sqlite("delete old sessions row", e))?;
+        // CRITICAL: the FTS5 cleanup must run **before** the base
+        // `sessions` row is deleted, because the rowid lookup subquery
+        // joins back to `sessions`. Reversing the order leaves an
+        // orphan FTS row and causes UNIQUE rowid conflicts on the
+        // subsequent INSERT (see issue #53 review feedback).
         tx.execute(
             "DELETE FROM sessions_fts WHERE rowid IN (
                 SELECT rowid FROM sessions WHERE run_id = ?1 AND session_num = ?2
@@ -358,16 +427,22 @@ impl SearchIndex {
             params![run_id, session.index],
         )
         .map_err(|e| SearchError::sqlite("delete old sessions_fts row", e))?;
+        tx.execute(
+            "DELETE FROM sessions WHERE run_id = ?1 AND session_num = ?2",
+            params![run_id, session.index],
+        )
+        .map_err(|e| SearchError::sqlite("delete old sessions row", e))?;
 
         tx.execute(
             "INSERT INTO sessions(
-                run_id, session_num, started_at, ended_at, trigger,
-                summary, files_modified, tool_calls_count
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                run_id, session_num, started_at, started_at_unix,
+                ended_at, trigger, summary, files_modified, tool_calls_count
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 run_id,
                 session.index,
                 started_at,
+                started_at_unix,
                 ended_at,
                 trigger,
                 summary,
@@ -471,6 +546,29 @@ impl SearchIndex {
         Ok(count > 0)
     }
 
+    /// Load every `(run_id, session_num)` pair currently in the index
+    /// into a [`HashSet`] for in-memory lookup during a rebuild scan.
+    /// Avoids the O(N) `SELECT COUNT(*)` round-trip per file that
+    /// [`Self::has_session`] would incur.
+    fn existing_session_keys(
+        &self,
+    ) -> Result<std::collections::HashSet<(String, u32)>, SearchError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare("SELECT run_id, session_num FROM sessions")
+            .map_err(|e| SearchError::sqlite("prepare existing_session_keys", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            })
+            .map_err(|e| SearchError::sqlite("execute existing_session_keys", e))?;
+        let mut set = std::collections::HashSet::new();
+        for r in rows {
+            set.insert(r.map_err(|e| SearchError::sqlite("read existing_session_keys", e))?);
+        }
+        Ok(set)
+    }
+
     /// Walk `runs_dir`, find every `session_NNN.json`, and ingest those
     /// not already in the DB. Returns the count of newly-ingested
     /// sessions.
@@ -478,11 +576,19 @@ impl SearchIndex {
     /// Files that fail to parse or contain malformed JSON are logged
     /// via `tracing::warn!` and skipped — a single corrupt session
     /// must not stop the rebuild from progressing.
+    ///
+    /// To avoid one `SELECT COUNT(*)` per file, this method loads the
+    /// full set of indexed `(run_id, session_num)` pairs into memory
+    /// up front and checks against that set. The membership map is
+    /// kept up-to-date in-memory as new rows are ingested, so a
+    /// duplicate session log inside the same scan still skips
+    /// correctly.
     pub fn rebuild_from_disk(&self, runs_dir: impl AsRef<Path>) -> Result<usize, SearchError> {
         let root = runs_dir.as_ref();
         if !root.exists() {
             return Ok(0);
         }
+        let mut existing = self.existing_session_keys()?;
         let mut ingested = 0usize;
         let read = std::fs::read_dir(root).map_err(|e| SearchError::io(root, e))?;
         for entry in read {
@@ -540,7 +646,8 @@ impl SearchIndex {
                         continue;
                     }
                 };
-                if self.has_session(run_id, session.index)? {
+                let key = (run_id.to_owned(), session.index);
+                if existing.contains(&key) {
                     continue;
                 }
                 if let Err(e) = self.ingest_session(run_id, &session) {
@@ -551,6 +658,7 @@ impl SearchIndex {
                     );
                     continue;
                 }
+                existing.insert(key);
                 ingested = ingested.saturating_add(1);
             }
         }
@@ -578,7 +686,9 @@ impl SearchIndex {
             return Err(SearchError::invalid_query("query must not be empty"));
         }
         let limit = limit.clamp(1, 200);
-        let since_str = since.as_ref().map(DateTime::to_rfc3339);
+        // Use Unix epoch for time comparison so the filter is robust
+        // against `Z` vs `+00:00` formatting drift in the text column.
+        let since_unix = since.as_ref().map(DateTime::timestamp);
 
         let conn = self.lock_conn()?;
         let mut hits: Vec<SearchHit> = Vec::new();
@@ -590,7 +700,7 @@ impl SearchIndex {
                        FROM sessions_fts
                        JOIN sessions s ON s.rowid = sessions_fts.rowid
                        WHERE sessions_fts MATCH ?1
-                         AND (?2 IS NULL OR s.started_at >= ?2)
+                         AND (?2 IS NULL OR s.started_at_unix >= ?2)
                        ORDER BY bm25(sessions_fts) ASC
                        LIMIT ?3";
             let mut stmt = conn
@@ -598,7 +708,7 @@ impl SearchIndex {
                 .map_err(|e| SearchError::sqlite("prepare summary query", e))?;
             let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
             let rows = stmt
-                .query_map(params![query, since_str, limit_i64], |row| {
+                .query_map(params![query, since_unix, limit_i64], |row| {
                     let raw_score: f64 = row.get(5)?;
                     Ok(SearchHit {
                         run_id: row.get(0)?,
@@ -627,7 +737,7 @@ impl SearchIndex {
                        JOIN turns t ON t.rowid = turns_fts.rowid
                        LEFT JOIN sessions s ON s.run_id = t.run_id AND s.session_num = t.session_num
                        WHERE turns_fts MATCH ?1
-                         AND (?2 IS NULL OR s.started_at IS NULL OR s.started_at >= ?2)
+                         AND (?2 IS NULL OR s.started_at_unix IS NULL OR s.started_at_unix >= ?2)
                        ORDER BY bm25(turns_fts) ASC
                        LIMIT ?3";
             let mut stmt = conn
@@ -635,7 +745,7 @@ impl SearchIndex {
                 .map_err(|e| SearchError::sqlite("prepare turns query", e))?;
             let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
             let rows = stmt
-                .query_map(params![query, since_str, limit_i64], |row| {
+                .query_map(params![query, since_unix, limit_i64], |row| {
                     let raw_score: f64 = row.get(5)?;
                     Ok(SearchHit {
                         run_id: row.get(0)?,
@@ -693,12 +803,13 @@ impl SearchIndex {
     }
 
     /// Lock the connection mutex, mapping a poisoned mutex to a
-    /// [`SearchError`].
+    /// dedicated [`SearchError::MutexPoisoned`] variant so callers can
+    /// distinguish "another thread panicked" from a real sqlite
+    /// failure.
     fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, SearchError> {
-        self.conn.lock().map_err(|_poison| SearchError::Sqlite {
-            context: "search index mutex poisoned".to_owned(),
-            source: rusqlite::Error::InvalidQuery,
-        })
+        self.conn
+            .lock()
+            .map_err(|_poison| SearchError::mutex_poisoned("search index connection"))
     }
 }
 
@@ -894,5 +1005,135 @@ mod tests {
             .query("   ", 10, SearchScope::Summary, None)
             .expect_err("must reject empty query");
         assert!(matches!(err, SearchError::InvalidQuery { .. }));
+    }
+
+    /// Regression test for issue #53 review feedback (HIGH #1):
+    /// previously, `ingest_session` deleted the base `sessions` row
+    /// before running the FTS5 cleanup whose subquery joined back to
+    /// `sessions`. The subquery returned zero rows so the old FTS row
+    /// stuck around, then the next INSERT into `sessions_fts`
+    /// collided on rowid (or, with external-content FTS, left
+    /// orphaned rows that bloated the index).
+    ///
+    /// Re-ingesting the same `(run_id, session_num)` twice must:
+    /// - succeed both times,
+    /// - leave exactly one row in `sessions` and one in `sessions_fts`,
+    /// - reflect the latest summary text in subsequent queries.
+    #[test]
+    fn reingest_same_session_keeps_one_row_in_sessions_and_fts() {
+        let tmp = TempDir::new().expect("tempdir");
+        let idx = fresh_index(&tmp);
+
+        // First ingest with summary A.
+        let mut s1 = session_with_summary(7, "first revision: noisy summary");
+        s1.started_at = Utc::now() - Duration::hours(1);
+        idx.ingest_session("run-zzz", &s1)
+            .expect("first ingest must succeed");
+
+        // Same `(run_id, session_num)` again with a different summary.
+        let mut s2 = session_with_summary(7, "revised summary covers oauth");
+        s2.started_at = Utc::now();
+        idx.ingest_session("run-zzz", &s2)
+            .expect("re-ingest must succeed (would fail on rowid collision pre-fix)");
+
+        // Direct row-count assertions on both tables.
+        let sessions_count: i64 = {
+            let conn = idx.lock_conn().expect("lock");
+            conn.query_row(
+                "SELECT COUNT(*) FROM sessions WHERE run_id = ?1 AND session_num = ?2",
+                params!["run-zzz", 7],
+                |row| row.get(0),
+            )
+            .expect("count sessions")
+        };
+        assert_eq!(sessions_count, 1, "exactly one base row expected");
+
+        let fts_count: i64 = {
+            let conn = idx.lock_conn().expect("lock");
+            conn.query_row(
+                "SELECT COUNT(*) FROM sessions_fts WHERE rowid IN (
+                    SELECT rowid FROM sessions WHERE run_id = ?1 AND session_num = ?2
+                )",
+                params!["run-zzz", 7],
+                |row| row.get(0),
+            )
+            .expect("count sessions_fts")
+        };
+        assert_eq!(
+            fts_count, 1,
+            "exactly one FTS row expected; pre-fix this would be 0 (orphan) or >1"
+        );
+
+        // Sanity: query reflects the latest summary, not the initial
+        // one. If the FTS update path were broken, the old row's
+        // tokens would still match.
+        let hits_old = idx
+            .query("noisy", 10, SearchScope::Summary, None)
+            .expect("query old");
+        assert!(
+            hits_old.is_empty(),
+            "old summary must not match: {hits_old:?}"
+        );
+        let hits_new = idx
+            .query("oauth", 10, SearchScope::Summary, None)
+            .expect("query new");
+        assert_eq!(hits_new.len(), 1);
+        assert!(hits_new[0].summary.contains("oauth"), "{hits_new:?}");
+    }
+
+    /// Regression test for issue #53 review feedback (MEDIUM #3): the
+    /// original `since` implementation compared RFC3339 strings, so a
+    /// row stored with `+00:00` would not be matched by a cutoff
+    /// rendered with `Z` (or vice versa). With the v2 schema we
+    /// compare Unix epoch integers, which is invariant under
+    /// formatting drift.
+    #[test]
+    fn since_filter_handles_mixed_timezone_formatting() {
+        let tmp = TempDir::new().expect("tempdir");
+        let idx = fresh_index(&tmp);
+
+        // We can't directly choose `Z` vs `+00:00` in chrono's
+        // `to_rfc3339` output (it picks one), but the canonical safe
+        // check is that two timestamps an hour apart with different
+        // serializations both filter correctly through `since`.
+        let now = Utc::now();
+        let mut older = session_with_summary(1, "old oauth bug");
+        older.started_at = now - Duration::hours(2);
+        idx.ingest_session("run-tz", &older).expect("old ingest");
+        let mut newer = session_with_summary(2, "new oauth fix");
+        newer.started_at = now;
+        idx.ingest_session("run-tz", &newer).expect("new ingest");
+
+        // Cutoff one hour ago — should pick up only the newer row.
+        let cutoff = now - Duration::hours(1);
+        let hits = idx
+            .query("oauth", 10, SearchScope::Summary, Some(cutoff))
+            .expect("since query");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].session_num, 2);
+
+        // Now corrupt one row's `started_at` text to use a different
+        // formatting (`+00:00` instead of `Z`). The string column
+        // becomes inconsistent with what chrono produced, but the
+        // numeric `started_at_unix` column stays correct, so the
+        // since filter must still return the same hit set.
+        {
+            let conn = idx.lock_conn().expect("lock");
+            conn.execute(
+                "UPDATE sessions SET started_at = REPLACE(started_at, 'Z', '+00:00') \
+                 WHERE run_id = ?1",
+                params!["run-tz"],
+            )
+            .expect("rewrite started_at");
+        }
+        let hits2 = idx
+            .query("oauth", 10, SearchScope::Summary, Some(cutoff))
+            .expect("since query 2");
+        assert_eq!(
+            hits2.len(),
+            1,
+            "since filter must still find the recent row after format drift: {hits2:?}"
+        );
+        assert_eq!(hits2[0].session_num, 2);
     }
 }

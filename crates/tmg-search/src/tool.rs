@@ -114,69 +114,94 @@ impl Tool for SessionSearchTool {
         params: JsonValue,
         _ctx: &'a SandboxContext,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult, ToolError>> + Send + 'a>> {
-        let result = self.execute_inner(&params);
-        Box::pin(std::future::ready(result))
-    }
-}
+        // `_ctx` is intentionally unused: the search index lives at the
+        // well-known internal path `<project>/.tsumugi/state.db` and is
+        // canonicalised to the project root by `SearchIndex::open`,
+        // not by per-tool sandbox checks. We don't take user-supplied
+        // paths through this tool so there is no path-traversal surface
+        // here that a sandbox check would defend.
+        let index_opt = self.index.clone();
+        Box::pin(async move {
+            // Parse params synchronously (cheap, no I/O).
+            let Some(index) = index_opt else {
+                return Ok(ToolResult::error(
+                    "session_search is disabled: enable [search] in tsumugi.toml",
+                ));
+            };
+            let Some(query) = params.get("query").and_then(JsonValue::as_str) else {
+                return Err(ToolError::invalid_params(
+                    "missing required parameter: query",
+                ));
+            };
+            let query = query.to_owned();
+            let limit = params
+                .get("limit")
+                .and_then(JsonValue::as_u64)
+                .map_or(10_usize, |n| usize::try_from(n).unwrap_or(10));
+            let scope = params
+                .get("scope")
+                .and_then(JsonValue::as_str)
+                .map_or(SearchScope::All, SearchScope::parse);
+            let since = match params.get("since").and_then(JsonValue::as_str) {
+                Some(s) => match DateTime::parse_from_rfc3339(s) {
+                    Ok(dt) => Some(dt.with_timezone(&chrono::Utc)),
+                    Err(e) => {
+                        return Err(ToolError::invalid_params(format!(
+                            "invalid since timestamp {s:?}: {e}"
+                        )));
+                    }
+                },
+                None => None,
+            };
 
-impl SessionSearchTool {
-    fn execute_inner(&self, params: &JsonValue) -> Result<ToolResult, ToolError> {
-        let Some(index) = self.index.as_ref() else {
-            return Ok(ToolResult::error(
-                "session_search is disabled: enable [search] in tsumugi.toml",
-            ));
-        };
-        let Some(query) = params.get("query").and_then(JsonValue::as_str) else {
-            return Err(ToolError::invalid_params(
-                "missing required parameter: query",
-            ));
-        };
-        let limit = params
-            .get("limit")
-            .and_then(JsonValue::as_u64)
-            .map_or(10_usize, |n| usize::try_from(n).unwrap_or(10));
-        let scope = params
-            .get("scope")
-            .and_then(JsonValue::as_str)
-            .map_or(SearchScope::All, SearchScope::parse);
-        let since = match params.get("since").and_then(JsonValue::as_str) {
-            Some(s) => match DateTime::parse_from_rfc3339(s) {
-                Ok(dt) => Some(dt.with_timezone(&chrono::Utc)),
+            // Run the actual SQLite query off the tokio worker so a
+            // slow FTS5 scan can't block neighbour tasks. The blocking
+            // task owns its own clone of the `Arc<SearchIndex>` so the
+            // future stays `Send`.
+            let query_for_blocking = query.clone();
+            let join_result = tokio::task::spawn_blocking(move || {
+                index.query(&query_for_blocking, limit, scope, since)
+            })
+            .await;
+            let result = match join_result {
+                Ok(r) => r,
                 Err(e) => {
-                    return Err(ToolError::invalid_params(format!(
-                        "invalid since timestamp {s:?}: {e}"
+                    // JoinError: the blocking task panicked or was
+                    // cancelled. Surface as a soft error so the agent
+                    // can keep going.
+                    return Ok(ToolResult::error(format!(
+                        "session_search task panicked or was cancelled: {e}"
                     )));
                 }
-            },
-            None => None,
-        };
+            };
 
-        match index.query(query, limit, scope, since) {
-            Ok(hits) => {
-                // Serialize the structured hit list as the tool's
-                // output. The agent loop already JSON-pretty-prints
-                // tool results in the activity pane; emitting JSON
-                // here preserves machine-parseability for scripts.
-                let payload = serde_json::to_string_pretty(&hits)
-                    .map_err(|e| ToolError::json("serialize search hits", e))?;
-                if hits.is_empty() {
-                    Ok(ToolResult::success(format!(
-                        "no matches for query {query:?}\n\n{payload}"
-                    )))
-                } else {
-                    Ok(ToolResult::success(payload))
+            match result {
+                Ok(hits) => {
+                    // Serialize the structured hit list as the tool's
+                    // output. The agent loop already JSON-pretty-prints
+                    // tool results in the activity pane; emitting JSON
+                    // here preserves machine-parseability for scripts.
+                    let payload = serde_json::to_string_pretty(&hits)
+                        .map_err(|e| ToolError::json("serialize search hits", e))?;
+                    if hits.is_empty() {
+                        Ok(ToolResult::success(format!(
+                            "no matches for query {query:?}\n\n{payload}"
+                        )))
+                    } else {
+                        Ok(ToolResult::success(payload))
+                    }
+                }
+                Err(crate::error::SearchError::InvalidQuery { message }) => {
+                    Err(ToolError::invalid_params(message))
+                }
+                Err(other) => {
+                    // Treat infrastructure failures (DB locked, schema
+                    // mismatch, ...) as soft errors so the agent can
+                    // recover or move on.
+                    Ok(ToolResult::error(format!("session_search failed: {other}")))
                 }
             }
-            Err(crate::error::SearchError::InvalidQuery { message }) => {
-                Err(ToolError::invalid_params(message))
-            }
-            Err(other) => {
-                // Treat infrastructure failures (DB locked, schema
-                // mismatch, ...) as soft errors so the agent can
-                // recover or move on.
-                Ok(ToolResult::error(format!("session_search failed: {other}")))
-            }
-        }
+        })
     }
 }
 

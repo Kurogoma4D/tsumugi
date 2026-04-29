@@ -682,23 +682,24 @@ fn run_prompt(
         // session-end hook is registered and `ingest_session` is never
         // called. The agent gets a search tool over whatever the TUI /
         // workflow paths previously indexed.
-        let search_index_for_oneshot: Option<Arc<tmg_search::SearchIndex>> =
-            if search_config.enabled {
-                let db_path = search_config.resolve_db_path(&canonical_cwd);
-                match tmg_search::SearchIndex::open(&db_path) {
-                    Ok(idx) => Some(Arc::new(idx)),
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %db_path.display(),
-                            error = %e,
-                            "failed to open search index for one-shot prompt; tool returns soft errors"
-                        );
-                        None
-                    }
+        let search_index_for_oneshot: Option<Arc<tmg_search::SearchIndex>> = if search_config
+            .enabled
+        {
+            let db_path = search_config.resolve_db_path(&canonical_cwd);
+            match tmg_search::SearchIndex::open(&db_path) {
+                Ok(idx) => Some(Arc::new(idx)),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %db_path.display(),
+                        error = %e,
+                        "failed to open search index for one-shot prompt; tool returns soft errors"
+                    );
+                    None
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
 
         // Build the tool registry: built-ins + (optionally) the memory
         // tool. No subagent registration in one-shot mode because

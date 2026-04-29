@@ -46,6 +46,16 @@ pub enum SearchError {
         /// Human-readable description.
         message: String,
     },
+
+    /// The connection mutex was poisoned by a panic in another thread.
+    /// The index handle is unusable from this point on; the caller
+    /// should reopen the index or surface the failure to the user.
+    #[error("search index mutex poisoned: {context}")]
+    MutexPoisoned {
+        /// What the search code was attempting when the mutex was
+        /// found poisoned.
+        context: String,
+    },
 }
 
 impl SearchError {
@@ -77,6 +87,13 @@ impl SearchError {
     pub fn invalid_query(message: impl Into<String>) -> Self {
         Self::InvalidQuery {
             message: message.into(),
+        }
+    }
+
+    /// Build an [`SearchError::MutexPoisoned`].
+    pub fn mutex_poisoned(context: impl Into<String>) -> Self {
+        Self::MutexPoisoned {
+            context: context.into(),
         }
     }
 }

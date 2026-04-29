@@ -62,6 +62,11 @@ rand = "0.9"
 # Regex
 regex = "1"
 
+# SQLite (FTS5 search index in tmg-search)
+# `bundled` ships sqlite3 with the crate so we don't depend on a system
+# library; the bundled build enables FTS5 by default. See issue #53.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # Tree-sitter (signature extraction in tmg-tools)
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
